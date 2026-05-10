@@ -146,14 +146,31 @@ class PocketTTSOnnx:
             return fp32.name
         raise FileNotFoundError(f"Missing ONNX file for {stem} in {self.bundle_dir}")
 
+    def _resolve_onnx(self, filename: str, required: bool = True) -> Optional[str]:
+        local = self.bundle_dir / filename
+        if local.exists():
+            return str(local)
+        hf_path = f"onnx/{self.language}/{filename}"
+        try:
+            return hf_hub_download(repo_id=self.HF_REPO_ID, filename=hf_path)
+        except Exception as exc:
+            if required:
+                raise FileNotFoundError(
+                    f"Cannot find {filename} locally or on HF Hub ({hf_path}): {exc}"
+                ) from exc
+            return None
+
     def _load_models(self):
         opts = self._make_session_options()
 
-        self.mimi_encoder = ort.InferenceSession(
-            str(self.bundle_dir / "mimi_encoder.onnx"), sess_options=opts, providers=self.providers
+        encoder_path = self._resolve_onnx("mimi_encoder.onnx", required=False)
+        self.mimi_encoder = (
+            ort.InferenceSession(encoder_path, sess_options=opts, providers=self.providers)
+            if encoder_path
+            else None
         )
         self.text_conditioner = ort.InferenceSession(
-            str(self.bundle_dir / "text_conditioner.onnx"),
+            self._resolve_onnx("text_conditioner.onnx", required=True),
             sess_options=opts,
             providers=self.providers,
         )
@@ -252,6 +269,8 @@ class PocketTTSOnnx:
         return audio.reshape(1, 1, -1)
 
     def encode_voice(self, audio_path: Union[str, Path]) -> np.ndarray:
+        if self.mimi_encoder is None:
+            raise RuntimeError("mimi_encoder.onnx was not found; voice cloning is unavailable.")
         audio = self._load_audio(audio_path)
         embeddings = self.mimi_encoder.run(None, {"audio": audio})[0]
         while embeddings.ndim > 3:
