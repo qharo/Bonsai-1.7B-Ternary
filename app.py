@@ -8,6 +8,7 @@ import ctypes
 import time
 import asyncio
 import numpy as np
+from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse
@@ -132,7 +133,7 @@ def init_model():
     print(f"Model loaded: vocab={_model.embed.num_rows}")
     
     # Initialize TTS
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "tts"))
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "tts"))
     from pocket_tts_onnx import PocketTTSOnnx
     _tts = PocketTTSOnnx(
         models_dir=os.path.join(os.path.dirname(__file__), "tts", "onnx"),
