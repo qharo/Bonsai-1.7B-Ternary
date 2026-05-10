@@ -263,7 +263,29 @@ async def generate_completion(req: GenerateRequest):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": "BitNet-1.7B", "vocab_size": VOCAB_SIZE}
+    import subprocess
+    cpu = ""
+    simd = []
+    try:
+        cpu = open("/proc/cpuinfo").read()
+        flags_line = next(l for l in cpu.splitlines() if l.startswith("flags"))
+        flags = flags_line.split(":")[1].split()
+        for f in ("avx512f", "avx2", "avx", "sse4_2"):
+            if f in flags:
+                simd.append(f)
+        model_name = next(l for l in cpu.splitlines() if "model name" in l).split(":")[1].strip()
+    except Exception:
+        model_name = "unknown"
+    import ctypes.util
+    omp_threads = int(os.environ.get("OMP_NUM_THREADS", 0)) or os.cpu_count()
+    return {
+        "status": "ok",
+        "model": "BitNet-1.7B",
+        "vocab_size": VOCAB_SIZE,
+        "cpu": model_name,
+        "simd": simd,
+        "omp_threads": omp_threads,
+    }
 
 @app.get("/model/info")
 async def model_info():
