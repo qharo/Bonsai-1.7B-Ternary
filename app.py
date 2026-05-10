@@ -29,6 +29,7 @@ STOP_EOS = 151645
 _lib = None
 ModelState = None
 _model = None
+_tts = None
 _tokenizer = None
 G128Matrix = None
 FP32Matrix = None
@@ -107,7 +108,7 @@ def load_library():
     ModelState = ModelStateStruct
 
 def init_model():
-    global _model, _tokenizer, _lib, ModelState
+    global _model, _tokenizer, _lib, _tts, ModelState
     
     if _model is not None:
         return
@@ -129,6 +130,16 @@ def init_model():
     
     _tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
     print(f"Model loaded: vocab={_model.embed.num_rows}")
+    
+    # Initialize TTS
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "tts"))
+    from pocket_tts_onnx import PocketTTSOnnx
+    _tts = PocketTTSOnnx(
+        models_dir=os.path.join(os.path.dirname(__file__), "tts", "onnx"),
+        language="english_2026-04",
+        precision="int8",
+    )
+    print(f"TTS loaded: sample_rate={_tts.sample_rate}, voices={_tts.predefined_voices}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -153,6 +164,15 @@ class GenerateRequest(BaseModel):
     top_p: float = DEFAULT_TOP_P
     top_k: int = DEFAULT_TOP_K
     stop_tokens: list = None
+    stream_audio: bool = False
+    voice: str = "alba"
+
+
+class StopRequest(BaseModel):
+    session_id: str = "default"
+
+
+_stop_flags: dict[str, bool] = {}
 
 def np_softmax(x):
     e = np.exp(x - np.max(x))
@@ -261,6 +281,140 @@ async def generate_completion(req: GenerateRequest):
         "tokens_per_second": round(tps, 2),
     }
 
+
+import re
+
+SENTENCE_END_RE = re.compile(r'([.!?]+)(\s|$)')
+ABBREVIATIONS = {'Mr', 'Mrs', 'Ms', 'Dr', 'Prof', 'Sr', 'Jr', 'vs', 'etc', 'Inc', 'Ltd', 'Co', 'St', 'Ave', 'Blvd', 'Rd'}
+
+def is_sentence_boundary(text: str, pos: int) -> bool:
+    if pos <= 0 or pos >= len(text):
+        return False
+    if text[pos] not in '.!?':
+        return False
+    next_char = text[pos + 1] if pos + 1 < len(text) else ' '
+    valid_next = {' ', '\t', '\n', '\r', '"', "'", ')', ']', '}'}
+    if next_char not in valid_next:
+        return False
+    before = text[:pos]
+    words = before.split()
+    if not words:
+        return True
+    last_word = words[-1].rstrip('.')
+    if last_word in ABBREVIATIONS:
+        return False
+    if last_word.endswith('.') and len(last_word) <= 3:
+        return False
+    if text[pos:pos+3] == '...':
+        return True
+    return True
+
+
+def find_sentence_boundaries(text: str) -> list[int]:
+    boundaries = []
+    for i, char in enumerate(text):
+        if is_sentence_boundary(text, i):
+            boundaries.append(i)
+    return boundaries
+
+
+@app.post("/generate/voice")
+async def generate_voice(req: GenerateRequest):
+    if not _tts:
+        raise HTTPException(status_code=503, detail="TTS not loaded")
+    
+    session_id = "default"
+    _stop_flags[session_id] = False
+    
+    messages = []
+    if req.system_prompt:
+        messages.append({"role": "system", "content": req.system_prompt})
+    messages.append({"role": "user", "content": req.prompt})
+    
+    text = _tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    tokens = _tokenizer.encode(text, add_special_tokens=False)
+    stop_ids = set(req.stop_tokens) if req.stop_tokens else {STOP_EOS}
+    
+    def generate_voice_stream():
+        full_text = ""
+        n_tokens = 0
+        last_boundary = 0
+        start = time.perf_counter()
+        
+        for token in generate_tokens(tokens, req.max_new_tokens, req.temperature, req.top_p, req.top_k, stop_ids):
+            if _stop_flags.get(session_id, False):
+                yield f"data: {json.dumps({'stopped': True, 'full': full_text})}\n\n"
+                return
+            
+            if token == STOP_EOS:
+                break
+            txt = _tokenizer.decode([token], skip_special_tokens=True)
+            full_text += txt
+            n_tokens += 1
+            
+            boundaries = find_sentence_boundaries(full_text)
+            if boundaries and boundaries[-1] > last_boundary:
+                sentence_end = boundaries[-1]
+                sentence_text = full_text[last_boundary:sentence_end + 1].strip()
+                if sentence_text and len(sentence_text) > 3:
+                    try:
+                        audio = _tts.generate(sentence_text, voice=req.voice, max_frames=188, frames_after_eos=0)
+                        audio_bytes = audio.tobytes()
+                        response_data = {
+                            'token': txt,
+                            'full': full_text,
+                            'audio': audio_bytes.hex(),
+                            'sample_rate': _tts.sample_rate,
+                            'sentence_start': last_boundary,
+                            'sentence_end': sentence_end + 1
+                        }
+                        yield f"data: {json.dumps(response_data)}\n\n"
+                        last_boundary = sentence_end + 1
+                    except Exception as e:
+                        print(f"TTS error: {e}")
+                        yield f"data: {json.dumps({'token': txt, 'full': full_text, 'tts_error': str(e)})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'token': txt, 'full': full_text})}\n\n"
+            else:
+                yield f"data: {json.dumps({'token': txt, 'full': full_text})}\n\n"
+        
+        if last_boundary < len(full_text):
+            remaining = full_text[last_boundary:].strip()
+            if remaining:
+                try:
+                    audio = _tts.generate(remaining, voice=req.voice, max_frames=188, frames_after_eos=0)
+                    audio_bytes = audio.tobytes()
+                    response_data = {
+                        'audio': audio_bytes.hex(),
+                        'sample_rate': _tts.sample_rate,
+                        'sentence_start': last_boundary,
+                        'sentence_end': len(full_text),
+                        'final': True
+                    }
+                    yield f"data: {json.dumps(response_data)}\n\n"
+                except Exception as e:
+                    print(f"TTS error (final): {e}")
+        
+        elapsed = time.perf_counter() - start
+        tps = n_tokens / elapsed if elapsed > 0 else 0.0
+        yield f"data: {json.dumps({
+            'done': True,
+            'full': full_text,
+            'tokens_generated': n_tokens,
+            'total_time_s': round(elapsed, 3),
+            'tokens_per_second': round(tps, 2)
+        })}\n\n"
+        _stop_flags[session_id] = False
+    
+    return StreamingResponse(generate_voice_stream(), media_type="text/event-stream")
+
+
+@app.post("/stop")
+async def stop_generation(req: StopRequest = None):
+    session_id = req.session_id if req else "default"
+    _stop_flags[session_id] = True
+    return {"stopped": True, "session_id": session_id}
+
 @app.get("/health")
 async def health():
     import subprocess
@@ -289,17 +443,72 @@ async def health():
 
 @app.get("/model/info")
 async def model_info():
-    if _model:
-        return {
-            "vocab_size": _model.embed.num_rows,
+    info = {
+        "llm": {
+            "vocab_size": _model.embed.num_rows if _model else None,
             "hidden_size": 2048,
             "num_layers": 28,
             "num_heads": 16,
             "num_kv_heads": 8,
             "head_dim": 128,
             "max_seq_len": MAX_SEQ_LEN
+        } if _model else {"error": "LLM not loaded"},
+        "tts": {
+            "sample_rate": _tts.sample_rate,
+            "frame_rate": _tts.frame_rate,
+            "voices": list(_tts.predefined_voices),
+        } if _tts else {"error": "TTS not loaded"},
+    }
+    return info
+
+
+class TTSRequest(BaseModel):
+    text: str
+    voice: str = "alba"
+
+
+@app.post("/tts/generate")
+async def tts_generate(req: TTSRequest):
+    if not _tts:
+        raise HTTPException(status_code=503, detail="TTS not loaded")
+    
+    start = time.time()
+    audio = _tts.generate(req.text, voice=req.voice)
+    elapsed = time.time() - start
+    
+    duration = len(audio) / _tts.sample_rate
+    
+    import io
+    import scipy.io.wavfile as wavfile
+    buffer = io.BytesIO()
+    wavfile.write(buffer, _tts.sample_rate, audio)
+    buffer.seek(0)
+    
+    return {
+        "audio_base64": buffer.read().hex(),
+        "duration_s": round(duration, 3),
+        "generation_time_s": round(elapsed, 3),
+        "rtf": round(elapsed / duration, 3) if duration > 0 else 0,
+    }
+
+
+@app.post("/tts/stream")
+async def tts_stream(req: TTSRequest):
+    if not _tts:
+        raise HTTPException(status_code=503, detail="TTS not loaded")
+    
+    def generate_audio_chunks():
+        for chunk in _tts.stream(req.text, voice=req.voice):
+            yield chunk.tobytes()
+    
+    return StreamingResponse(
+        generate_audio_chunks(),
+        media_type="audio/pcm",
+        headers={
+            "X-Sample-Rate": str(_tts.sample_rate),
+            "X-Channels": "1",
         }
-    return {"error": "Model not loaded"}
+    )
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=7860)

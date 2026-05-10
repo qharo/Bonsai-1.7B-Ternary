@@ -105,6 +105,7 @@ header {
   display: flex;
   flex-direction: column;
   max-width: 78%;
+  position: relative;
 }
 .row.user { align-self: flex-end; align-items: flex-end; }
 .row.bot  { align-self: flex-start; align-items: flex-start; }
@@ -115,6 +116,7 @@ header {
   line-height: 1.65;
   white-space: pre-wrap;
   word-break: break-word;
+  position: relative;
 }
 
 .row.user .bubble {
@@ -130,6 +132,58 @@ header {
 }
 
 .row.bot .bubble.error { color: var(--error); }
+
+/* Audio controls in bot bubble */
+.audio-controls {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.row.bot:hover .audio-controls {
+  opacity: 1;
+}
+
+.audio-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  transition: all 0.15s;
+}
+
+.audio-btn:hover {
+  background: var(--surface2);
+  border-color: var(--accent);
+}
+
+.audio-btn.playing {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+}
+
+.audio-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Word highlighting */
+.word-spoken {
+  color: var(--accent);
+  font-weight: 600;
+}
 
 /* Blinking cursor */
 .cursor {
@@ -181,7 +235,7 @@ textarea {
 textarea:focus       { border-color: #58a6ff; }
 textarea::placeholder { color: var(--muted); }
 
-.send {
+.send, .stop {
   background: var(--accent);
   color: #0d1117;
   border: none;
@@ -190,11 +244,40 @@ textarea::placeholder { color: var(--muted); }
   display: flex; align-items: center; justify-content: center;
   cursor: pointer;
   flex-shrink: 0;
-  font-size: 20px; font-weight: 700; line-height: 1;
+  font-size: 18px; font-weight: 700; line-height: 1;
   transition: opacity .15s;
 }
-.send:disabled { background: var(--surface2); color: var(--muted); cursor: not-allowed; }
-.send:hover:not(:disabled) { opacity: .82; }
+
+.stop {
+  background: var(--error);
+  color: #fff;
+}
+
+.send:disabled, .stop:disabled {
+  background: var(--surface2);
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+.send:hover:not(:disabled), .stop:hover:not(:disabled) {
+  opacity: .82;
+}
+
+.test-audio-btn {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 4px 11px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s;
+}
+.test-audio-btn:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+}
 </style>
 </head>
 <body>
@@ -209,6 +292,7 @@ textarea::placeholder { color: var(--muted); }
     <div class="live-dot"></div>
     <span id="badge-text">live</span>
   </div>
+  <button class="test-audio-btn" id="test-audio-btn" title="Test Audio Playback" style="display:none">🔊 Test</button>
 </header>
 
 <div class="messages" id="msgs">
@@ -220,7 +304,7 @@ textarea::placeholder { color: var(--muted); }
 </div>
 
 <div class="input-area">
-  <textarea id="inp" placeholder="Ask anything… (Enter to send, Shift+Enter for newline)" rows="1" autofocus></textarea>
+  <textarea id="inp" placeholder="How can I help you today? (Enter to send, Shift+Enter for newline)" rows="1" autofocus></textarea>
   <button class="send" id="send-btn" title="Send">↑</button>
 </div>
 
@@ -230,7 +314,18 @@ const welcomeEl= document.getElementById('welcome');
 const inpEl    = document.getElementById('inp');
 const sendBtn  = document.getElementById('send-btn');
 const badgeEl  = document.getElementById('badge-text');
+const testAudioBtn = document.getElementById('test-audio-btn');
+
 let busy = false;
+let generating = false;
+let audioContext = null;
+let currentAudioSource = null;
+let isPlaying = false;
+let isPaused = false;
+let audioQueue = [];
+let currentBotRow = null;
+let spokenWords = new Set();
+let allWords = [];
 
 // Auto-resize textarea
 inpEl.addEventListener('input', () => {
@@ -241,7 +336,14 @@ inpEl.addEventListener('input', () => {
 inpEl.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
 });
-sendBtn.addEventListener('click', send);
+
+sendBtn.addEventListener('click', () => {
+  if (generating) {
+    stopGeneration();
+  } else {
+    send();
+  }
+});
 
 function scrollBottom() {
   msgsEl.scrollTop = msgsEl.scrollHeight;
@@ -264,13 +366,215 @@ function appendBot() {
   row.className = 'row bot';
   const b = document.createElement('div');
   b.className = 'bubble';
+  
+  const controls = document.createElement('div');
+  controls.className = 'audio-controls';
+  const playBtn = document.createElement('button');
+  playBtn.className = 'audio-btn';
+  playBtn.innerHTML = '▶';
+  playBtn.disabled = true;
+  playBtn.title = 'Play audio';
+  playBtn.onclick = () => toggleAudio();
+  controls.appendChild(playBtn);
+  
+  b.appendChild(controls);
   const cur = document.createElement('span');
   cur.className = 'cursor';
   b.appendChild(cur);
   row.appendChild(b);
   msgsEl.appendChild(row);
   scrollBottom();
-  return { row, b, cur };
+  return { row, b, cur, playBtn };
+}
+
+function initAudioContext() {
+  if (!audioContext) {
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (audioContext.state === 'suspended') {
+    audioContext.resume();
+  }
+}
+
+function hexToFloat32Array(hex) {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+  }
+  const float32 = new Float32Array(bytes.length / 4);
+  for (let i = 0; i < float32.length; i++) {
+    float32[i] = new DataView(bytes.buffer).getFloat32(i * 4, true);
+  }
+  console.log(`[Audio] Hex->Float32: ${hex.length} chars -> ${float32.length} samples`);
+  return float32;
+}
+
+function playAudioChunk(audioHex, sampleRate) {
+  initAudioContext();
+  console.log(`[Audio] Playing chunk: ${audioHex.length} hex chars, ${sampleRate}Hz`);
+  const audioData = hexToFloat32Array(audioHex);
+  const audioBuffer = audioContext.createBuffer(1, audioData.length, sampleRate);
+  audioBuffer.getChannelData(0).set(audioData);
+  
+  const source = audioContext.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(audioContext.destination);
+  source.start();
+  
+  source.onended = () => {
+    console.log(`[Audio] Chunk finished: ${audioData.length} samples, ${(audioData.length / sampleRate).toFixed(2)}s`);
+  };
+  
+  return source;
+}
+
+function playTestTone() {
+  initAudioContext();
+  const sampleRate = audioContext.sampleRate;
+  const duration = 1.0;
+  const frequency = 440;
+  
+  const audioBuffer = audioContext.createBuffer(1, sampleRate * duration, sampleRate);
+  const data = audioBuffer.getChannelData(0);
+  
+  for (let i = 0; i < data.length; i++) {
+    data[i] = Math.sin(2 * Math.PI * frequency * i / sampleRate) * 0.3;
+  }
+  
+  const source = audioContext.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(audioContext.destination);
+  source.start();
+  
+  testAudioBtn.textContent = '🔊 Playing...';
+  source.onended = () => {
+    testAudioBtn.textContent = '🔊 Test';
+  };
+}
+
+testAudioBtn.addEventListener('click', playTestTone);
+
+function extractWords(text) {
+  const words = [];
+  const regex = /\S+/g;
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    words.push({ text: match[0], start: match.index, end: match.index + match[0].length });
+  }
+  return words;
+}
+
+function updateWordHighlight(fullText, sentenceStart, sentenceEnd) {
+  allWords = extractWords(fullText);
+  const wordsInSentence = allWords.filter(w => w.start >= sentenceStart && w.end <= sentenceEnd);
+  
+  if (currentBotRow && currentBotRow.playBtn) {
+    currentBotRow.playBtn.disabled = false;
+    currentBotRow.playBtn.innerHTML = '⏸';
+    currentBotRow.playBtn.classList.add('playing');
+  }
+}
+
+function renderTextWithHighlights(fullText) {
+  const words = extractWords(fullText);
+  let html = '';
+  let pos = 0;
+  
+  for (const word of words) {
+    html += fullText.slice(pos, word.start);
+    if (spokenWords.has(word.start)) {
+      html += `<span class="word-spoken">${escapeHtml(word.text)}</span>`;
+    } else {
+      html += escapeHtml(word.text);
+    }
+    pos = word.end;
+  }
+  html += fullText.slice(pos);
+  
+  return html;
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+async function playAudioQueue() {
+  if (audioQueue.length === 0 || isPaused) return;
+  
+  const chunk = audioQueue.shift();
+  console.log(`[Audio] Queue: playing chunk, queue size=${audioQueue.length}, sentence=[${chunk.sentenceStart}-${chunk.sentenceEnd}]`);
+  currentAudioSource = playAudioChunk(chunk.audio, chunk.sampleRate);
+  
+  currentAudioSource.onended = () => {
+    if (chunk.sentenceEnd) {
+      for (let i = chunk.sentenceStart; i < chunk.sentenceEnd; i++) {
+        spokenWords.add(i);
+      }
+    }
+    if (currentBotRow && currentBotRow.b) {
+      const displayHtml = renderTextWithHighlights(chunk.full);
+      const controlsHtml = '<div class="audio-controls"><button class="audio-btn" onclick="toggleAudio()">' + 
+        (isPlaying && !isPaused ? '⏸' : '▶') + '</button></div>';
+      currentBotRow.b.innerHTML = displayHtml + controlsHtml + '<span class="cursor"></span>';
+      currentBotRow.playBtn = currentBotRow.b.querySelector('.audio-btn');
+    }
+    if (!isPaused && audioQueue.length > 0) {
+      setTimeout(playAudioQueue, 100);
+    } else if (audioQueue.length === 0) {
+      isPlaying = false;
+      if (currentBotRow && currentBotRow.playBtn) {
+        currentBotRow.playBtn.innerHTML = '▶';
+        currentBotRow.playBtn.classList.remove('playing');
+      }
+    }
+  };
+}
+
+function toggleAudio() {
+  if (!isPlaying && audioQueue.length === 0) return;
+  
+  isPaused = !isPaused;
+  if (currentBotRow && currentBotRow.playBtn) {
+    currentBotRow.playBtn.innerHTML = isPaused ? '▶' : '⏸';
+    currentBotRow.playBtn.classList.toggle('playing', !isPaused);
+  }
+  
+  if (!isPaused) {
+    playAudioQueue();
+  }
+}
+
+function stopAudio() {
+  if (currentAudioSource) {
+    try {
+      currentAudioSource.stop();
+    } catch (e) {}
+    currentAudioSource = null;
+  }
+  audioQueue = [];
+  isPlaying = false;
+  isPaused = false;
+  spokenWords.clear();
+  allWords = [];
+}
+
+async function stopGeneration() {
+  try {
+    await fetch('/stop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
+  } catch (e) {}
+  stopAudio();
+  generating = false;
+  busy = false;
+  sendBtn.innerHTML = '↑';
+  sendBtn.className = 'send';
+  sendBtn.disabled = false;
+  inpEl.focus();
 }
 
 async function send() {
@@ -278,19 +582,24 @@ async function send() {
   if (!prompt || busy) return;
 
   busy = true;
-  sendBtn.disabled = true;
+  generating = true;
+  sendBtn.innerHTML = '⏹';
+  sendBtn.className = 'stop';
   inpEl.value = '';
   inpEl.style.height = 'auto';
 
+  stopAudio();
   appendUser(prompt);
-  const { row, b, cur } = appendBot();
+  const { row, b, cur, playBtn } = appendBot();
+  currentBotRow = { row, b, cur, playBtn };
   let text = '';
+  let lastFullText = '';
 
   try {
-    const res = await fetch('/generate', {
+    const res = await fetch('/generate/voice', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt, max_new_tokens: 512 })
+      body: JSON.stringify({ prompt, max_new_tokens: 512, stream_audio: true })
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
@@ -308,7 +617,19 @@ async function send() {
       for (const part of parts) {
         if (!part.startsWith('data: ')) continue;
         let d;
-        try { d = JSON.parse(part.slice(6)); } catch { continue; }
+        try { d = JSON.parse(part.slice(6)); } catch (e) { 
+          console.error('[SSE] JSON parse error:', e.message, 'data:', part.substring(0, 100));
+          continue; 
+        }
+
+        if (d.stopped) {
+          cur.remove();
+          const s = document.createElement('div');
+          s.className = 'stats';
+          s.textContent = 'Stopped by user';
+          row.appendChild(s);
+          break;
+        }
 
         if (d.done) {
           cur.remove();
@@ -318,11 +639,38 @@ async function send() {
             `${d.tokens_per_second.toFixed(1)} t/s · ${d.total_time_s.toFixed(1)}s · ${d.tokens_generated} tokens`;
           row.appendChild(s);
           badgeEl.textContent = `${d.tokens_per_second.toFixed(1)} t/s`;
+          if (currentBotRow && currentBotRow.playBtn) {
+            currentBotRow.playBtn.innerHTML = '▶';
+            currentBotRow.playBtn.classList.remove('playing');
+          }
         } else if (d.token !== undefined) {
           text += d.token;
-          b.textContent = text;
-          b.appendChild(cur);
-          scrollBottom();
+          if (d.audio) {
+            console.log(`[Audio] Received chunk: hex=${d.audio.length} chars, sentence=[${d.sentence_start||0}-${d.sentence_end||0}], full="${d.full?.substring(0, 50)}..."`);
+            const wasPlaying = isPlaying;
+            audioQueue.push({
+              audio: d.audio,
+              sampleRate: d.sample_rate,
+              sentenceStart: d.sentence_start || 0,
+              sentenceEnd: d.sentence_end || 0,
+              full: d.full
+            });
+            if (!wasPlaying) {
+              isPlaying = true;
+              console.log('[Audio] Starting playback');
+              playAudioQueue();
+            }
+          } else {
+            console.log(`[Audio] Token received (no audio): "${d.token}"`);
+          }
+          if (d.full !== lastFullText) {
+            let displayHtml = renderTextWithHighlights(d.full);
+            const controlsHtml = '<div class="audio-controls"><button class="audio-btn" onclick="toggleAudio()" ' + 
+              (playBtn.disabled ? 'disabled' : '') + '>' + 
+              (isPlaying && !isPaused ? '⏸' : '▶') + '</button></div>';
+            b.innerHTML = displayHtml + controlsHtml + '<span class="cursor"></span>';
+            lastFullText = d.full;
+          }
         }
       }
     }
@@ -331,7 +679,10 @@ async function send() {
     b.classList.add('error');
     b.textContent = `Error: ${err.message}`;
   } finally {
+    generating = false;
     busy = false;
+    sendBtn.innerHTML = '↑';
+    sendBtn.className = 'send';
     sendBtn.disabled = false;
     inpEl.focus();
   }

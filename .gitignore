@@ -1,12 +1,17 @@
 __pycache__/
 *.pyc
 *.pyo
-inference.so
 *.o
 *.dSYM/
 .venv/
 venv/
 tokenizer/
+
+# HuggingFace cache
+.cache/
+
+# Compiled binaries
+inference.so
 
 # Original safetensors — not used by inference, too large for HF Spaces
 models/**/*.safetensors
