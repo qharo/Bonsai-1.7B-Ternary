@@ -136,7 +136,7 @@ def init_model():
     sys.path.insert(0, str(Path(__file__).resolve().parent / "tts"))
     from pocket_tts_onnx import PocketTTSOnnx
     _tts = PocketTTSOnnx(
-        models_dir=os.path.join(os.path.dirname(__file__), "tts", "onnx"),
+        models_dir=os.path.join(os.path.dirname(__file__), "tts", "onnx", "english"),
         language="english_2026-04",
         precision="int8",
     )
