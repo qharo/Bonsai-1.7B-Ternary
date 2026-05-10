@@ -1,0 +1,31 @@
+__pycache__/
+*.pyc
+*.pyo
+inference.so
+*.o
+*.dSYM/
+.venv/
+venv/
+tokenizer/
+
+# Original safetensors — not used by inference, too large for HF Spaces
+models/**/*.safetensors
+
+# fp32 versions of weights that have g128 equivalents — inference uses g128 only
+models/**/weight_model_embed_tokens_weight.bin
+models/**/weight_model_layers_*_mlp_*_proj_weight.bin
+models/**/weight_model_layers_*_self_attn_[qkvo]_proj_weight.bin
+
+# Unused g128 exports of fp32-only weights (layernorms, q/k norms, final norm)
+models/**/*_layernorm_weight_magnitude.bin
+models/**/*_layernorm_weight_sign.bin
+models/**/*_layernorm_weight_scales.bin
+models/**/*_q_norm_weight_magnitude.bin
+models/**/*_q_norm_weight_sign.bin
+models/**/*_q_norm_weight_scales.bin
+models/**/*_k_norm_weight_magnitude.bin
+models/**/*_k_norm_weight_sign.bin
+models/**/*_k_norm_weight_scales.bin
+models/**/weight_model_norm_weight_magnitude.bin
+models/**/weight_model_norm_weight_sign.bin
+models/**/weight_model_norm_weight_scales.bin
