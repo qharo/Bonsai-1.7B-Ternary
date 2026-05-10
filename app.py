@@ -397,13 +397,13 @@ async def generate_voice(req: GenerateRequest):
         
         elapsed = time.perf_counter() - start
         tps = n_tokens / elapsed if elapsed > 0 else 0.0
-        yield f'data: {json.dumps({
+        yield (f'data: {json.dumps({
             "done": True,
             "full": full_text,
             "tokens_generated": n_tokens,
             "total_time_s": round(elapsed, 3),
             "tokens_per_second": round(tps, 2)
-        })}\n\n'
+        })}\n\n')
         _stop_flags[session_id] = False
     
     return StreamingResponse(generate_voice_stream(), media_type="text/event-stream")
