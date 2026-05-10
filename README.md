@@ -2,7 +2,7 @@
 title: Bonsai 1.7B
 emoji: 🌿
 colorFrom: green
-colorTo: teal
+colorTo: green
 sdk: docker
 pinned: false
 app_port: 7860
