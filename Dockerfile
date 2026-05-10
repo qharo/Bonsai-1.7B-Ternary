@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y \
 COPY model_infer.c model_infer.h matmul_common.c matmul_common.h Makefile ./
 COPY app.py requirements.txt ./
 COPY static/ ./static/
+COPY tts/ ./tts/
 
 # Build inference library
 RUN make inference.so CC=clang "CFLAGS=-O3 -std=c11 -Wall -fPIC -march=native -ffast-math -fopenmp"
