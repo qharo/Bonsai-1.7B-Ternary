@@ -25,6 +25,14 @@ typedef struct {
 } LayerWeights;
 
 typedef struct {
+    uint64_t decode_count;      // number of decode steps profiled
+    double   matmul_ns;         // cumulative ns in G128 matmuls (decode only)
+    double   attn_ns;           // cumulative ns in attention core (decode only)
+    double   logits_ns;         // cumulative ns in final embed projection (decode only)
+    double   total_ns;          // cumulative ns across entire model_decode
+} ProfileStats;
+
+typedef struct {
     LayerWeights layers[NUM_LAYERS];
     G128Matrix embed;
     FP32Matrix final_norm;
@@ -36,9 +44,12 @@ typedef struct {
     float attn_scale;
     int kv_len;
     bool loaded;
+    ProfileStats profile;
 } ModelState;
 
 int model_load(ModelState *s, const char *dir);
 void model_free(ModelState *s);
 int model_prefill(ModelState *s, int32_t *tokens, int n, float *logits);
 int model_decode(ModelState *s, int32_t token, float *logits);
+void model_get_profile(ModelState *s, ProfileStats *out);
+void model_reset_profile(ModelState *s);

@@ -6,6 +6,23 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+#ifdef __MACH__
+#include <mach/mach_time.h>
+#else
+#include <time.h>
+#endif
+
+static inline uint64_t now_ns(void) {
+#ifdef __MACH__
+    static mach_timebase_info_data_t info = {0};
+    if (info.denom == 0) mach_timebase_info(&info);
+    return mach_absolute_time() * info.numer / info.denom;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
+}
 
 static inline float half_to_float(uint16_t h) {
     union { uint32_t u; float f; } v;
@@ -150,13 +167,16 @@ static void forward_layer(ModelState *s, int lid, int seqlen, int prefill, int d
     float *h = s->hidden, *n = s->normalized, *res = s->residual;
     float *q = s->q, *k = s->k, *v = s->v, *ao = s->attn_out, *aw = s->attn_weights;
     float *go = s->gate_out, *uo = s->up_out, *ma = s->mlp_act;
+    uint64_t _t0 = 0, _t1 = 0;
 
     memcpy(res, h, seqlen * HIDDEN_SIZE * 4);
     for (int i = 0; i < seqlen; i++) rms_norm(&h[i*HIDDEN_SIZE], lw->ln1.data, &n[i*HIDDEN_SIZE], HIDDEN_SIZE);
 
+    if (!prefill) _t0 = now_ns();
     matmul_simd_g128(n, &lw->q_proj, q, seqlen, HIDDEN_SIZE, HIDDEN_SIZE);
     matmul_simd_g128(n, &lw->k_proj, k, seqlen, HIDDEN_SIZE, NUM_KV_HEADS*HEAD_DIM);
     matmul_simd_g128(n, &lw->v_proj, v, seqlen, HIDDEN_SIZE, NUM_KV_HEADS*HEAD_DIM);
+    if (!prefill) { _t1 = now_ns(); s->profile.matmul_ns += (double)(_t1 - _t0); }
 
     for (int i = 0; i < seqlen; i++) {
         rms_norm_head(&q[i*HIDDEN_SIZE], lw->q_norm.data, NUM_HEADS, HEAD_DIM);
@@ -167,6 +187,7 @@ static void forward_layer(ModelState *s, int lid, int seqlen, int prefill, int d
     apply_rope(q, seqlen, NUM_HEADS, HEAD_DIM, s->inv_freq, s->attn_scale, rope_offset);
     apply_rope(k, seqlen, NUM_KV_HEADS, HEAD_DIM, s->inv_freq, s->attn_scale, rope_offset);
 
+    if (!prefill) _t0 = now_ns();
     // KV cache write (head-major layout: kv_k[lid][head][pos][dim])
     if (prefill) {
         for (int i = 0; i < seqlen; i++) {
@@ -210,7 +231,9 @@ static void forward_layer(ModelState *s, int lid, int seqlen, int prefill, int d
             }
         }
     }
+    if (!prefill) { _t1 = now_ns(); s->profile.attn_ns += (double)(_t1 - _t0); }
 
+    if (!prefill) _t0 = now_ns();
     matmul_simd_g128(ao, &lw->o_proj, h, seqlen, HIDDEN_SIZE, HIDDEN_SIZE);
     for (int i = 0; i < seqlen*HIDDEN_SIZE; i++) h[i] += res[i];
     memcpy(res, h, seqlen*HIDDEN_SIZE*4);
@@ -222,6 +245,7 @@ static void forward_layer(ModelState *s, int lid, int seqlen, int prefill, int d
     silu(go, ma, seqlen*INTERMEDIATE_SIZE);
     for (int i = 0; i < seqlen*INTERMEDIATE_SIZE; i++) go[i] = ma[i] * uo[i];
     matmul_simd_g128(go, &lw->down_proj, h, seqlen, INTERMEDIATE_SIZE, HIDDEN_SIZE);
+    if (!prefill) { _t1 = now_ns(); s->profile.matmul_ns += (double)(_t1 - _t0); }
     for (int i = 0; i < seqlen*HIDDEN_SIZE; i++) h[i] += res[i];
 }
 
@@ -341,6 +365,8 @@ int model_prefill(ModelState *s, int32_t *tokens, int n, float *logits) {
 int model_decode(ModelState *s, int32_t token, float *logits) {
     if (!s->loaded) return -1;
     if (token < 0 || token >= s->embed.num_rows) return -1;
+
+    uint64_t _tstart = now_ns();
     embed_lookup(&s->embed, token, s->hidden);
 
     int pos = s->kv_len;
@@ -349,7 +375,23 @@ int model_decode(ModelState *s, int32_t token, float *logits) {
     for (int i = 0; i < NUM_LAYERS; i++) forward_layer(s, i, 1, 0, pos);
     s->kv_len = pos + 1;
 
+    uint64_t _lt0 = now_ns();
     rms_norm(s->hidden, s->final_norm.data, s->normalized, HIDDEN_SIZE);
     matmul_simd_g128(s->normalized, &s->embed, logits, 1, HIDDEN_SIZE, (int)s->embed.num_rows);
+    s->profile.logits_ns += (double)(now_ns() - _lt0);
+    s->profile.total_ns += (double)(now_ns() - _tstart);
+    s->profile.decode_count++;
     return 0;
+}
+
+void model_get_profile(ModelState *s, ProfileStats *out) {
+    out->decode_count = s->profile.decode_count;
+    out->matmul_ns    = s->profile.matmul_ns;
+    out->attn_ns      = s->profile.attn_ns;
+    out->logits_ns    = s->profile.logits_ns;
+    out->total_ns     = s->profile.total_ns;
+}
+
+void model_reset_profile(ModelState *s) {
+    memset(&s->profile, 0, sizeof(s->profile));
 }

@@ -1,29 +1,38 @@
 """
-TinyTTS ONNX — CPU inference with no PyTorch/transformers/numba.
-Downloads models from HuggingFace Hub on first use.
+TinyTTS ONNX — CPU inference, no PyTorch/transformers/numba.
+Model and tokenizer loaded from models/tinytts/ (local, not HF Hub).
 """
-import os
-import re
+import os, re
 import numpy as np
 import onnxruntime as ort
-from huggingface_hub import hf_hub_download
 from g2p_en import G2p
 from tokenizers import Tokenizer
 
-_REPO = "backtracking/tiny-tts"
+_MODEL_DIR = os.path.join(os.path.dirname(__file__), "models", "tinytts")
 
-# Phoneme symbols from tiny-tts (English subset + punctuation + special)
-_EN_SYMBOLS = [
-    "aa", "ae", "ah", "ao", "aw", "ay", "b", "ch", "d", "dh",
-    "eh", "er", "ey", "f", "g", "hh", "ih", "iy", "jh", "k",
-    "l", "m", "n", "ng", "ow", "oy", "p", "r", "s", "sh", "t",
-    "th", "uh", "uw", "V", "w", "y", "z", "zh",
-]
+# ── Full multilingual phoneme table (from tiny_tts.text.symbols) ──
+
+_ZH_SYMBOLS = ["E","En","a","ai","an","ang","ao","b","c","ch","d","e","ei","en","eng","er","f","g","h","i","i0","ia","ian","iang","iao","ie","in","ing","iong","ir","iu","j","k","l","m","n","o","ong","ou","p","q","r","s","sh","t","u","ua","uai","uan","uang","ui","un","uo","v","van","ve","vn","w","x","y","z","zh","AA","EE","OO"]
+_JA_SYMBOLS = ["N","a","a:","b","by","ch","d","dy","e","e:","f","g","gy","h","hy","i","i:","j","k","ky","m","my","n","ny","o","o:","p","py","q","r","ry","s","sh","t","ts","ty","u","u:","w","y","z","zy"]
+_EN_SYMBOLS = ["aa","ae","ah","ao","aw","ay","b","ch","d","dh","eh","er","ey","f","g","hh","ih","iy","jh","k","l","m","n","ng","ow","oy","p","r","s","sh","t","th","uh","uw","V","w","y","z","zh"]
+_KR_SYMBOLS = ['ᄌ','ᅥ','ᆫ','ᅦ','ᄋ','ᅵ','ᄅ','ᅴ','ᄀ','ᅡ','ᄎ','ᅪ','ᄑ','ᅩ','ᄐ','ᄃ','ᅢ','ᅮ','ᆼ','ᅳ','ᄒ','ᄆ','ᆯ','ᆷ','ᄂ','ᄇ','ᄉ','ᆮ','ᄁ','ᅬ','ᅣ','ᄄ','ᆨ','ᄍ','ᅧ','ᄏ','ᆸ','ᅭ','(','ᄊ',')','ᅲ','ᅨ','ᄈ','ᅱ','ᅯ','ᅫ','ᅰ','ᅤ','~','\\','[',']','/','^',':','ㄸ','*']
+_ES_SYMBOLS = ["N","Q","a","b","d","e","f","g","h","i","j","k","l","m","n","o","p","s","t","u","v","w","x","y","z","ɑ","æ","ʃ","ʑ","ç","ɯ","ɪ","ɔ","ɛ","ɹ","ð","ə","ɫ","ɥ","ɸ","ʊ","ɾ","ʒ","θ","β","ŋ","ɦ","ɡ","r","ɲ","ʝ","ɣ","ʎ","ˈ","ˌ","ː"]
+_FR_SYMBOLS = ["\u0303","œ","ø","ʁ","ɒ","ʌ","ɜ","ɐ"]
+_DE_SYMBOLS = ["ʏ","̩"]
+_RU_SYMBOLS = ["ɭ","ʲ","ɕ","\"","ɵ","^","ɬ"]
+
 _PUNCTUATION = ["!", "?", "…", ",", ".", "'", "-", "¿", "¡", "SP", "UNK"]
-_SYMBOLS = ["_"] + sorted(set(_EN_SYMBOLS)) + _PUNCTUATION
+
+_NORMAL_SYMBOLS = sorted(set(_ZH_SYMBOLS + _JA_SYMBOLS + _EN_SYMBOLS + _KR_SYMBOLS + _ES_SYMBOLS + _FR_SYMBOLS + _DE_SYMBOLS + _RU_SYMBOLS))
+_SYMBOLS = ["_"] + _NORMAL_SYMBOLS + _PUNCTUATION
 _SYM_TO_ID = {s: i for i, s in enumerate(_SYMBOLS)}
 
-# ARPAbet → tiny-tts symbol mapping (excluding stress markers)
+# ── Constants ──
+_UNK_ID = _SYM_TO_ID["UNK"]
+_PAD_ID = _SYM_TO_ID["_"]
+_EN_TONE_OFFSET = 7  # num_zh_tones(6) + num_ja_tones(1)
+
+# ── ARPAbet → tiny-tts mapping ──
 _ARPA_MAP = {
     "AA": "aa", "AE": "ae", "AH": "ah", "AO": "ao", "AW": "aw", "AY": "ay",
     "B": "b", "CH": "ch", "D": "d", "DH": "dh", "EH": "eh", "ER": "er",
@@ -35,22 +44,10 @@ _ARPA_MAP = {
 }
 _ARPABET_SET = set(_ARPA_MAP.keys())
 
-# English tone offset (from tiny_tts.text.symbols: ZH=6 + JP=1)
-_EN_TONE_OFFSET = 7
-_UNK_ID = _SYM_TO_ID["UNK"]
-_PAD_ID = _SYM_TO_ID["_"]  # blank/padding symbol
-
-# Punctuation mapping from tiny-tts
 _PUNCT_MAP = {
     "：": ",", "；": ",", "，": ",", "。": ".", "！": "!",
-    "？": "?", "\n": ".", "·": ",", "、": ",", "…": "…",
-    "v": "V",
+    "？": "?", "\n": ".", "·": ",", "、": ",", "…": "…", "v": "V",
 }
-
-_TEXT_NORM_REPLACEMENTS = [
-    (r"(\d+)\.(\d+)", r"\1 point \2"),
-    (r"(\d+)\s*-\s*(\d+)", r"\1 to \2"),
-]
 
 
 def _insert_blanks(lst, item):
@@ -60,7 +57,6 @@ def _insert_blanks(lst, item):
 
 
 def _parse_arpabet(ph):
-    """Parse an ARPAbet phone string into (symbol, tone)."""
     m = re.match(r'^([A-Z]+)(\d)$', ph)
     if m:
         return m.group(1), int(m.group(2)) + 1
@@ -68,7 +64,6 @@ def _parse_arpabet(ph):
 
 
 def _map_phoneme(symbol):
-    """Map a phoneme/grapheme to a tiny-tts symbol."""
     if symbol in _PUNCT_MAP:
         symbol = _PUNCT_MAP[symbol]
     if symbol in _SYM_TO_ID:
@@ -77,34 +72,30 @@ def _map_phoneme(symbol):
 
 
 class TinyTTSOnnx:
-    """TinyTTS inference via ONNX Runtime, with no PyTorch/transformers."""
 
     def __init__(self):
         self.sample_rate = 44100
         self.frame_rate = 44100.0 / 512.0
         self.predefined_voices = ["MALE", "FEMALE"]
 
-        model_path = hf_hub_download(_REPO, "tinytts_fp16.onnx")
+        onnx_path = os.path.join(_MODEL_DIR, "tinytts_fp16.onnx")
         opts = ort.SessionOptions()
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         opts.intra_op_num_threads = os.cpu_count() or 2
         opts.inter_op_num_threads = 1
         self.session = ort.InferenceSession(
-            model_path, sess_options=opts, providers=["CPUExecutionProvider"]
+            onnx_path, sess_options=opts, providers=["CPUExecutionProvider"]
         )
 
-        # Load BERT tokenizer for word-level tokenization (matches tiny-tts pipeline)
-        try:
-            tok_path = hf_hub_download("bert-base-uncased", "tokenizer.json")
+        tok_path = os.path.join(_MODEL_DIR, "tokenizer.json")
+        if os.path.exists(tok_path):
             self.tokenizer = Tokenizer.from_file(tok_path)
-        except Exception:
+        else:
             self.tokenizer = None
 
         self.g2p = G2p()
 
     def _tokenize_words(self, text: str) -> list[str]:
-        """Tokenize text into words using BERT WordPiece tokenizer,
-        group subwords back into whole words for CMU dict lookup."""
         words = []
         if self.tokenizer:
             encoded = self.tokenizer.encode(text)
@@ -127,8 +118,8 @@ class TinyTTSOnnx:
 
     def _text_to_ids(self, text: str):
         text = text.strip().lower()
-        for pat, repl in _TEXT_NORM_REPLACEMENTS:
-            text = re.sub(pat, repl, text)
+        text = re.sub(r"(\d+)\.(\d+)", r"\1 point \2", text)
+        text = re.sub(r"(\d+)\s*-\s*(\d+)", r"\1 to \2", text)
 
         words = self._tokenize_words(text)
         phones = []
@@ -175,33 +166,25 @@ class TinyTTSOnnx:
         phone_ids, tone_ids, lang_ids = self._text_to_ids(text)
         T = len(phone_ids)
 
-        sid = 0
         x = np.array(phone_ids, dtype=np.int64)[None, :]
         x_len = np.array([T], dtype=np.int64)
         tone = np.array(tone_ids, dtype=np.int64)[None, :]
         lang = np.array(lang_ids, dtype=np.int64)[None, :]
-        bert = np.zeros((1, 1024, T), dtype=np.float32)
-        ja_bert = np.zeros((1, 768, T), dtype=np.float32)
-        sid_arr = np.array([sid], dtype=np.int64)
-        noise_scale = np.array([0.667], dtype=np.float32)
-        noise_scale_w = np.array([0.8], dtype=np.float32)
-        length_scale = np.array([1.0], dtype=np.float32)
+        bert = np.zeros((1, 1024, T), dtype=np.float16)
+        ja_bert = np.zeros((1, 768, T), dtype=np.float16)
+        sid_arr = np.array([0], dtype=np.int64)
+        noise_scale = np.array([0.667], dtype=np.float16)
+        noise_scale_w = np.array([0.8], dtype=np.float16)
+        length_scale = np.array([1.0], dtype=np.float16)
 
-        audio = self.session.run(
-            None,
-            {
-                "x": x,
-                "x_lengths": x_len,
-                "sid": sid_arr,
-                "tone": tone,
-                "language": lang,
-                "bert": bert.astype(np.float16),
-                "ja_bert": ja_bert.astype(np.float16),
-                "noise_scale": noise_scale.astype(np.float16),
-                "noise_scale_w": noise_scale_w.astype(np.float16),
-                "length_scale": length_scale.astype(np.float16),
-            },
-        )[0]
+        audio = self.session.run(None, {
+            "x": x, "x_lengths": x_len, "sid": sid_arr,
+            "tone": tone, "language": lang,
+            "bert": bert, "ja_bert": ja_bert,
+            "noise_scale": noise_scale,
+            "noise_scale_w": noise_scale_w,
+            "length_scale": length_scale,
+        })[0]
 
         return audio[0, 0].astype(np.float32)
 

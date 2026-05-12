@@ -28,6 +28,7 @@ STOP_EOS = 151645
 # Global state
 _lib = None
 ModelState = None
+ProfileStats = None
 _model = None
 _tts = None
 _tokenizer = None
@@ -36,7 +37,7 @@ FP32Matrix = None
 LayerWeights = None
 
 def load_library():
-    global _lib, ModelState, G128Matrix, FP32Matrix, LayerWeights
+    global _lib, ModelState, ProfileStats, G128Matrix, FP32Matrix, LayerWeights
     
     lib_path = os.path.join(os.path.dirname(__file__), "inference.so")
     if not os.path.exists(lib_path):
@@ -77,6 +78,15 @@ def load_library():
             ("down_proj", G128MatrixStruct),
         ]
     
+    class ProfileStatsStruct(ctypes.Structure):
+        _fields_ = [
+            ("decode_count", ctypes.c_uint64),
+            ("matmul_ns", ctypes.c_double),
+            ("attn_ns", ctypes.c_double),
+            ("logits_ns", ctypes.c_double),
+            ("total_ns", ctypes.c_double),
+        ]
+
     class ModelStateStruct(ctypes.Structure):
         _fields_ = [
             ("layers", LayerWeightsStruct * 28),
@@ -100,15 +110,17 @@ def load_library():
             ("attn_scale", ctypes.c_float),
             ("kv_len", ctypes.c_int),
             ("loaded", ctypes.c_bool),
+            ("profile", ProfileStatsStruct),
         ]
     
     G128Matrix = G128MatrixStruct
     FP32Matrix = FP32MatrixStruct
     LayerWeights = LayerWeightsStruct
     ModelState = ModelStateStruct
+    ProfileStats = ProfileStatsStruct
 
 def init_model():
-    global _model, _tokenizer, _lib, _tts, ModelState
+    global _model, _tokenizer, _lib, _tts, ModelState, ProfileStats
     
     if _model is not None:
         return
@@ -122,6 +134,10 @@ def init_model():
     _lib.model_prefill.restype = ctypes.c_int
     _lib.model_decode.argtypes = [ctypes.POINTER(ModelState), ctypes.c_int32, ctypes.POINTER(ctypes.c_float)]
     _lib.model_decode.restype = ctypes.c_int
+    _lib.model_get_profile.argtypes = [ctypes.POINTER(ModelState), ctypes.POINTER(ProfileStats)]
+    _lib.model_get_profile.restype = None
+    _lib.model_reset_profile.argtypes = [ctypes.POINTER(ModelState)]
+    _lib.model_reset_profile.restype = None
     
     _model = ModelState()
     ret = _lib.model_load(ctypes.byref(_model), MODEL_DIR.encode())
@@ -184,9 +200,9 @@ def np_softmax(x):
     return e / e.sum()
 
 def sample_token(logits, temperature, top_p, top_k):
-    logits = np.array(logits[:VOCAB_SIZE], dtype=np.float32)
+    logits = np.frombuffer(logits, dtype=np.float32).copy()
     if temperature > 0:
-        logits = logits / temperature
+        logits /= temperature
     if top_k > 0:
         # argpartition is O(n) vs argsort O(n log n)
         top_k = min(top_k, len(logits))
@@ -467,6 +483,49 @@ async def health():
         "simd": simd,
         "omp_threads": omp_threads,
     }
+
+@app.get("/profile")
+async def profile():
+    if not _model:
+        return {"error": "model not loaded"}
+    p = ProfileStats()
+    _lib.model_get_profile(ctypes.byref(_model), ctypes.byref(p))
+    c = p.decode_count
+    if c == 0:
+        return {"decode_count": 0, "message": "no decode steps recorded yet"}
+    matmul_ms = p.matmul_ns / 1e6
+    attn_ms = p.attn_ns / 1e6
+    logits_ms = p.logits_ns / 1e6
+    total_ms = p.total_ns / 1e6
+    return {
+        "decode_count": c,
+        "avg_per_step_ms": {
+            "matmul": round(matmul_ms / c, 2),
+            "attention": round(attn_ms / c, 2),
+            "logits": round(logits_ms / c, 2),
+            "other_plus_overhead": round((total_ms - matmul_ms - attn_ms - logits_ms) / c, 2),
+            "total": round(total_ms / c, 2),
+        },
+        "pct_of_total": {
+            "matmul": f"{matmul_ms/total_ms*100:.1f}%",
+            "attention": f"{attn_ms/total_ms*100:.1f}%",
+            "logits": f"{logits_ms/total_ms*100:.1f}%",
+            "other": f"{(total_ms-matmul_ms-attn_ms-logits_ms)/total_ms*100:.1f}%",
+        },
+        "cumulative_s": {
+            "matmul": round(matmul_ms / 1000, 2),
+            "attention": round(attn_ms / 1000, 2),
+            "logits": round(logits_ms / 1000, 2),
+            "total": round(total_ms / 1000, 2),
+        },
+    }
+
+@app.post("/profile/reset")
+async def profile_reset():
+    if not _model:
+        return {"error": "model not loaded"}
+    _lib.model_reset_profile(ctypes.byref(_model))
+    return {"reset": True}
 
 @app.get("/model/info")
 async def model_info():
