@@ -643,26 +643,10 @@ async function send() {
             currentBotRow.playBtn.innerHTML = '▶';
             currentBotRow.playBtn.classList.remove('playing');
           }
-        } else if (d.token !== undefined) {
+        }
+
+        if (d.token !== undefined) {
           text += d.token;
-          if (d.audio) {
-            console.log(`[Audio] Received chunk: hex=${d.audio.length} chars, sentence=[${d.sentence_start||0}-${d.sentence_end||0}], full="${d.full?.substring(0, 50)}..."`);
-            const wasPlaying = isPlaying;
-            audioQueue.push({
-              audio: d.audio,
-              sampleRate: d.sample_rate,
-              sentenceStart: d.sentence_start || 0,
-              sentenceEnd: d.sentence_end || 0,
-              full: d.full
-            });
-            if (!wasPlaying) {
-              isPlaying = true;
-              console.log('[Audio] Starting playback');
-              playAudioQueue();
-            }
-          } else {
-            console.log(`[Audio] Token received (no audio): "${d.token}"`);
-          }
           if (d.full !== lastFullText) {
             let displayHtml = renderTextWithHighlights(d.full);
             const controlsHtml = '<div class="audio-controls"><button class="audio-btn" onclick="toggleAudio()" ' + 
@@ -670,6 +654,21 @@ async function send() {
               (isPlaying && !isPaused ? '⏸' : '▶') + '</button></div>';
             b.innerHTML = displayHtml + controlsHtml + '<span class="cursor"></span>';
             lastFullText = d.full;
+          }
+        }
+
+        if (d.audio) {
+          const wasPlaying = isPlaying;
+          audioQueue.push({
+            audio: d.audio,
+            sampleRate: d.sample_rate,
+            sentenceStart: d.sentence_start || 0,
+            sentenceEnd: d.sentence_end || 0,
+            full: d.full || lastFullText,
+          });
+          if (!wasPlaying) {
+            isPlaying = true;
+            playAudioQueue();
           }
         }
       }

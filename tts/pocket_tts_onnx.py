@@ -124,17 +124,16 @@ class PocketTTSOnnx:
     def _get_providers(self, device: str) -> list[str]:
         if device == "cpu":
             return ["CPUExecutionProvider"]
-        if device == "cuda":
-            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
         available = ort.get_available_providers()
-        if "CUDAExecutionProvider" in available:
+        if device == "cuda" and "CUDAExecutionProvider" in available:
             return ["CUDAExecutionProvider", "CPUExecutionProvider"]
         return ["CPUExecutionProvider"]
 
     def _make_session_options(self) -> ort.SessionOptions:
         opts = ort.SessionOptions()
-        opts.intra_op_num_threads = min(os.cpu_count() or 4, 4)
+        opts.intra_op_num_threads = os.cpu_count() or 2
         opts.inter_op_num_threads = 1
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         return opts
 
     def _model_file(self, stem: str) -> str:

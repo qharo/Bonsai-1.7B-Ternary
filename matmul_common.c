@@ -202,6 +202,137 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
 }
 
 #elif defined(__AVX2__)
+
+#include <immintrin.h>
+
+// 8-bit LUT for AVX2: maps 8-bit pattern to 8 × uint32 mask
+// Lane j = all-1s if bit j of index is set, else 0
+static uint32_t avx2_mag_lut[256][8] __attribute__((aligned(64)));
+static int avx2_lut_init = 0;
+
+static void init_avx2_lut_once(void) {
+    if (avx2_lut_init) return;
+    for (int i = 0; i < 256; i++)
+        for (int j = 0; j < 8; j++)
+            avx2_mag_lut[i][j] = ((i >> j) & 1) ? 0xFFFFFFFF : 0;
+    avx2_lut_init = 1;
+}
+
+// Horitzontal sum across 8-wide YMM → single float
+static inline float hsum_avx2(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    return _mm_cvtss_f32(s);
+}
+
+#define LUT_ACCUM_AVX2(acc, mag_w, sgn_w, b, sc, av) do { \
+    uint8_t _mn = ((uint64_t)(mag_w) >> (b)) & 0xFF; \
+    uint8_t _sn = ((uint64_t)(sgn_w) >> (b)) & 0xFF; \
+    __m256 _ps = (sc); \
+    __m256 _ns = _mm256_xor_ps(_ps, _mm256_set1_ps(-0.0f)); \
+    __m256 _sg = _mm256_blendv_ps(_ps, _ns, \
+        _mm256_load_si256((const __m256i*)avx2_mag_lut[_sn])); \
+    __m256 _w  = _mm256_and_ps(_sg, \
+        _mm256_load_si256((const __m256i*)avx2_mag_lut[_mn])); \
+    (acc) = _mm256_fmadd_ps(_w, (av), (acc)); \
+} while(0)
+
+void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) {
+    init_avx2_lut_once();
+    int nkb = (int)B_T->num_blocks_col;
+    const float *sf = B_T->scales_f32;
+    for (int i = 0; i < M; i++) {
+        int n8 = (N / 8) * 8;
+        #pragma omp parallel for schedule(static) if(n8 >= 512)
+        for (int j = 0; j < n8; j += 8) {
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+            __m256 acc2 = _mm256_setzero_ps();
+            __m256 acc3 = _mm256_setzero_ps();
+            __m256 acc4 = _mm256_setzero_ps();
+            __m256 acc5 = _mm256_setzero_ps();
+            __m256 acc6 = _mm256_setzero_ps();
+            __m256 acc7 = _mm256_setzero_ps();
+            for (int bk = 0; bk < nkb; bk++) {
+                int b0=(j+0)*nkb+bk, b1=(j+1)*nkb+bk;
+                int b2=(j+2)*nkb+bk, b3=(j+3)*nkb+bk;
+                int b4=(j+4)*nkb+bk, b5=(j+5)*nkb+bk;
+                int b6=(j+6)*nkb+bk, b7=(j+7)*nkb+bk;
+                uint64_t m00=B_T->magnitude[b0*2+0], m01=B_T->magnitude[b0*2+1];
+                uint64_t s00=B_T->sign[b0*2+0],      s01=B_T->sign[b0*2+1];
+                uint64_t m10=B_T->magnitude[b1*2+0], m11=B_T->magnitude[b1*2+1];
+                uint64_t s10=B_T->sign[b1*2+0],      s11=B_T->sign[b1*2+1];
+                uint64_t m20=B_T->magnitude[b2*2+0], m21=B_T->magnitude[b2*2+1];
+                uint64_t s20=B_T->sign[b2*2+0],      s21=B_T->sign[b2*2+1];
+                uint64_t m30=B_T->magnitude[b3*2+0], m31=B_T->magnitude[b3*2+1];
+                uint64_t s30=B_T->sign[b3*2+0],      s31=B_T->sign[b3*2+1];
+                uint64_t m40=B_T->magnitude[b4*2+0], m41=B_T->magnitude[b4*2+1];
+                uint64_t s40=B_T->sign[b4*2+0],      s41=B_T->sign[b4*2+1];
+                uint64_t m50=B_T->magnitude[b5*2+0], m51=B_T->magnitude[b5*2+1];
+                uint64_t s50=B_T->sign[b5*2+0],      s51=B_T->sign[b5*2+1];
+                uint64_t m60=B_T->magnitude[b6*2+0], m61=B_T->magnitude[b6*2+1];
+                uint64_t s60=B_T->sign[b6*2+0],      s61=B_T->sign[b6*2+1];
+                uint64_t m70=B_T->magnitude[b7*2+0], m71=B_T->magnitude[b7*2+1];
+                uint64_t s70=B_T->sign[b7*2+0],      s71=B_T->sign[b7*2+1];
+                float sc0=sf[b0], sc1=sf[b1], sc2=sf[b2], sc3=sf[b3];
+                float sc4=sf[b4], sc5=sf[b5], sc6=sf[b6], sc7=sf[b7];
+                __m256 ps0=_mm256_set1_ps(sc0), ps1=_mm256_set1_ps(sc1);
+                __m256 ps2=_mm256_set1_ps(sc2), ps3=_mm256_set1_ps(sc3);
+                __m256 ps4=_mm256_set1_ps(sc4), ps5=_mm256_set1_ps(sc5);
+                __m256 ps6=_mm256_set1_ps(sc6), ps7=_mm256_set1_ps(sc7);
+                const float *ap = &A[i * K + bk * G128_BLOCK_SIZE];
+                for (int b = 0; b < 64; b += 8) {
+                    __m256 av = _mm256_loadu_ps(ap + b);
+                    LUT_ACCUM_AVX2(acc0, m00, s00, b, ps0, av);
+                    LUT_ACCUM_AVX2(acc1, m10, s10, b, ps1, av);
+                    LUT_ACCUM_AVX2(acc2, m20, s20, b, ps2, av);
+                    LUT_ACCUM_AVX2(acc3, m30, s30, b, ps3, av);
+                    LUT_ACCUM_AVX2(acc4, m40, s40, b, ps4, av);
+                    LUT_ACCUM_AVX2(acc5, m50, s50, b, ps5, av);
+                    LUT_ACCUM_AVX2(acc6, m60, s60, b, ps6, av);
+                    LUT_ACCUM_AVX2(acc7, m70, s70, b, ps7, av);
+                }
+                for (int b = 0; b < 64; b += 8) {
+                    __m256 av = _mm256_loadu_ps(ap + 64 + b);
+                    LUT_ACCUM_AVX2(acc0, m01, s01, b, ps0, av);
+                    LUT_ACCUM_AVX2(acc1, m11, s11, b, ps1, av);
+                    LUT_ACCUM_AVX2(acc2, m21, s21, b, ps2, av);
+                    LUT_ACCUM_AVX2(acc3, m31, s31, b, ps3, av);
+                    LUT_ACCUM_AVX2(acc4, m41, s41, b, ps4, av);
+                    LUT_ACCUM_AVX2(acc5, m51, s51, b, ps5, av);
+                    LUT_ACCUM_AVX2(acc6, m61, s61, b, ps6, av);
+                    LUT_ACCUM_AVX2(acc7, m71, s71, b, ps7, av);
+                }
+            }
+            C[i*N+j+0]=hsum_avx2(acc0); C[i*N+j+1]=hsum_avx2(acc1);
+            C[i*N+j+2]=hsum_avx2(acc2); C[i*N+j+3]=hsum_avx2(acc3);
+            C[i*N+j+4]=hsum_avx2(acc4); C[i*N+j+5]=hsum_avx2(acc5);
+            C[i*N+j+6]=hsum_avx2(acc6); C[i*N+j+7]=hsum_avx2(acc7);
+        }
+        for (int j = n8; j < N; j++) {
+            __m256 acc = _mm256_setzero_ps();
+            int rb = j * nkb;
+            for (int bk = 0; bk < nkb; bk++) {
+                int bidx = rb + bk;
+                uint64_t mag0=B_T->magnitude[bidx*2+0], mag1=B_T->magnitude[bidx*2+1];
+                uint64_t sgn0=B_T->sign[bidx*2+0],      sgn1=B_T->sign[bidx*2+1];
+                __m256 ps = _mm256_set1_ps(sf[bidx]);
+                const float *ap = &A[i * K + bk * G128_BLOCK_SIZE];
+                for (int b = 0; b < 64; b += 8)
+                    LUT_ACCUM_AVX2(acc, mag0, sgn0, b, ps, _mm256_loadu_ps(ap + b));
+                for (int b = 0; b < 64; b += 8)
+                    LUT_ACCUM_AVX2(acc, mag1, sgn1, b, ps, _mm256_loadu_ps(ap + 64 + b));
+            }
+            C[i*N+j] = hsum_avx2(acc);
+        }
+    }
+}
+
+#elif defined(__SSE4_1__)
+
 #include <immintrin.h>
 
 static inline float hsum_ps(__m128 v) {
@@ -218,10 +349,7 @@ static const uint32_t mag_lut_x86[16][4] __attribute__((aligned(16))) = {
     {0,0,~0u,~0u},   {~0u,0,~0u,~0u}, {0,~0u,~0u,~0u}, {~0u,~0u,~0u,~0u}
 };
 
-/* Decode 4-bit magnitude/sign nibbles into ±scale SSE vector and accumulate.
-   blendv_ps selects neg_sc where sign mask MSB=1, pos_sc where MSB=0.
-   and_ps zeros out elements where magnitude=0. */
-#define LUT_ACCUM_X86(acc, mag_w, sgn_w, b, neg_sc, pos_sc, av) do { \
+#define LUT_ACCUM_SSE(acc, mag_w, sgn_w, b, neg_sc, pos_sc, av) do { \
     uint8_t _mn = ((uint64_t)(mag_w) >> (b)) & 0xF; \
     uint8_t _sn = ((uint64_t)(sgn_w) >> (b)) & 0xF; \
     __m128 _sg = _mm_blendv_ps((pos_sc), (neg_sc), \
@@ -241,17 +369,17 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
             __m128 acc0 = _mm_setzero_ps(), acc1 = _mm_setzero_ps();
             __m128 acc2 = _mm_setzero_ps(), acc3 = _mm_setzero_ps();
             for (int bk = 0; bk < nkb; bk++) {
-                int bidx0=(j+0)*nkb+bk, bidx1=(j+1)*nkb+bk;
-                int bidx2=(j+2)*nkb+bk, bidx3=(j+3)*nkb+bk;
-                uint64_t m00=B_T->magnitude[bidx0*2+0], m01=B_T->magnitude[bidx0*2+1];
-                uint64_t s00=B_T->sign[bidx0*2+0],      s01=B_T->sign[bidx0*2+1];
-                uint64_t m10=B_T->magnitude[bidx1*2+0], m11=B_T->magnitude[bidx1*2+1];
-                uint64_t s10=B_T->sign[bidx1*2+0],      s11=B_T->sign[bidx1*2+1];
-                uint64_t m20=B_T->magnitude[bidx2*2+0], m21=B_T->magnitude[bidx2*2+1];
-                uint64_t s20=B_T->sign[bidx2*2+0],      s21=B_T->sign[bidx2*2+1];
-                uint64_t m30=B_T->magnitude[bidx3*2+0], m31=B_T->magnitude[bidx3*2+1];
-                uint64_t s30=B_T->sign[bidx3*2+0],      s31=B_T->sign[bidx3*2+1];
-                float sc0=sf[bidx0], sc1=sf[bidx1], sc2=sf[bidx2], sc3=sf[bidx3];
+                int b0=(j+0)*nkb+bk, b1=(j+1)*nkb+bk;
+                int b2=(j+2)*nkb+bk, b3=(j+3)*nkb+bk;
+                uint64_t m00=B_T->magnitude[b0*2+0], m01=B_T->magnitude[b0*2+1];
+                uint64_t s00=B_T->sign[b0*2+0],      s01=B_T->sign[b0*2+1];
+                uint64_t m10=B_T->magnitude[b1*2+0], m11=B_T->magnitude[b1*2+1];
+                uint64_t s10=B_T->sign[b1*2+0],      s11=B_T->sign[b1*2+1];
+                uint64_t m20=B_T->magnitude[b2*2+0], m21=B_T->magnitude[b2*2+1];
+                uint64_t s20=B_T->sign[b2*2+0],      s21=B_T->sign[b2*2+1];
+                uint64_t m30=B_T->magnitude[b3*2+0], m31=B_T->magnitude[b3*2+1];
+                uint64_t s30=B_T->sign[b3*2+0],      s31=B_T->sign[b3*2+1];
+                float sc0=sf[b0], sc1=sf[b1], sc2=sf[b2], sc3=sf[b3];
                 __m128 ns0=_mm_set1_ps(-sc0), ps0=_mm_set1_ps(sc0);
                 __m128 ns1=_mm_set1_ps(-sc1), ps1=_mm_set1_ps(sc1);
                 __m128 ns2=_mm_set1_ps(-sc2), ps2=_mm_set1_ps(sc2);
@@ -259,21 +387,21 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
                 const float *ap = &A[i * K + bk * G128_BLOCK_SIZE];
                 for (int b = 0; b < 64; b += 4) {
                     __m128 av = _mm_loadu_ps(ap + b);
-                    LUT_ACCUM_X86(acc0, m00, s00, b, ns0, ps0, av);
-                    LUT_ACCUM_X86(acc1, m10, s10, b, ns1, ps1, av);
-                    LUT_ACCUM_X86(acc2, m20, s20, b, ns2, ps2, av);
-                    LUT_ACCUM_X86(acc3, m30, s30, b, ns3, ps3, av);
+                    LUT_ACCUM_SSE(acc0, m00, s00, b, ns0, ps0, av);
+                    LUT_ACCUM_SSE(acc1, m10, s10, b, ns1, ps1, av);
+                    LUT_ACCUM_SSE(acc2, m20, s20, b, ns2, ps2, av);
+                    LUT_ACCUM_SSE(acc3, m30, s30, b, ns3, ps3, av);
                 }
                 for (int b = 0; b < 64; b += 4) {
                     __m128 av = _mm_loadu_ps(ap + 64 + b);
-                    LUT_ACCUM_X86(acc0, m01, s01, b, ns0, ps0, av);
-                    LUT_ACCUM_X86(acc1, m11, s11, b, ns1, ps1, av);
-                    LUT_ACCUM_X86(acc2, m21, s21, b, ns2, ps2, av);
-                    LUT_ACCUM_X86(acc3, m31, s31, b, ns3, ps3, av);
+                    LUT_ACCUM_SSE(acc0, m01, s01, b, ns0, ps0, av);
+                    LUT_ACCUM_SSE(acc1, m11, s11, b, ns1, ps1, av);
+                    LUT_ACCUM_SSE(acc2, m21, s21, b, ns2, ps2, av);
+                    LUT_ACCUM_SSE(acc3, m31, s31, b, ns3, ps3, av);
                 }
             }
-            C[i*N+j+0] = hsum_ps(acc0); C[i*N+j+1] = hsum_ps(acc1);
-            C[i*N+j+2] = hsum_ps(acc2); C[i*N+j+3] = hsum_ps(acc3);
+            C[i*N+j+0]=hsum_ps(acc0); C[i*N+j+1]=hsum_ps(acc1);
+            C[i*N+j+2]=hsum_ps(acc2); C[i*N+j+3]=hsum_ps(acc3);
         }
         for (int j = n4; j < N; j++) {
             __m128 acc = _mm_setzero_ps();
@@ -286,9 +414,9 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
                 __m128 ns=_mm_set1_ps(-sc), ps=_mm_set1_ps(sc);
                 const float *ap = &A[i * K + bk * G128_BLOCK_SIZE];
                 for (int b = 0; b < 64; b += 4)
-                    LUT_ACCUM_X86(acc, mag0, sgn0, b, ns, ps, _mm_loadu_ps(ap + b));
+                    LUT_ACCUM_SSE(acc, mag0, sgn0, b, ns, ps, _mm_loadu_ps(ap + b));
                 for (int b = 0; b < 64; b += 4)
-                    LUT_ACCUM_X86(acc, mag1, sgn1, b, ns, ps, _mm_loadu_ps(ap + 64 + b));
+                    LUT_ACCUM_SSE(acc, mag1, sgn1, b, ns, ps, _mm_loadu_ps(ap + 64 + b));
             }
             C[i*N+j] = hsum_ps(acc);
         }
@@ -338,11 +466,11 @@ void matmul_swar_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
     }
 }
 
-static uint8_t LUT_POS[256][256]; // LUT_POS[mag_byte][A_byte] not useful for float; LUT used for popcount
+static uint8_t LUT_POS[256][256];
 static int lut_initialized = 0;
 
 void matmul_lut_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) {
-    (void)LUT_POS; // suppress unused warning
+    (void)LUT_POS; (void)lut_initialized;
     int nkb = (int)B_T->num_blocks_col;
     for (int i = 0; i < M; i++) {
         for (int j = 0; j < N; j++) {

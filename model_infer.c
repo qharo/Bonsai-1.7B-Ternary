@@ -148,7 +148,7 @@ static void apply_rope(float *q, int seqlen, int nh, int hd, float *invf, float 
 static void forward_layer(ModelState *s, int lid, int seqlen, int prefill, int decode_pos) {
     LayerWeights *lw = &s->layers[lid];
     float *h = s->hidden, *n = s->normalized, *res = s->residual;
-    float *q = s->q, *k = s->k, *v = s->v, *ao = s->attn_out, *aw = s->attn_weights, *ap = s->attn_probs;
+    float *q = s->q, *k = s->k, *v = s->v, *ao = s->attn_out, *aw = s->attn_weights;
     float *go = s->gate_out, *uo = s->up_out, *ma = s->mlp_act;
 
     memcpy(res, h, seqlen * HIDDEN_SIZE * 4);
@@ -167,39 +167,46 @@ static void forward_layer(ModelState *s, int lid, int seqlen, int prefill, int d
     apply_rope(q, seqlen, NUM_HEADS, HEAD_DIM, s->inv_freq, s->attn_scale, rope_offset);
     apply_rope(k, seqlen, NUM_KV_HEADS, HEAD_DIM, s->inv_freq, s->attn_scale, rope_offset);
 
-    // KV cache write — kv_len is managed by the caller, not modified here
+    // KV cache write (head-major layout: kv_k[lid][head][pos][dim])
     if (prefill) {
         for (int i = 0; i < seqlen; i++) {
-            memcpy(&s->kv_k[lid][i][0][0], &k[i*NUM_KV_HEADS*HEAD_DIM], NUM_KV_HEADS*HEAD_DIM*4);
-            memcpy(&s->kv_v[lid][i][0][0], &v[i*NUM_KV_HEADS*HEAD_DIM], NUM_KV_HEADS*HEAD_DIM*4);
+            for (int h = 0; h < NUM_KV_HEADS; h++) {
+                memcpy(&s->kv_k[lid][h][i][0], &k[i*NUM_KV_HEADS*HEAD_DIM + h*HEAD_DIM], HEAD_DIM*4);
+                memcpy(&s->kv_v[lid][h][i][0], &v[i*NUM_KV_HEADS*HEAD_DIM + h*HEAD_DIM], HEAD_DIM*4);
+            }
         }
     } else {
-        memcpy(&s->kv_k[lid][decode_pos][0][0], &k[0], NUM_KV_HEADS*HEAD_DIM*4);
-        memcpy(&s->kv_v[lid][decode_pos][0][0], &v[0], NUM_KV_HEADS*HEAD_DIM*4);
+        for (int h = 0; h < NUM_KV_HEADS; h++) {
+            memcpy(&s->kv_k[lid][h][decode_pos][0], &k[h*HEAD_DIM], HEAD_DIM*4);
+            memcpy(&s->kv_v[lid][h][decode_pos][0], &v[h*HEAD_DIM], HEAD_DIM*4);
+        }
     }
 
     int kv_len = prefill ? seqlen : decode_pos + 1;
-    memset(ao, 0, seqlen * HIDDEN_SIZE * 4);
     for (int h = 0; h < NUM_HEADS; h++) {
         int qkh = h / (NUM_HEADS / NUM_KV_HEADS);
+        float *k_cache_head = &s->kv_k[lid][qkh][0][0];
+        float *v_cache_head = &s->kv_v[lid][qkh][0][0];
         for (int i = 0; i < seqlen; i++) {
             int query_pos = prefill ? i : decode_pos;
+            float *q_head = &q[i*HIDDEN_SIZE + h*HEAD_DIM];
+            float *aw_row = &aw[i * kv_len];
             for (int j = 0; j < kv_len; j++) {
-                if (j > query_pos) aw[i*kv_len+j] = -1e38f;
-                else {
-                    float sc = 0;
-                    for (int d = 0; d < HEAD_DIM; d++) sc += q[i*HIDDEN_SIZE+h*HEAD_DIM+d] * s->kv_k[lid][j][qkh][d];
-                    aw[i*kv_len+j] = sc / sqrtf((float)HEAD_DIM);
-                }
+                if (j > query_pos) { aw_row[j] = -1e38f; continue; }
+                float sc = 0;
+                float *kc = &k_cache_head[j * HEAD_DIM];
+                for (int d = 0; d < HEAD_DIM; d++) sc += q_head[d] * kc[d];
+                aw_row[j] = sc / sqrtf((float)HEAD_DIM);
             }
-            softmax(&aw[i*kv_len], kv_len);
-            memcpy(&ap[i*kv_len], &aw[i*kv_len], kv_len*4);
+            softmax(aw_row, kv_len);
         }
         for (int i = 0; i < seqlen; i++) {
+            float *aw_row = &aw[i * kv_len];
+            float *ao_head = &ao[i*HIDDEN_SIZE + h*HEAD_DIM];
             for (int d = 0; d < HEAD_DIM; d++) {
                 float val = 0;
-                for (int j = 0; j < kv_len; j++) val += ap[i*kv_len+j] * s->kv_v[lid][j][qkh][d];
-                ao[i*HIDDEN_SIZE+h*HEAD_DIM+d] = val;
+                for (int j = 0; j < kv_len; j++) val += aw_row[j] * v_cache_head[j * HEAD_DIM + d];
+                ao_head[d] = val;
             }
         }
     }
@@ -262,7 +269,6 @@ int model_load(ModelState *s, const char *dir) {
     s->v = calloc(MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM, 4);
     s->attn_out = calloc(MAX_SEQ_LEN * HIDDEN_SIZE, 4);
     s->attn_weights = calloc(MAX_SEQ_LEN * MAX_SEQ_LEN, 4);
-    s->attn_probs = calloc(MAX_SEQ_LEN * MAX_SEQ_LEN, 4);
     s->gate_out = calloc(MAX_SEQ_LEN * INTERMEDIATE_SIZE, 4);
     s->up_out = calloc(MAX_SEQ_LEN * INTERMEDIATE_SIZE, 4);
     s->mlp_act = calloc(MAX_SEQ_LEN * INTERMEDIATE_SIZE, 4);
@@ -310,7 +316,7 @@ void model_free(ModelState *s) {
     }
     free(s->hidden); free(s->normalized); free(s->residual);
     free(s->q); free(s->k); free(s->v); free(s->attn_out);
-    free(s->attn_weights); free(s->attn_probs);
+    free(s->attn_weights);
     free(s->gate_out); free(s->up_out); free(s->mlp_act);
 }
 

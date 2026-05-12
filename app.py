@@ -7,6 +7,7 @@ import json
 import ctypes
 import time
 import asyncio
+import concurrent.futures
 import numpy as np
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -128,6 +129,9 @@ def init_model():
     ret = _lib.model_load(ctypes.byref(_model), MODEL_DIR.encode())
     if ret != 0:
         raise RuntimeError(f"Failed to load model from {MODEL_DIR}")
+
+    global _logits_buf
+    _logits_buf = (ctypes.c_float * VOCAB_SIZE)()
     
     _tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
     print(f"Model loaded: vocab={_model.embed.num_rows}")
@@ -201,19 +205,22 @@ def sample_token(logits, temperature, top_p, top_k):
     probs = np_softmax(logits)
     return int(np.random.choice(len(probs), p=probs))
 
+_logits_buf = None
+_max_token_array = None
+
 def generate_tokens(prompt_tokens, max_new, temp, top_p, top_k, stop_ids):
-    logits = (ctypes.c_float * VOCAB_SIZE)()
+    global _logits_buf
     token_array = (ctypes.c_int32 * len(prompt_tokens))(*prompt_tokens)
-    ret = _lib.model_prefill(ctypes.byref(_model), token_array, len(prompt_tokens), logits)
+    ret = _lib.model_prefill(ctypes.byref(_model), token_array, len(prompt_tokens), _logits_buf)
     if ret != 0:
         raise RuntimeError("Prefill failed")
     
     for i in range(max_new):
-        next_token = sample_token(logits, temp, top_p, top_k)
+        next_token = sample_token(_logits_buf, temp, top_p, top_k)
         yield next_token
         if next_token in stop_ids:
             break
-        ret = _lib.model_decode(ctypes.byref(_model), ctypes.c_int32(next_token), logits)
+        ret = _lib.model_decode(ctypes.byref(_model), ctypes.c_int32(next_token), _logits_buf)
         if ret != 0:
             break
 
@@ -323,79 +330,93 @@ def find_sentence_boundaries(text: str) -> list[int]:
 async def generate_voice(req: GenerateRequest):
     if not _tts:
         raise HTTPException(status_code=503, detail="TTS not loaded")
-    
+
     session_id = "default"
     _stop_flags[session_id] = False
-    
+
     messages = []
     if req.system_prompt:
         messages.append({"role": "system", "content": req.system_prompt})
     messages.append({"role": "user", "content": req.prompt})
-    
+
     text = _tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
     tokens = _tokenizer.encode(text, add_special_tokens=False)
     stop_ids = set(req.stop_tokens) if req.stop_tokens else {STOP_EOS}
-    
+
     def generate_voice_stream():
         full_text = ""
         n_tokens = 0
         last_boundary = 0
         start = time.perf_counter()
-        
-        for token in generate_tokens(tokens, req.max_new_tokens, req.temperature, req.top_p, req.top_k, stop_ids):
-            if _stop_flags.get(session_id, False):
-                yield f"data: {json.dumps({'stopped': True, 'full': full_text})}\n\n"
-                return
-            
-            if token == STOP_EOS:
-                break
-            txt = _tokenizer.decode([token], skip_special_tokens=True)
-            full_text += txt
-            n_tokens += 1
-            
-            boundaries = find_sentence_boundaries(full_text)
-            if boundaries and boundaries[-1] > last_boundary:
-                sentence_end = boundaries[-1]
-                sentence_text = full_text[last_boundary:sentence_end + 1].strip()
-                if sentence_text and len(sentence_text) > 3:
+        pending = []
+
+        tts_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            for token in generate_tokens(tokens, req.max_new_tokens, req.temperature, req.top_p, req.top_k, stop_ids):
+                if _stop_flags.get(session_id, False):
+                    yield f"data: {json.dumps({'stopped': True, 'full': full_text})}\n\n"
+                    return
+
+                if token == STOP_EOS:
+                    break
+                txt = _tokenizer.decode([token], skip_special_tokens=True)
+                full_text += txt
+                n_tokens += 1
+
+                # Drain completed TTS futures — yield audio events as they finish
+                while pending and pending[0][0].done():
+                    future, sstart, send, _ = pending.pop(0)
                     try:
-                        audio = _tts.generate(sentence_text, voice=req.voice, max_frames=188, frames_after_eos=0)
+                        audio = future.result()
                         audio_bytes = audio.tobytes()
-                        response_data = {
-                            'token': txt,
-                            'full': full_text,
+                        yield f"data: {json.dumps({
                             'audio': audio_bytes.hex(),
                             'sample_rate': _tts.sample_rate,
-                            'sentence_start': last_boundary,
-                            'sentence_end': sentence_end + 1
-                        }
-                        yield f"data: {json.dumps(response_data)}\n\n"
-                        last_boundary = sentence_end + 1
+                            'sentence_start': sstart,
+                            'sentence_end': send,
+                            'full': full_text,
+                        })}\n\n"
                     except Exception as e:
                         print(f"TTS error: {e}")
-                        yield f"data: {json.dumps({'token': txt, 'full': full_text, 'tts_error': str(e)})}\n\n"
-                else:
-                    yield f"data: {json.dumps({'token': txt, 'full': full_text})}\n\n"
-            else:
+
+                # Detect sentence boundaries and submit to TTS pool
+                boundaries = find_sentence_boundaries(full_text)
+                if boundaries and boundaries[-1] > last_boundary:
+                    sentence_end = boundaries[-1]
+                    sentence_text = full_text[last_boundary:sentence_end + 1].strip()
+                    if sentence_text and len(sentence_text) > 3:
+                        future = tts_pool.submit(_tts.generate, sentence_text, voice=req.voice)
+                        pending.append((future, last_boundary, sentence_end + 1, full_text))
+                        last_boundary = sentence_end + 1
+
                 yield f"data: {json.dumps({'token': txt, 'full': full_text})}\n\n"
-        
-        if last_boundary < len(full_text):
-            remaining = full_text[last_boundary:].strip()
-            if remaining:
+
+            # Remaining text after last sentence boundary
+            if last_boundary < len(full_text):
+                remaining = full_text[last_boundary:].strip()
+                if remaining:
+                    future = tts_pool.submit(_tts.generate, remaining, voice=req.voice)
+                    pending.append((future, last_boundary, len(full_text), full_text))
+
+            # Drain all pending TTS futures
+            while pending:
+                future, sstart, send, _ = pending.pop(0)
                 try:
-                    audio = _tts.generate(remaining, voice=req.voice, max_frames=188, frames_after_eos=0)
+                    audio = future.result()
                     audio_bytes = audio.tobytes()
-                    response_data = {
+                    yield f"data: {json.dumps({
                         'audio': audio_bytes.hex(),
                         'sample_rate': _tts.sample_rate,
-                        'sentence_start': last_boundary,
-                        'sentence_end': len(full_text),
-                        'final': True
-                    }
-                    yield f"data: {json.dumps(response_data)}\n\n"
+                        'sentence_start': sstart,
+                        'sentence_end': send,
+                        'full': full_text,
+                        'final': True,
+                    })}\n\n"
                 except Exception as e:
                     print(f"TTS error (final): {e}")
-        
+        finally:
+            tts_pool.shutdown(wait=False)
+
         elapsed = time.perf_counter() - start
         tps = n_tokens / elapsed if elapsed > 0 else 0.0
         done_payload = json.dumps({
@@ -407,7 +428,7 @@ async def generate_voice(req: GenerateRequest):
         })
         yield f'data: {done_payload}\n\n'
         _stop_flags[session_id] = False
-    
+
     return StreamingResponse(generate_voice_stream(), media_type="text/event-stream")
 
 

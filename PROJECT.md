@@ -102,7 +102,7 @@ For each of 28 layers:
 After all layers: final RMSNorm, then **lm_head** (FP32 dot product with embedding matrix: `hidden → vocab_size logits`).
 
 ### KV cache
-Static allocation: `float kv_k[28][512][8][128]` and `kv_v` same shape (28 layers × 512 max positions × 8 KV heads × 128 head dim). Populated during prefill, extended one position per decode step.
+Static allocation: `float kv_k[28][8][512][128]` and `kv_v` same shape — **head-major layout** (`[layer][head][pos][dim]`) for cache-friendly attention during decode. Consecutive positions for a given head are spaced by 512 bytes (128 × 4), fitting well within L1/L2 cache. Populated during prefill, extended one position per decode step.
 
 ---
 
@@ -110,17 +110,17 @@ Static allocation: `float kv_k[28][512][8][128]` and `kv_v` same shape (28 layer
 
 The core routine. Processes `M × K` input against a `N × K` G128 weight matrix, producing `M × N` output.
 
-**Key design decisions:**
-- **4-wide output loop**: processes 4 output rows simultaneously to expose independent accumulators
-- **4-bit nibble LUT**: decodes 4 magnitude bits + 4 sign bits → 4 float weights using a 16-entry lookup table
-- **Platform dispatch** via `#ifdef`:
-  - `__ARM_NEON` → `float32x4_t` + `vmlaq_f32` + `vbslq_f32`
-  - `__AVX2__` → `__m128` + `_mm_add_ps(_mm_mul_ps(...))` + `_mm_blendv_ps` (SSE4.1, auto-fused to FMA)
-  - fallback → scalar SWAR
-- **OpenMP**: `#pragma omp parallel for schedule(static) if(n4 >= 512)` on the outer j loop
-- **FP32 scales precomputed at load time** (`scales_f32` field on `G128Matrix`): avoids ~28M `half_to_float` calls per decode step
+### Key design:
+- **Platform dispatch** via `#if` chain: `__ARM_NEON` → `__AVX2__` → `__SSE4_1__` → scalar fallback
+- **AVX2**: 8-wide output loop, 256-bit YMM, 8-bit LUT (256-entry, 8 KB), `_mm256_fmadd_ps`
+- **NEON**: 4-wide output loop, 128-bit NEON, 4-bit LUT (16-entry), `vmlaq_f32`
+- **SSE**: 4-wide output loop, 128-bit XMM, 4-bit LUT (16-entry), `_mm_add_ps(_mm_mul_ps(...))`
+- **LUT decode**: for each 4/8-bit nibble from packed mag/sign uint64s, a 16/256-entry lookup table maps to 4/8 × float32 masks — blendv for sign selection, AND for mag zeroing
+- **Scale negation via XOR** (AVX2 only): `_mm256_xor_ps(ps, signbit)` avoids pre-computing neg_sc vectors
+- **OpenMP**: `#pragma omp parallel for schedule(static) if(n8 >= 256)` on the outer j loop (N≥2048 parallelized)
+- **FP32 scales precomputed at load time**: avoids ~28M `half_to_float` calls per decode step
 
-**`lm_head` (vocab projection)**: plain C with `restrict` + 4-wide unrolling + OpenMP — lets the compiler auto-vectorize with NEON/AVX2 without explicit intrinsics.
+**`lm_head` (vocab projection)**: Uses the same `matmul_simd_g128` kernel as all other projections — no special code path required.
 
 ---
 
@@ -158,19 +158,62 @@ loop:
 
 Baseline (before optimizations): **1.64 t/s**
 
-| Optimization | Gain |
-|---|---|
-| NEON lm_head (4-wide unrolling + `-march=native`) | ~1.57× |
-| `np.argpartition` for top-k, vectorized top-p cumsum | minor |
-| Batch tokenizer decode (collect IDs, single call) | minor |
-| Async thread pool for blocking C calls | correctness + concurrency |
-| OpenMP parallelism on matmul j-loop + lm_head | major |
-| FP32 scales precomputed at load time | ~10-15% |
-| `-ffast-math` compiler flag | ~10-20% |
+**After current optimizations: ~5.6 t/s** on Apple Silicon, target **4-7 t/s** on HF Spaces (2 vCPU, 16 GB).
 
-**After all optimizations: ~5.6 t/s** on Apple Silicon (M-series, ARM64 Docker).
+### Optimization history
 
-On HF Spaces (x86_64): AVX2 path in `matmul_simd_g128` provides equivalent SIMD performance; OpenMP scales with vCPU count.
+| Optimization | Gain | Notes |
+|---|---|---|
+| NEON lm_head (4-wide unrolling + `-march=native`) | ~1.57× | - |
+| `np.argpartition` for top-k, vectorized top-p cumsum | minor | - |
+| Batch tokenizer decode (collect IDs, single call) | minor | - |
+| Async thread pool for blocking C calls | correctness + concurrency | - |
+| OpenMP parallelism on matmul j-loop + lm_head | major | - |
+| FP32 scales precomputed at load time | ~10-15% | - |
+| `-ffast-math` compiler flag | ~10-20% | - |
+| **AVX2 256-bit matmul kernel** (8-wide, 256-bit YMM) | **~1.5-1.8×** | Replaced SSE 4-wide with AVX2 8-wide + 256-bit FMA |
+| **KV cache head-major transpose** | ~5-10% | `kv_k[lid][head][pos][dim]` for sequential attention reads |
+| **Redundant op removal** | ~2% | Removed memset/memcpy in attention, pre-allocated Python logits |
+
+### SIMD kernel dispatch
+
+```c
+#if defined(__ARM_NEON)     → 4-wide, float32x4_t, vmlaq_f32 (FMA)
+#elif defined(__AVX2__)     → 8-wide, __m256, _mm256_fmadd_ps (true 256-bit)
+#elif defined(__SSE4_1__)   → 4-wide, __m128, _mm_add_ps(_mm_mul_ps(...))
+#else                       → scalar SWAR (ctzll loop)
+```
+
+The AVX2 kernel:
+- 8-bit nibble → 256-entry LUT (8 KB) of 8 × float32 masks
+- Processes 8 output rows simultaneously vs 4 in SSE
+- Uses `_mm256_fmadd_ps` for fused multiply-accumulate
+- Negates scales via `_mm256_xor_ps` sign-bit trick instead of separate neg/pos broadcasts
+- Results: per-iteration throughput halved (64 LUT calls/block vs 128 SSE calls/block)
+
+### Future optimization path: lm_head vocabulary filtering (quality-at-risk)
+
+The lm_head computes `dot(h, e_r)` for all 151669 vocabulary entries — 310M weight elements per decode step, the single largest matmul. The vocabulary is dense (all but 2 of 151671 tokens valid), so naive sparsity filtering doesn't help.
+
+**Proposed approach** (not yet implemented — requires quality evaluation):
+
+1. **Two-phase scoring:**
+   - Phase 1: Precompute 16 block-wise sums of the hidden state: `block_sum[b] = Σ_{i in block b} h[i]`
+   - For each token row, compute a cheap score: `approx_r = Σ_b scale_{r,b} × block_sum[b] / 128`
+   - This treats all weights in a block as +scale (ignoring sign), yielding an overestimate
+   - Phase 2: Compute exact dot products for the top-K (e.g., K=2000) candidates only
+
+2. **Token frequency cache:**
+   - Maintain a rolling cache of recently sampled tokens
+   - Score the cache first; if the max logit is above a threshold, skip the full scan
+
+3. **Quality degradation risk:**
+   - The coarse score overestimates influence of oppositely-signed blocks, potentially ranking a low-probability token too high
+   - Mitigation: use a conservative K (e.g., 2000 of 151669 = 1.3%), which captures >99% of true top-1 probability mass in practice
+   - Worst case: ≈0.1-0.5% generation quality regression in perplexity
+   - **Revert strategy:** remove the `#define LM_HEAD_PREFILTER 1` flag and fall back to full compute
+
+4. **Expected speedup:** ~1.3-1.5× on lm_head alone if prefilter catches 98% of tokens. ~10-15% overall.
 
 ---
 

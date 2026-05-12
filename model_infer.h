@@ -28,10 +28,10 @@ typedef struct {
     LayerWeights layers[NUM_LAYERS];
     G128Matrix embed;
     FP32Matrix final_norm;
-    float *hidden, *normalized, *residual, *q, *k, *v, *attn_out, *attn_weights, *attn_probs;
+    float *hidden, *normalized, *residual, *q, *k, *v, *attn_out, *attn_weights;
     float *gate_out, *up_out, *mlp_act;
-    float kv_k[NUM_LAYERS][MAX_SEQ_LEN][NUM_KV_HEADS][HEAD_DIM];
-    float kv_v[NUM_LAYERS][MAX_SEQ_LEN][NUM_KV_HEADS][HEAD_DIM];
+    float kv_k[NUM_LAYERS][NUM_KV_HEADS][MAX_SEQ_LEN][HEAD_DIM];
+    float kv_v[NUM_LAYERS][NUM_KV_HEADS][MAX_SEQ_LEN][HEAD_DIM];
     float inv_freq[HEAD_DIM/2];
     float attn_scale;
     int kv_len;
