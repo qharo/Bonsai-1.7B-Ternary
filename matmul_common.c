@@ -210,13 +210,14 @@ static int avx512_lut_init = 0;
 
 static void init_avx512_lut_once(void) {
     if (avx512_lut_init) return;
+    AVX512_SIGN_MASK = _mm256_castsi256_ps(_mm256_set1_epi32((int)0x80000000));
     for (int i = 0; i < 256; i++)
         for (int j = 0; j < 16; j++)
             avx512_mag_lut[i][j] = ((i >> j) & 1) ? 0xFFFFFFFF : 0;
     avx512_lut_init = 1;
 }
 
-static const __m256 AVX512_SIGN_MASK = _mm256_set1_ps(-0.0f);
+static __m256 AVX512_SIGN_MASK;
 
 // acc = FMA(av, w, acc) where w = decode(mag[16bits], sgn[16bits], ps, ns)
 // ps = +scale broadcast, ns = -scale broadcast (precomputed)
