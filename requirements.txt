@@ -4,6 +4,7 @@ transformers>=4.37.0
 numpy>=1.24.0
 tokenizers>=0.15.0
 jinja2>=3.1.0
-onnxruntime>=1.17.0
-sentencepiece>=0.1.99
-safetensors>=0.4.0
+tiny-tts>=0.3.0
+huggingface_hub
+nltk
+scipy>=1.10.0

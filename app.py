@@ -2,14 +2,12 @@
 """FastAPI server for BitNet 1.7B inference with streaming."""
 
 import os
-import sys
 import json
 import ctypes
 import time
 import asyncio
 import concurrent.futures
 import numpy as np
-from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse
@@ -137,14 +135,32 @@ def init_model():
     print(f"Model loaded: vocab={_model.embed.num_rows}")
     
     # Initialize TTS
-    sys.path.insert(0, str(Path(__file__).resolve().parent / "tts"))
-    from pocket_tts_onnx import PocketTTSOnnx
-    _tts = PocketTTSOnnx(
-        models_dir=os.path.join(os.path.dirname(__file__), "tts", "onnx", "english"),
-        language="english_2026-04",
-        precision="int8",
-    )
-    print(f"TTS loaded: sample_rate={_tts.sample_rate}, voices={_tts.predefined_voices}")
+    from tiny_tts import TinyTTS
+    from tiny_tts.utils.config import SAMPLING_RATE
+    import nltk
+    try:
+        for resource in ('averaged_perceptron_tagger_eng', 'averaged_perceptron_tagger', 'cmudict'):
+            try:
+                nltk.data.find(f'corpora/{resource}' if resource == 'cmudict' else f'taggers/{resource}')
+            except LookupError:
+                nltk.download(resource, quiet=True)
+    except Exception:
+        pass
+
+    _tts_raw = TinyTTS()
+    # Wrap to match expected interface
+    class _TTSWrapper:
+        sample_rate = SAMPLING_RATE
+        frame_rate = SAMPLING_RATE / 256.0
+        predefined_voices = ['MALE', 'FEMALE']
+        def generate(self, text, voice='MALE'):
+            speaker = voice.upper() if voice.upper() in ('MALE', 'FEMALE') else 'MALE'
+            return _tts_raw.speak(text, speaker=speaker, output_path='/tmp/tts_out.wav')
+        def stream(self, text, voice='MALE'):
+            audio = self.generate(text, voice)
+            yield audio
+    _tts = _TTSWrapper()
+    print(f"TTS loaded: sample_rate={SAMPLING_RATE}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -170,7 +186,7 @@ class GenerateRequest(BaseModel):
     top_k: int = DEFAULT_TOP_K
     stop_tokens: list = None
     stream_audio: bool = False
-    voice: str = "alba"
+    voice: str = "MALE"
 
 
 class StopRequest(BaseModel):
@@ -491,7 +507,7 @@ async def model_info():
 
 class TTSRequest(BaseModel):
     text: str
-    voice: str = "alba"
+    voice: str = "MALE"
 
 
 @app.post("/tts/generate")
