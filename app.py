@@ -354,7 +354,8 @@ async def generate_voice(req: GenerateRequest):
         try:
             for token in generate_tokens(tokens, req.max_new_tokens, req.temperature, req.top_p, req.top_k, stop_ids):
                 if _stop_flags.get(session_id, False):
-                    yield f"data: {json.dumps({'stopped': True, 'full': full_text})}\n\n"
+                    stop_payload = json.dumps({'stopped': True, 'full': full_text})
+                    yield f"data: {stop_payload}\n\n"
                     return
 
                 if token == STOP_EOS:
@@ -369,13 +370,14 @@ async def generate_voice(req: GenerateRequest):
                     try:
                         audio = future.result()
                         audio_bytes = audio.tobytes()
-                        yield f"data: {json.dumps({
+                        audio_payload = json.dumps({
                             'audio': audio_bytes.hex(),
                             'sample_rate': _tts.sample_rate,
                             'sentence_start': sstart,
                             'sentence_end': send,
                             'full': full_text,
-                        })}\n\n"
+                        })
+                        yield f"data: {audio_payload}\n\n"
                     except Exception as e:
                         print(f"TTS error: {e}")
 
@@ -389,7 +391,8 @@ async def generate_voice(req: GenerateRequest):
                         pending.append((future, last_boundary, sentence_end + 1, full_text))
                         last_boundary = sentence_end + 1
 
-                yield f"data: {json.dumps({'token': txt, 'full': full_text})}\n\n"
+                token_payload = json.dumps({'token': txt, 'full': full_text})
+                yield f"data: {token_payload}\n\n"
 
             # Remaining text after last sentence boundary
             if last_boundary < len(full_text):
@@ -404,14 +407,15 @@ async def generate_voice(req: GenerateRequest):
                 try:
                     audio = future.result()
                     audio_bytes = audio.tobytes()
-                    yield f"data: {json.dumps({
+                    final_payload = json.dumps({
                         'audio': audio_bytes.hex(),
                         'sample_rate': _tts.sample_rate,
                         'sentence_start': sstart,
                         'sentence_end': send,
                         'full': full_text,
                         'final': True,
-                    })}\n\n"
+                    })
+                    yield f"data: {final_payload}\n\n"
                 except Exception as e:
                     print(f"TTS error (final): {e}")
         finally:
