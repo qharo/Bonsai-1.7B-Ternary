@@ -141,7 +141,10 @@ def init_model():
     _lib.model_reset_profile.restype = None
     _lib.model_matmul_path.restype = ctypes.c_char_p
     _lib.model_compile_info.restype = ctypes.c_char_p
-    
+    _lib.model_set_omp_threads.argtypes = [ctypes.c_int]
+    _lib.model_set_omp_threads.restype = None
+    _lib.model_set_omp_threads(ctypes.c_int(os.cpu_count() or 16))
+
     t0 = time.perf_counter()
     _model = ModelState()
     ret = _lib.model_load(ctypes.byref(_model), MODEL_DIR.encode())

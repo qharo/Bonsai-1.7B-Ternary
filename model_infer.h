@@ -12,7 +12,7 @@
 #define NUM_LAYERS 28
 #define VOCAB_SIZE 151669
 #define MAX_SEQ_LEN 512
-#define LM_HEAD_CANDIDATES 8192
+#define LM_HEAD_CANDIDATES 4096
 
 typedef struct {
     float *data;
@@ -58,3 +58,4 @@ void model_get_profile(ModelState *s, ProfileStats *out);
 void model_reset_profile(ModelState *s);
 const char* model_matmul_path(void);
 const char* model_compile_info(void);
+void model_set_omp_threads(int n);
