@@ -207,6 +207,7 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
 
 static uint32_t avx512_mag_lut[256][16] __attribute__((aligned(64)));
 static int avx512_lut_init = 0;
+static __m256 AVX512_SIGN_MASK;
 
 static void init_avx512_lut_once(void) {
     if (avx512_lut_init) return;
@@ -216,8 +217,6 @@ static void init_avx512_lut_once(void) {
             avx512_mag_lut[i][j] = ((i >> j) & 1) ? 0xFFFFFFFF : 0;
     avx512_lut_init = 1;
 }
-
-static __m256 AVX512_SIGN_MASK;
 
 // acc = FMA(av, w, acc) where w = decode(mag[16bits], sgn[16bits], ps, ns)
 // ps = +scale broadcast, ns = -scale broadcast (precomputed)
