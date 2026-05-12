@@ -38,6 +38,7 @@ class PocketTTSOnnx:
     VALID_PRECISIONS = ("int8", "fp32")
     TOKENS_PER_SECOND_ESTIMATE = 3.0
     GEN_SECONDS_PADDING = 2.0
+    MIN_FRAMES_BEFORE_EOS = 8
 
     def __init__(
         self,
@@ -146,31 +147,18 @@ class PocketTTSOnnx:
             return fp32.name
         raise FileNotFoundError(f"Missing ONNX file for {stem} in {self.bundle_dir}")
 
-    def _resolve_onnx(self, filename: str, required: bool = True) -> Optional[str]:
-        local = self.bundle_dir / filename
-        if local.exists():
-            return str(local)
-        hf_path = f"onnx/{self.language}/{filename}"
-        try:
-            return hf_hub_download(repo_id=self.HF_REPO_ID, filename=hf_path)
-        except Exception as exc:
-            if required:
-                raise FileNotFoundError(
-                    f"Cannot find {filename} locally or on HF Hub ({hf_path}): {exc}"
-                ) from exc
-            return None
-
     def _load_models(self):
         opts = self._make_session_options()
 
-        encoder_path = self._resolve_onnx("mimi_encoder.onnx", required=False)
-        self.mimi_encoder = (
-            ort.InferenceSession(encoder_path, sess_options=opts, providers=self.providers)
-            if encoder_path
-            else None
-        )
+        try:
+            encoder_file = self._model_file("mimi_encoder")
+            self.mimi_encoder = ort.InferenceSession(
+                str(self.bundle_dir / encoder_file), sess_options=opts, providers=self.providers
+            )
+        except FileNotFoundError:
+            self.mimi_encoder = None
         self.text_conditioner = ort.InferenceSession(
-            self._resolve_onnx("text_conditioner.onnx", required=True),
+            str(self.bundle_dir / self._model_file("text_conditioner")),
             sess_options=opts,
             providers=self.providers,
         )
@@ -374,8 +362,12 @@ class PocketTTSOnnx:
             return self._clone_state(self._voice_state_cache[voice_str])
 
         if voice_str in self.predefined_voices:
-            filename = f"languages/{self.language}/embeddings/{voice_str}.safetensors"
-            model_state = self._hf_model_state(filename)
+            local_embed = self.bundle_dir / f"{voice_str}.safetensors"
+            if local_embed.exists():
+                model_state = self._import_model_state_file(local_embed)
+            else:
+                filename = f"languages/{self.language}/embeddings/{voice_str}.safetensors"
+                model_state = self._hf_model_state(filename)
             state = self._state_from_model_state(model_state, self.flow_state_manifest)
             self._voice_state_cache[voice_str] = self._clone_state(state)
             return state
@@ -521,7 +513,7 @@ class PocketTTSOnnx:
             eos_logit = result[1]
             self._update_state_from_outputs(state, result, self.flow_state_manifest, output_offset=2)
 
-            if eos_logit[0][0] > -4.0 and eos_step is None:
+            if step >= self.MIN_FRAMES_BEFORE_EOS and eos_logit[0][0] > -4.0 and eos_step is None:
                 eos_step = step
             if eos_step is not None and step >= eos_step + frames_after_eos:
                 break
