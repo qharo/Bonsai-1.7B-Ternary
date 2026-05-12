@@ -1,3 +1,8 @@
+// Expose POSIX clock_gettime even under -std=c11 — must precede ALL system includes
+#ifndef __MACH__
+#define _GNU_SOURCE
+#endif
+
 #include "model_infer.h"
 #include <stdio.h>
 #include <stdlib.h>
