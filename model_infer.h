@@ -53,3 +53,5 @@ int model_prefill(ModelState *s, int32_t *tokens, int n, float *logits);
 int model_decode(ModelState *s, int32_t token, float *logits);
 void model_get_profile(ModelState *s, ProfileStats *out);
 void model_reset_profile(ModelState *s);
+const char* model_matmul_path(void);
+const char* model_compile_info(void);

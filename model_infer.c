@@ -400,3 +400,23 @@ void model_get_profile(ModelState *s, ProfileStats *out) {
 void model_reset_profile(ModelState *s) {
     memset(&s->profile, 0, sizeof(s->profile));
 }
+
+const char* model_matmul_path(void) {
+#ifdef __ARM_NEON
+    return "NEON";
+#elif defined(__AVX2__)
+    return "AVX2";
+#elif defined(__SSE4_1__)
+    return "SSE4.1";
+#else
+    return "scalar (SWAR)";
+#endif
+}
+
+const char* model_compile_info(void) {
+#ifdef _OPENMP
+    return "OMP enabled";
+#else
+    return "OMP disabled";
+#endif
+}

@@ -100,7 +100,6 @@ def load_library():
             ("v", ctypes.c_void_p),
             ("attn_out", ctypes.c_void_p),
             ("attn_weights", ctypes.c_void_p),
-            ("attn_probs", ctypes.c_void_p),
             ("gate_out", ctypes.c_void_p),
             ("up_out", ctypes.c_void_p),
             ("mlp_act", ctypes.c_void_p),
@@ -138,17 +137,20 @@ def init_model():
     _lib.model_get_profile.restype = None
     _lib.model_reset_profile.argtypes = [ctypes.POINTER(ModelState)]
     _lib.model_reset_profile.restype = None
+    _lib.model_matmul_path.restype = ctypes.c_char_p
+    _lib.model_compile_info.restype = ctypes.c_char_p
     
+    t0 = time.perf_counter()
     _model = ModelState()
     ret = _lib.model_load(ctypes.byref(_model), MODEL_DIR.encode())
     if ret != 0:
         raise RuntimeError(f"Failed to load model from {MODEL_DIR}")
+    load_s = time.perf_counter() - t0
 
     global _logits_buf
     _logits_buf = (ctypes.c_float * VOCAB_SIZE)()
     
     _tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
-    print(f"Model loaded: vocab={_model.embed.num_rows}")
     
     # Initialize TTS
     import nltk
@@ -158,9 +160,13 @@ def init_model():
         except LookupError:
             nltk.download(_res, quiet=True)
 
+    tts_t0 = time.perf_counter()
     from tiny_tts_onnx import TinyTTSOnnx
     _tts = TinyTTSOnnx()
-    print(f"TTS loaded: sample_rate={_tts.sample_rate}")
+    tts_load_s = time.perf_counter() - tts_t0
+
+    log_startup_diagnostics(load_s, tts_load_s)
+    log_pod_info()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -223,11 +229,16 @@ def sample_token(logits, temperature, top_p, top_k):
 
 _logits_buf = None
 _max_token_array = None
+_last_prefill_s = 0.0
+_last_prompt_tokens = 0
 
 def generate_tokens(prompt_tokens, max_new, temp, top_p, top_k, stop_ids):
-    global _logits_buf
+    global _logits_buf, _last_prefill_s, _last_prompt_tokens
+    t0 = time.perf_counter()
     token_array = (ctypes.c_int32 * len(prompt_tokens))(*prompt_tokens)
     ret = _lib.model_prefill(ctypes.byref(_model), token_array, len(prompt_tokens), _logits_buf)
+    _last_prefill_s = time.perf_counter() - t0
+    _last_prompt_tokens = len(prompt_tokens)
     if ret != 0:
         raise RuntimeError("Prefill failed")
     
@@ -506,6 +517,7 @@ def _format_profile(p):
     total_ms = p.total_ns / 1e6
     return {
         "decode_count": c,
+        "kv_len": _model.kv_len if _model else 0,
         "avg_per_step_ms": {
             "matmul": round(matmul_ms / c, 2),
             "attention": round(attn_ms / c, 2),
@@ -534,7 +546,58 @@ def log_profile(label=""):
     _lib.model_get_profile(ctypes.byref(_model), ctypes.byref(p))
     d = _format_profile(p)
     d["label"] = label
+    d["prefill_s"] = round(_last_prefill_s, 3)
+    d["prompt_tokens"] = _last_prompt_tokens
     print(f"[PROFILE] {json.dumps(d)}", flush=True)
+
+def log_startup_diagnostics(load_s, tts_load_s):
+    diag = {
+        "model_load_s": round(load_s, 2),
+        "tts_load_s": round(tts_load_s, 2),
+        "inference_so": _lib.model_matmul_path().decode(),
+        "compile": _lib.model_compile_info().decode(),
+        "vocab_size": VOCAB_SIZE,
+        "hidden_size": 2048,
+        "intermediate_size": 6144,
+        "num_layers": 28,
+        "num_heads": 16,
+        "num_kv_heads": 8,
+        "head_dim": 128,
+        "max_seq_len": MAX_SEQ_LEN,
+        "model_dir": MODEL_DIR,
+    }
+    print(f"[DIAG] {json.dumps(diag)}", flush=True)
+
+def log_pod_info():
+    info = {"env": {}}
+    for var in ("OMP_NUM_THREADS", "OMP_SCHEDULE", "OMP_WAIT_POLICY", "OMP_PROC_BIND", "MODEL_DIR"):
+        info["env"][var] = os.environ.get(var, "(unset)")
+    info["cpu_count"] = os.cpu_count()
+    try:
+        with open("/proc/cpuinfo") as f:
+            cpu = f.read()
+        for line in cpu.splitlines():
+            if line.startswith("model name"):
+                info["cpu"] = line.split(":")[1].strip()
+                break
+        flags_line = next(l for l in cpu.splitlines() if l.startswith("flags"))
+        flags = flags_line.split(":")[1].split()
+        info["simd"] = [f for f in ("avx512f","avx512_vnni","avx2","avx","sse4_2","sse4_1","ssse3","neon") if f in flags]
+    except Exception:
+        info["cpu"] = "unknown"
+        info["simd"] = []
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if "MemTotal" in line:
+                    kb = int(line.split()[1])
+                    info["mem_total_gb"] = round(kb / 1024 / 1024, 1)
+                elif "MemAvailable" in line:
+                    kb = int(line.split()[1])
+                    info["mem_avail_gb"] = round(kb / 1024 / 1024, 1)
+    except Exception:
+        pass
+    print(f"[POD] {json.dumps(info)}", flush=True)
 
 @app.post("/profile/reset")
 async def profile_reset():
