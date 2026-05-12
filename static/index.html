@@ -681,9 +681,11 @@ async function send() {
           text += d.token;
           if (d.full !== lastFullText) {
             let displayHtml = renderTextWithHighlights(d.full);
-            const controlsHtml = '<div class="audio-controls"><button class="audio-btn" onclick="toggleAudio()" ' + 
-              (playBtn.disabled ? 'disabled' : '') + '>' + 
-              (isPlaying && !isPaused ? '⏸' : '▶') + '</button></div>';
+            const controlsHtml = playBtn
+              ? '<div class="audio-controls"><button class="audio-btn" onclick="toggleAudio()" ' +
+                (playBtn.disabled ? 'disabled' : '') + '>' +
+                (isPlaying && !isPaused ? '⏸' : '▶') + '</button></div>'
+              : '';
             b.innerHTML = displayHtml + controlsHtml + '<span class="cursor"></span>';
             lastFullText = d.full;
           }
