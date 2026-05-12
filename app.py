@@ -103,6 +103,8 @@ def load_library():
             ("gate_out", ctypes.c_void_p),
             ("up_out", ctypes.c_void_p),
             ("mlp_act", ctypes.c_void_p),
+            ("approx_logits", ctypes.c_void_p),
+            ("lm_head_candidates", ctypes.c_int * 8192),
             ("kv_k", ctypes.c_float * (28 * 512 * 8 * 128)),
             ("kv_v", ctypes.c_float * (28 * 512 * 8 * 128)),
             ("inv_freq", ctypes.c_float * 64),
