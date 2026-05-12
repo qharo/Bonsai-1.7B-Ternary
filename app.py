@@ -264,6 +264,7 @@ async def generate(req: GenerateRequest):
             yield f"data: {json.dumps({'token': txt, 'full': full_text})}\n\n"
         elapsed = time.perf_counter() - start
         tps = n_tokens / elapsed if elapsed > 0 else 0.0
+        log_profile(f"generate: {n_tokens} tokens, {tps:.1f} t/s")
         yield f"data: {json.dumps({'done': True, 'full': full_text, 'tokens_generated': n_tokens, 'total_time_s': round(elapsed, 3), 'tokens_per_second': round(tps, 2)})}\n\n"
 
     return StreamingResponse(generate_and_decode(), media_type="text/event-stream")
@@ -296,6 +297,8 @@ async def generate_completion(req: GenerateRequest):
     full_text = _tokenizer.decode(token_ids, skip_special_tokens=True)
     n_tokens = len(token_ids)
     tps = n_tokens / elapsed if elapsed > 0 else 0.0
+
+    log_profile(f"completion: {n_tokens} tokens, {tps:.1f} t/s")
 
     return {
         "text": full_text,
@@ -439,6 +442,7 @@ async def generate_voice(req: GenerateRequest):
 
         elapsed = time.perf_counter() - start
         tps = n_tokens / elapsed if elapsed > 0 else 0.0
+        log_profile(f"voice: {n_tokens} tokens, {tps:.1f} t/s")
         done_payload = json.dumps({
             "done": True,
             "full": full_text,
@@ -490,9 +494,12 @@ async def profile():
         return {"error": "model not loaded"}
     p = ProfileStats()
     _lib.model_get_profile(ctypes.byref(_model), ctypes.byref(p))
+    return _format_profile(p)
+
+def _format_profile(p):
     c = p.decode_count
     if c == 0:
-        return {"decode_count": 0, "message": "no decode steps recorded yet"}
+        return {"decode_count": 0}
     matmul_ms = p.matmul_ns / 1e6
     attn_ms = p.attn_ns / 1e6
     logits_ms = p.logits_ns / 1e6
@@ -503,10 +510,10 @@ async def profile():
             "matmul": round(matmul_ms / c, 2),
             "attention": round(attn_ms / c, 2),
             "logits": round(logits_ms / c, 2),
-            "other_plus_overhead": round((total_ms - matmul_ms - attn_ms - logits_ms) / c, 2),
+            "other": round((total_ms - matmul_ms - attn_ms - logits_ms) / c, 2),
             "total": round(total_ms / c, 2),
         },
-        "pct_of_total": {
+        "pct": {
             "matmul": f"{matmul_ms/total_ms*100:.1f}%",
             "attention": f"{attn_ms/total_ms*100:.1f}%",
             "logits": f"{logits_ms/total_ms*100:.1f}%",
@@ -520,10 +527,20 @@ async def profile():
         },
     }
 
+def log_profile(label=""):
+    if not _model:
+        return
+    p = ProfileStats()
+    _lib.model_get_profile(ctypes.byref(_model), ctypes.byref(p))
+    d = _format_profile(p)
+    d["label"] = label
+    print(f"[PROFILE] {json.dumps(d)}", flush=True)
+
 @app.post("/profile/reset")
 async def profile_reset():
     if not _model:
         return {"error": "model not loaded"}
+    log_profile("reset")
     _lib.model_reset_profile(ctypes.byref(_model))
     return {"reset": True}
 
