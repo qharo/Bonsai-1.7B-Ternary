@@ -404,6 +404,8 @@ void model_reset_profile(ModelState *s) {
 const char* model_matmul_path(void) {
 #ifdef __ARM_NEON
     return "NEON";
+#elif defined(__AVX512F__)
+    return "AVX512";
 #elif defined(__AVX2__)
     return "AVX2";
 #elif defined(__SSE4_1__)
