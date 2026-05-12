@@ -2,17 +2,16 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install build and runtime dependencies
+# Install build dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
     clang \
     libomp-dev \
-    libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy source files
 COPY model_infer.c model_infer.h matmul_common.c matmul_common.h Makefile ./
-COPY app.py requirements.txt ./
+COPY app.py tiny_tts_onnx.py requirements.txt ./
 COPY static/ ./static/
 
 # Build inference library
@@ -21,8 +20,8 @@ RUN make inference.so CC=clang "CFLAGS=-O3 -std=c11 -Wall -fPIC -march=native -f
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Download NLTK data for tiny-tts (g2p_en requires cmudict)
-RUN python3 -c "import nltk; nltk.download('averaged_perceptron_tagger_eng', quiet=True); nltk.download('averaged_perceptron_tagger', quiet=True); nltk.download('cmudict', quiet=True)"
+# Download NLTK data for g2p-en
+RUN python3 -c "import nltk; nltk.download('cmudict', quiet=True); nltk.download('averaged_perceptron_tagger_eng', quiet=True); nltk.download('averaged_perceptron_tagger', quiet=True)"
 
 # Model weights: copied from repo via Git LFS (HF Spaces) or overridden at runtime
 # Local dev: docker run -v $(pwd)/models:/app/models cvp-app

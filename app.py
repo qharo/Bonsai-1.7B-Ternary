@@ -135,32 +135,16 @@ def init_model():
     print(f"Model loaded: vocab={_model.embed.num_rows}")
     
     # Initialize TTS
-    from tiny_tts import TinyTTS
-    from tiny_tts.utils.config import SAMPLING_RATE
     import nltk
-    try:
-        for resource in ('averaged_perceptron_tagger_eng', 'averaged_perceptron_tagger', 'cmudict'):
-            try:
-                nltk.data.find(f'corpora/{resource}' if resource == 'cmudict' else f'taggers/{resource}')
-            except LookupError:
-                nltk.download(resource, quiet=True)
-    except Exception:
-        pass
+    for _res in ('cmudict', 'averaged_perceptron_tagger_eng', 'averaged_perceptron_tagger'):
+        try:
+            nltk.data.find(f'corpora/{_res}' if _res == 'cmudict' else f'taggers/{_res}')
+        except LookupError:
+            nltk.download(_res, quiet=True)
 
-    _tts_raw = TinyTTS()
-    # Wrap to match expected interface
-    class _TTSWrapper:
-        sample_rate = SAMPLING_RATE
-        frame_rate = SAMPLING_RATE / 256.0
-        predefined_voices = ['MALE', 'FEMALE']
-        def generate(self, text, voice='MALE'):
-            speaker = voice.upper() if voice.upper() in ('MALE', 'FEMALE') else 'MALE'
-            return _tts_raw.speak(text, speaker=speaker, output_path='/tmp/tts_out.wav')
-        def stream(self, text, voice='MALE'):
-            audio = self.generate(text, voice)
-            yield audio
-    _tts = _TTSWrapper()
-    print(f"TTS loaded: sample_rate={SAMPLING_RATE}")
+    from tiny_tts_onnx import TinyTTSOnnx
+    _tts = TinyTTSOnnx()
+    print(f"TTS loaded: sample_rate={_tts.sample_rate}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
