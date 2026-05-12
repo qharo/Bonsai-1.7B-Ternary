@@ -375,7 +375,7 @@ int model_prefill(ModelState *s, int32_t *tokens, int n, float *logits) {
     rms_norm(&s->hidden[(n-1)*HIDDEN_SIZE], s->final_norm.data, s->normalized, HIDDEN_SIZE);
     int vocab_n = (int)s->embed.num_rows;
     if (lm_head_prefilter_available) {
-        lm_head_prefilter(s->normalized, &s->embed, s->approx_logits, vocab_n, 1);
+        lm_head_prefilter(s->normalized, &s->embed, s->approx_logits, vocab_n, 2);
         find_top_k(s->approx_logits, vocab_n, LM_HEAD_CANDIDATES, s->lm_head_candidates);
         for (int i = 0; i < vocab_n; i++) logits[i] = -1e38f;
         matmul_g128_selected(s->normalized, &s->embed, logits, 1, HIDDEN_SIZE, vocab_n, LM_HEAD_CANDIDATES, s->lm_head_candidates);
@@ -402,8 +402,8 @@ int model_decode(ModelState *s, int32_t token, float *logits) {
     rms_norm(s->hidden, s->final_norm.data, s->normalized, HIDDEN_SIZE);
     int vocab_n = (int)s->embed.num_rows;
     if (lm_head_prefilter_available) {
-        // Phase 1: approximate scores from first block (128/2048 dims)
-        lm_head_prefilter(s->normalized, &s->embed, s->approx_logits, vocab_n, 1);
+        // Phase 1: approximate scores from first 2 blocks (256/2048 dims)
+        lm_head_prefilter(s->normalized, &s->embed, s->approx_logits, vocab_n, 2);
         // Phase 2: find top-K candidate rows
         find_top_k(s->approx_logits, vocab_n, LM_HEAD_CANDIDATES, s->lm_head_candidates);
         // Phase 3: zero out all logits, then compute exact full-dim scores for candidates
