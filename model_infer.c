@@ -17,6 +17,14 @@
 #include <time.h>
 #endif
 
+// 64-byte aligned calloc for AVX-512 (safe on all POSIX platforms)
+static inline void *aligned_calloc(size_t alignment, size_t size) {
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, alignment, size) != 0) return NULL;
+    memset(ptr, 0, size);
+    return ptr;
+}
+
 static inline uint64_t now_ns(void) {
 #ifdef __MACH__
     static mach_timebase_info_data_t info = {0};
@@ -65,9 +73,9 @@ static int load_g128(G128Matrix *m, const char *base) {
     m->num_blocks_col = (m->num_cols + G128_BLOCK_SIZE - 1) / G128_BLOCK_SIZE;
     uint64_t nb = (uint64_t)m->num_rows * m->num_cols / G128_BLOCK_SIZE;
 
-    m->magnitude = malloc(nb * 2 * sizeof(uint64_t));
-    m->sign      = malloc(nb * 2 * sizeof(uint64_t));
-    m->scales    = malloc(nb * sizeof(uint16_t));
+    posix_memalign((void**)&m->magnitude, 64, nb * 2 * sizeof(uint64_t));
+    posix_memalign((void**)&m->sign, 64, nb * 2 * sizeof(uint64_t));
+    m->scales = (uint16_t*)malloc(nb * sizeof(uint16_t));
 
     fseek(f, header_size, SEEK_SET);
     fread(m->magnitude, 2 * sizeof(uint64_t), nb, f);
@@ -86,7 +94,7 @@ static int load_g128(G128Matrix *m, const char *base) {
     fclose(f);
 
     // precompute FP32 scales once to avoid per-call half_to_float during inference
-    m->scales_f32 = malloc(nb * sizeof(float));
+    posix_memalign((void**)&m->scales_f32, 64, nb * sizeof(float));
     for (uint64_t bi = 0; bi < nb; bi++)
         m->scales_f32[bi] = half_to_float(m->scales[bi]);
 
@@ -290,17 +298,18 @@ int model_load(ModelState *s, const char *dir) {
     snprintf(p, sizeof(p), "%s/weight_model_norm_weight.bin", dir);
     if (load_fp32(&s->final_norm, p) != 0) return -1;
 
-    s->hidden = calloc(MAX_SEQ_LEN * HIDDEN_SIZE, 4);
-    s->normalized = calloc(MAX_SEQ_LEN * HIDDEN_SIZE, 4);
-    s->residual = calloc(MAX_SEQ_LEN * HIDDEN_SIZE, 4);
-    s->q = calloc(MAX_SEQ_LEN * HIDDEN_SIZE, 4);
-    s->k = calloc(MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM, 4);
-    s->v = calloc(MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM, 4);
-    s->attn_out = calloc(MAX_SEQ_LEN * HIDDEN_SIZE, 4);
-    s->attn_weights = calloc(MAX_SEQ_LEN * MAX_SEQ_LEN, 4);
-    s->gate_out = calloc(MAX_SEQ_LEN * INTERMEDIATE_SIZE, 4);
-    s->up_out = calloc(MAX_SEQ_LEN * INTERMEDIATE_SIZE, 4);
-    s->mlp_act = calloc(MAX_SEQ_LEN * INTERMEDIATE_SIZE, 4);
+    s->hidden       = aligned_calloc(64, (size_t)MAX_SEQ_LEN * HIDDEN_SIZE * 4);
+    s->normalized   = aligned_calloc(64, (size_t)MAX_SEQ_LEN * HIDDEN_SIZE * 4);
+    s->residual     = aligned_calloc(64, (size_t)MAX_SEQ_LEN * HIDDEN_SIZE * 4);
+    s->q            = aligned_calloc(64, (size_t)MAX_SEQ_LEN * HIDDEN_SIZE * 4);
+    s->k            = aligned_calloc(64, (size_t)MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM * 4);
+    s->v            = aligned_calloc(64, (size_t)MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM * 4);
+    s->attn_out     = aligned_calloc(64, (size_t)MAX_SEQ_LEN * HIDDEN_SIZE * 4);
+    s->attn_weights = aligned_calloc(64, (size_t)MAX_SEQ_LEN * MAX_SEQ_LEN * 4);
+    s->gate_out     = aligned_calloc(64, (size_t)MAX_SEQ_LEN * INTERMEDIATE_SIZE * 4);
+    s->up_out       = aligned_calloc(64, (size_t)MAX_SEQ_LEN * INTERMEDIATE_SIZE * 4);
+    s->mlp_act      = aligned_calloc(64, (size_t)MAX_SEQ_LEN * INTERMEDIATE_SIZE * 4);
+    s->approx_logits = aligned_calloc(64, (size_t)VOCAB_SIZE * 4);
 
     // YaRN RoPE: blend interpolated (low-freq) and extrapolated (high-freq) inv_freq
     {
@@ -347,6 +356,7 @@ void model_free(ModelState *s) {
     free(s->q); free(s->k); free(s->v); free(s->attn_out);
     free(s->attn_weights);
     free(s->gate_out); free(s->up_out); free(s->mlp_act);
+    free(s->approx_logits);
 }
 
 int model_prefill(ModelState *s, int32_t *tokens, int n, float *logits) {
@@ -363,7 +373,15 @@ int model_prefill(ModelState *s, int32_t *tokens, int n, float *logits) {
     s->kv_len = n;
 
     rms_norm(&s->hidden[(n-1)*HIDDEN_SIZE], s->final_norm.data, s->normalized, HIDDEN_SIZE);
-    matmul_simd_g128(s->normalized, &s->embed, logits, 1, HIDDEN_SIZE, (int)s->embed.num_rows);
+    int vocab_n = (int)s->embed.num_rows;
+    if (lm_head_prefilter_available) {
+        lm_head_prefilter(s->normalized, &s->embed, s->approx_logits, vocab_n, 2);
+        find_top_k(s->approx_logits, vocab_n, LM_HEAD_CANDIDATES, s->lm_head_candidates);
+        for (int i = 0; i < vocab_n; i++) logits[i] = -1e38f;
+        matmul_g128_selected(s->normalized, &s->embed, logits, 1, HIDDEN_SIZE, vocab_n, LM_HEAD_CANDIDATES, s->lm_head_candidates);
+    } else {
+        matmul_simd_g128(s->normalized, &s->embed, logits, 1, HIDDEN_SIZE, vocab_n);
+    }
     return 0;
 }
 
@@ -382,7 +400,18 @@ int model_decode(ModelState *s, int32_t token, float *logits) {
 
     uint64_t _lt0 = now_ns();
     rms_norm(s->hidden, s->final_norm.data, s->normalized, HIDDEN_SIZE);
-    matmul_simd_g128(s->normalized, &s->embed, logits, 1, HIDDEN_SIZE, (int)s->embed.num_rows);
+    int vocab_n = (int)s->embed.num_rows;
+    if (lm_head_prefilter_available) {
+        // Phase 1: approximate scores from first 2 blocks (256/2048 dims)
+        lm_head_prefilter(s->normalized, &s->embed, s->approx_logits, vocab_n, 2);
+        // Phase 2: find top-K candidate rows
+        find_top_k(s->approx_logits, vocab_n, LM_HEAD_CANDIDATES, s->lm_head_candidates);
+        // Phase 3: zero out all logits, then compute exact full-dim scores for candidates
+        for (int i = 0; i < vocab_n; i++) logits[i] = -1e38f;
+        matmul_g128_selected(s->normalized, &s->embed, logits, 1, HIDDEN_SIZE, vocab_n, LM_HEAD_CANDIDATES, s->lm_head_candidates);
+    } else {
+        matmul_simd_g128(s->normalized, &s->embed, logits, 1, HIDDEN_SIZE, vocab_n);
+    }
     s->profile.logits_ns += (double)(now_ns() - _lt0);
     s->profile.total_ns += (double)(now_ns() - _tstart);
     s->profile.decode_count++;

@@ -12,6 +12,7 @@
 #define NUM_LAYERS 28
 #define VOCAB_SIZE 151669
 #define MAX_SEQ_LEN 512
+#define LM_HEAD_CANDIDATES 8192
 
 typedef struct {
     float *data;
@@ -38,6 +39,8 @@ typedef struct {
     FP32Matrix final_norm;
     float *hidden, *normalized, *residual, *q, *k, *v, *attn_out, *attn_weights;
     float *gate_out, *up_out, *mlp_act;
+    float *approx_logits;
+    int lm_head_candidates[LM_HEAD_CANDIDATES];
     float kv_k[NUM_LAYERS][NUM_KV_HEADS][MAX_SEQ_LEN][HEAD_DIM];
     float kv_v[NUM_LAYERS][NUM_KV_HEADS][MAX_SEQ_LEN][HEAD_DIM];
     float inv_freq[HEAD_DIM/2];
