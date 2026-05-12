@@ -278,6 +278,21 @@ textarea::placeholder { color: var(--muted); }
   background: var(--accent);
   border-color: var(--accent);
 }
+
+.voice-btn {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  width: 44px; height: 44px;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  font-size: 18px;
+  transition: all 0.15s;
+  color: var(--text);
+}
+.voice-btn:hover { background: var(--surface); border-color: var(--accent); }
+.voice-btn.tts-off { opacity: 0.38; }
 </style>
 </head>
 <body>
@@ -305,6 +320,7 @@ textarea::placeholder { color: var(--muted); }
 
 <div class="input-area">
   <textarea id="inp" placeholder="How can I help you today? (Enter to send, Shift+Enter for newline)" rows="1" autofocus></textarea>
+  <button class="voice-btn" id="voice-btn" title="Toggle voice (currently on)">🔊</button>
   <button class="send" id="send-btn" title="Send">↑</button>
 </div>
 
@@ -315,9 +331,18 @@ const inpEl    = document.getElementById('inp');
 const sendBtn  = document.getElementById('send-btn');
 const badgeEl  = document.getElementById('badge-text');
 const testAudioBtn = document.getElementById('test-audio-btn');
+const voiceBtn  = document.getElementById('voice-btn');
 
 let busy = false;
 let generating = false;
+let ttsEnabled = true;
+
+voiceBtn.addEventListener('click', () => {
+  ttsEnabled = !ttsEnabled;
+  voiceBtn.textContent = ttsEnabled ? '🔊' : '🔇';
+  voiceBtn.title = ttsEnabled ? 'Toggle voice (currently on)' : 'Toggle voice (currently off)';
+  voiceBtn.classList.toggle('tts-off', !ttsEnabled);
+});
 let audioContext = null;
 let currentAudioSource = null;
 let isPlaying = false;
@@ -361,23 +386,26 @@ function appendUser(text) {
   scrollBottom();
 }
 
-function appendBot() {
+function appendBot(withAudio = true) {
   const row = document.createElement('div');
   row.className = 'row bot';
   const b = document.createElement('div');
   b.className = 'bubble';
-  
-  const controls = document.createElement('div');
-  controls.className = 'audio-controls';
-  const playBtn = document.createElement('button');
-  playBtn.className = 'audio-btn';
-  playBtn.innerHTML = '▶';
-  playBtn.disabled = true;
-  playBtn.title = 'Play audio';
-  playBtn.onclick = () => toggleAudio();
-  controls.appendChild(playBtn);
-  
-  b.appendChild(controls);
+
+  let playBtn = null;
+  if (withAudio) {
+    const controls = document.createElement('div');
+    controls.className = 'audio-controls';
+    playBtn = document.createElement('button');
+    playBtn.className = 'audio-btn';
+    playBtn.innerHTML = '▶';
+    playBtn.disabled = true;
+    playBtn.title = 'Play audio';
+    playBtn.onclick = () => toggleAudio();
+    controls.appendChild(playBtn);
+    b.appendChild(controls);
+  }
+
   const cur = document.createElement('span');
   cur.className = 'cursor';
   b.appendChild(cur);
@@ -590,16 +618,20 @@ async function send() {
 
   stopAudio();
   appendUser(prompt);
-  const { row, b, cur, playBtn } = appendBot();
+  const { row, b, cur, playBtn } = appendBot(ttsEnabled);
   currentBotRow = { row, b, cur, playBtn };
   let text = '';
   let lastFullText = '';
 
+  const SYSTEM_PROMPT = "You are a helpful, concise assistant. Answer questions directly and clearly.";
+  const endpoint = ttsEnabled ? '/generate/voice' : '/generate';
+  const maxTokens = ttsEnabled ? 200 : 512;
+
   try {
-    const res = await fetch('/generate/voice', {
+    const res = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt, max_new_tokens: 512, stream_audio: true })
+      body: JSON.stringify({ prompt, max_new_tokens: maxTokens, stream_audio: ttsEnabled, system_prompt: SYSTEM_PROMPT })
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
