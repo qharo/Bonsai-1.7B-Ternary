@@ -784,18 +784,20 @@ static int _diag_test_f32(const char *name, const float *got, const float *exp, 
     for (int i = 0; i < n; i++) {
         float d = fabsf(got[i] - exp[i]);
         if (d > 1e-5f && d > 1e-5f * fabsf(exp[i])) {
-            fprintf(stderr, "  %-40s FAIL lane %d: got %8.4f exp %8.4f\n", name, i, got[i], exp[i]);
+            fprintf(stdout, "  %-40s FAIL lane %d: got %8.4f exp %8.4f\n", name, i, got[i], exp[i]);
+            fflush(stdout);
             ok = 0;
         }
     }
-    if (ok) fprintf(stderr, "  %-40s PASS\n", name);
+    if (ok) { fprintf(stdout, "  %-40s PASS\n", name); fflush(stdout); }
     return ok;
 }
 
 __attribute__((constructor)) static void avx512_diagnostic_impl(void) {
     static int done = 0;
     if (done) return; done = 1;
-    fprintf(stderr, "[DIAG] AVX-512 instruction diagnostic\n");
+    fprintf(stdout, "[DIAG] AVX-512 instruction diagnostic\n");
+    fflush(stdout);
     float av_in[16], exp[16], got[16];
     for (int i = 0; i < 16; i++) av_in[i] = (float)(i + 1);
     float sc_val = 3.0f;
@@ -878,7 +880,8 @@ __attribute__((constructor)) static void avx512_diagnostic_impl(void) {
     }
     _diag_test_f32("mask-to-vector (zero-mask + AND+XOR+FMADD)", got, exp, 16);
 
-    fprintf(stderr, "[DIAG] AVX-512 diagnostic complete\n");
+    fprintf(stdout, "[DIAG] AVX-512 diagnostic complete\n");
+    fflush(stdout);
 }
 
 #else  // portable scalar fallback
