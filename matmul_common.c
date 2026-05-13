@@ -206,13 +206,15 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
 #include <immintrin.h>
 
 
-// Zero-out lanes where mag=0, negate where mag=1&sgn=1, then unmasked VFMADD
+// Zero mag=0, flip sign of mag=1&sgn=1 via VPBLENDMD (port 0/1) + VXORPS (port 0/1)
 #define LUT_ACCUM_ZMM_16(acc, mw, sw, b, sc, av) do { \
     uint32_t _m16 = (uint32_t)((uint64_t)(mw) >> (b)); \
     uint32_t _s16 = (uint32_t)((uint64_t)(sw) >> (b)); \
-    __m512 _magged = _mm512_maskz_mov_ps(_cvtu32_mask16(_m16), (av)); \
-    __m512 _signed = _mm512_xor_ps(_magged, _mm512_castsi512_ps( \
-        _mm512_maskz_set1_epi32(_cvtu32_mask16(_m16 & _s16), 0x80000000))); \
+    __mmask16 _mm = _cvtu32_mask16(_m16); \
+    __mmask16 _sm = _cvtu32_mask16(_m16 & _s16); \
+    __m512 _magged = _mm512_mask_blend_ps(_mm, (av), _zz); \
+    __m512 _neg = _mm512_xor_ps(_magged, _sb); \
+    __m512 _signed = _mm512_mask_blend_ps(_sm, _magged, _neg); \
     (acc) = _mm512_fmadd_ps(_signed, (sc), (acc)); \
 } while(0)
 
@@ -227,7 +229,8 @@ static inline float hsum_zmm(__m512 v) {
 }
 
 void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) {
-
+    const __m512 _zz = _mm512_setzero_ps();
+    const __m512 _sb = _mm512_set1_ps(-0.0f);
     int nkb = (int)B_T->num_blocks_col;
     const float *sf = B_T->scales_f32;
     for (int i = 0; i < M; i++) {
@@ -324,7 +327,8 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
 }
 
 void lm_head_prefilter(float *A, G128Matrix *B_T, float *C, int N, int max_blocks) {
-
+    const __m512 _zz = _mm512_setzero_ps();
+    const __m512 _sb = _mm512_set1_ps(-0.0f);
     int nkb = (int)B_T->num_blocks_col;
     if (max_blocks <= 0 || max_blocks > nkb) max_blocks = nkb;
     const float *sf = B_T->scales_f32;
@@ -417,7 +421,8 @@ void lm_head_prefilter(float *A, G128Matrix *B_T, float *C, int N, int max_block
 }
 
 void matmul_g128_selected(float *A, G128Matrix *B_T, float *C, int M, int K, int N_full, int N_sel, const int *sel_rows) {
-
+    const __m512 _zz = _mm512_setzero_ps();
+    const __m512 _sb = _mm512_set1_ps(-0.0f);
     int nkb = (int)B_T->num_blocks_col;
     const float *sf = B_T->scales_f32;
     for (int i = 0; i < M; i++) {
