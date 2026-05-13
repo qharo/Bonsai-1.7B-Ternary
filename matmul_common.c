@@ -779,6 +779,108 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
     }
 }
 
+static int _diag_test_f32(const char *name, const float *got, const float *exp, int n) {
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        float d = fabsf(got[i] - exp[i]);
+        if (d > 1e-5f && d > 1e-5f * fabsf(exp[i])) {
+            fprintf(stderr, "  %-40s FAIL lane %d: got %8.4f exp %8.4f\n", name, i, got[i], exp[i]);
+            ok = 0;
+        }
+    }
+    if (ok) fprintf(stderr, "  %-40s PASS\n", name);
+    return ok;
+}
+
+__attribute__((constructor)) static void avx512_diagnostic_impl(void) {
+    static int done = 0;
+    if (done) return; done = 1;
+    fprintf(stderr, "[DIAG] AVX-512 instruction diagnostic\n");
+    float av_in[16], exp[16], got[16];
+    for (int i = 0; i < 16; i++) av_in[i] = (float)(i + 1);
+    float sc_val = 3.0f;
+    __m512 av = _mm512_loadu_ps(av_in);
+    __m512 sc = _mm512_set1_ps(sc_val);
+    __m512 zero = _mm512_setzero_ps();
+    __m512i one = _mm512_set1_epi32(1);
+
+    // 1. Unmasked FMADD (control)
+    __m512 acc = _mm512_fmadd_ps(av, sc, zero);
+    _mm512_storeu_ps(got, acc);
+    for (int i = 0; i < 16; i++) exp[i] = av_in[i] * sc_val;
+    _diag_test_f32("VFMADD (unmasked)", got, exp, 16);
+
+    // 2. Merge-masked VFMADD (odd lanes)
+    __mmask16 k_odd = 0xAAAA;
+    acc = zero;
+    acc = _mm512_mask_fmadd_ps(acc, k_odd, sc, av);
+    _mm512_storeu_ps(got, acc);
+    for (int i = 0; i < 16; i++) exp[i] = (i & 1) ? av_in[i] * sc_val : 0.0f;
+    _diag_test_f32("VFMADD (merge-mask, odd lanes)", got, exp, 16);
+
+    // 3. Merge-masked VFNMADD (odd lanes)
+    acc = zero;
+    acc = _mm512_mask_fnmadd_ps(acc, k_odd, sc, av);
+    _mm512_storeu_ps(got, acc);
+    for (int i = 0; i < 16; i++) exp[i] = (i & 1) ? -(av_in[i] * sc_val) : 0.0f;
+    _diag_test_f32("VFNMADD (merge-mask, odd lanes)", got, exp, 16);
+
+    // 4. Sequential merge-masked VFMADD + VFMADD(nsc) (mask kernel pattern)
+    __mmask16 k_pos = 0x0005;  // lanes 0,2
+    __mmask16 k_neg = 0x0050;  // lanes 4,6
+    acc = zero;
+    acc = _mm512_mask_fmadd_ps(acc, k_pos, sc, av);
+    __m512 nsc = _mm512_xor_ps(sc, _mm512_set1_ps(-0.0f));
+    acc = _mm512_mask_fmadd_ps(acc, k_neg, nsc, av);
+    _mm512_storeu_ps(got, acc);
+    for (int i = 0; i < 16; i++) {
+        if (i == 0 || i == 2) exp[i] = sc_val * av_in[i];
+        else if (i == 4 || i == 6) exp[i] = -sc_val * av_in[i];
+        else exp[i] = 0.0f;
+    }
+    _diag_test_f32("mask kernel (VFMADD+VFMADD-nsc)", got, exp, 16);
+
+    // 5. Zero-masked VMOVAPS
+    acc = _mm512_maskz_mov_ps(k_odd, av);
+    _mm512_storeu_ps(got, acc);
+    for (int i = 0; i < 16; i++) exp[i] = (i & 1) ? av_in[i] : 0.0f;
+    _diag_test_f32("VMOVAPS (zero-mask)", got, exp, 16);
+
+    // 6. Zero-masked VPBROADCASTD (0x80000000)
+    __m512i sgn_bits = _mm512_maskz_set1_epi32(k_odd, 0x80000000);
+    _mm512_storeu_ps(got, _mm512_castsi512_ps(sgn_bits));
+    for (int i = 0; i < 16; i++) exp[i] = (i & 1) ? -0.0f : 0.0f;
+    _diag_test_f32("VPBROADCASTD zero 0x80000000", got, exp, 16);
+
+    // 7. Zero-masked VPSLLD (1 << 31)
+    sgn_bits = _mm512_maskz_slli_epi32(k_odd, one, 31);
+    _mm512_storeu_ps(got, _mm512_castsi512_ps(sgn_bits));
+    _diag_test_f32("VPSLLD zero 1<<31", got, exp, 16);
+
+    // 8. Merge-masked VPBLENDMD (±av)
+    __m512 neg_av = _mm512_xor_ps(av, _mm512_set1_ps(-0.0f));
+    acc = _mm512_mask_blend_ps(k_odd, av, neg_av);
+    _mm512_storeu_ps(got, acc);
+    for (int i = 0; i < 16; i++) exp[i] = (i & 1) ? -av_in[i] : av_in[i];
+    _diag_test_f32("VPBLENDMD merge ±av", got, exp, 16);
+
+    // 9. Zero-masked blend via AND+XOR (mask-to-vector)
+    __m512i mag_bits = _mm512_maskz_set1_epi32(k_odd, -1);
+    sgn_bits = _mm512_maskz_slli_epi32(k_neg, one, 31);
+    __m512 sf = _mm512_castsi512_ps(sgn_bits);
+    __m512 w = _mm512_and_ps(_mm512_xor_ps(sc, sf), _mm512_castsi512_ps(mag_bits));
+    acc = _mm512_fmadd_ps(w, av, zero);
+    _mm512_storeu_ps(got, acc);
+    for (int i = 0; i < 16; i++) {
+        if (i == 0 || i == 2) exp[i] = sc_val * av_in[i];
+        else if (i == 4 || i == 6) exp[i] = -sc_val * av_in[i];
+        else exp[i] = 0.0f;
+    }
+    _diag_test_f32("mask-to-vector (zero-mask + AND+XOR+FMADD)", got, exp, 16);
+
+    fprintf(stderr, "[DIAG] AVX-512 diagnostic complete\n");
+}
+
 #else  // portable scalar fallback
 
 void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) {
