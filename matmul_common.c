@@ -206,13 +206,14 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
 #include <immintrin.h>
 
 
-// Decode 16 bits from mag/sgn via masked VFMADD with VXORPS negation (no VFNMADD)
+// Zero-out lanes where mag=0, negate where mag=1&sgn=1, then unmasked VFMADD
 #define LUT_ACCUM_ZMM_16(acc, mw, sw, b, sc, av) do { \
     uint32_t _m16 = (uint32_t)((uint64_t)(mw) >> (b)); \
     uint32_t _s16 = (uint32_t)((uint64_t)(sw) >> (b)); \
-    __m512 _nsc = _mm512_xor_ps((sc), _mm512_set1_ps(-0.0f)); \
-    (acc) = _mm512_mask_fmadd_ps((acc), _cvtu32_mask16(_m16 & ~_s16), (sc), (av)); \
-    (acc) = _mm512_mask_fmadd_ps((acc), _cvtu32_mask16(_m16 &  _s16), (_nsc), (av)); \
+    __m512 _magged = _mm512_maskz_mov_ps(_cvtu32_mask16(_m16), (av)); \
+    __m512 _signed = _mm512_xor_ps(_magged, _mm512_castsi512_ps( \
+        _mm512_maskz_set1_epi32(_cvtu32_mask16(_m16 & _s16), 0x80000000))); \
+    (acc) = _mm512_fmadd_ps(_signed, (sc), (acc)); \
 } while(0)
 
 static inline float hsum_zmm(__m512 v) {
