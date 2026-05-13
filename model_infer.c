@@ -393,6 +393,9 @@ int model_prefill(ModelState *s, int32_t *tokens, int n, float *logits) {
         embed_lookup(&s->embed, tid, &s->hidden[i*HIDDEN_SIZE]);
     }
 
+#ifdef _OPENMP
+    omp_set_num_threads(omp_get_max_threads());
+#endif
     for (int i = 0; i < NUM_LAYERS; i++) forward_layer(s, i, n, 1, 0);
     s->kv_len = n;
 
@@ -419,6 +422,9 @@ int model_decode(ModelState *s, int32_t token, float *logits) {
     int pos = s->kv_len;
     if (pos >= MAX_SEQ_LEN) return -1;
 
+#ifdef _OPENMP
+    omp_set_num_threads(2);
+#endif
     for (int i = 0; i < NUM_LAYERS; i++) forward_layer(s, i, 1, 0, pos);
     s->kv_len = pos + 1;
 
