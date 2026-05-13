@@ -183,6 +183,7 @@ def init_model():
 
     log_startup_diagnostics(load_s, tts_load_s)
     log_pod_info()
+    _lib.model_run_benchmark(ctypes.byref(_model))
     log_benchmark()
 
 @asynccontextmanager
