@@ -205,16 +205,28 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
 
 #include <immintrin.h>
 
-// acc += scv * av where mag=1,sgn=0 (+1 ternary)
-// acc -= scv * av where mag=1,sgn=1 (-1 ternary)
-// acc unchanged     where mag=0 (0 ternary)
-static inline __m512 ternary_madd(__m512 acc, uint64_t mag, uint64_t sgn, int b, __m512 scv, __m512 av) {
-    uint32_t m = (uint32_t)(mag >> b);
-    uint32_t s = (uint32_t)(sgn >> b);
-    acc = _mm512_mask_fmadd_ps (acc, _cvtu32_mask16(m & ~s), scv, av);
-    acc = _mm512_mask_fnmadd_ps(acc, _cvtu32_mask16(m &  s), scv, av);
-    return acc;
+// 8-bit → 16-lane mask LUT: lane j = all-1s if bit j of index is set, else 0
+static uint32_t avx512_mag_lut[256][16] __attribute__((aligned(64)));
+static int avx512_lut_init = 0;
+
+static void init_avx512_lut_once(void) {
+    if (avx512_lut_init) return;
+    for (int i = 0; i < 256; i++)
+        for (int j = 0; j < 16; j++)
+            avx512_mag_lut[i][j] = ((i >> j) & 1) ? 0xFFFFFFFF : 0;
+    avx512_lut_init = 1;
 }
+
+// Decode 8-bit mag/sgn nibble into ±scale ZMM vector (zeroed where mag=0) and FMA-accumulate
+#define LUT_ACCUM_ZMM(acc, mw, sw, b, sc, av) do { \
+    uint8_t _mn = ((uint64_t)(mw) >> (b)) & 0xFF; \
+    uint8_t _sn = ((uint64_t)(sw) >> (b)) & 0xFF; \
+    __m512 _wm = _mm512_castsi512_ps(_mm512_load_si512((const __m512i*)avx512_mag_lut[_mn])); \
+    __m512 _ws = _mm512_castsi512_ps(_mm512_load_si512((const __m512i*)avx512_mag_lut[_sn])); \
+    __m512 _ss = _mm512_xor_ps((sc), _mm512_and_ps(_ws, _mm512_set1_ps(-0.0f))); \
+    __m512 _w  = _mm512_and_ps(_ss, _wm); \
+    (acc) = _mm512_fmadd_ps(_w, (av), (acc)); \
+} while(0)
 
 static inline float hsum_zmm(__m512 v) {
     __m256 lo = _mm512_castps512_ps256(v);
@@ -227,6 +239,7 @@ static inline float hsum_zmm(__m512 v) {
 }
 
 void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) {
+    init_avx512_lut_once();
     int nkb = (int)B_T->num_blocks_col;
     const float *sf = B_T->scales_f32;
     for (int i = 0; i < M; i++) {
@@ -275,27 +288,27 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
                     _mm_prefetch((const char*)&B_T->sign[pf_bidx * 2], _MM_HINT_T1);
                     _mm_prefetch((const char*)&sf[pf_bidx], _MM_HINT_T1);
                 }
-                for (int b = 0; b < 64; b += 16) {
+                for (int b = 0; b < 64; b += 8) {
                     __m512 av = _mm512_load_ps(ap + b);
-                    acc0 = ternary_madd(acc0, m00, s00, b, scv0, av);
-                    acc1 = ternary_madd(acc1, m10, s10, b, scv1, av);
-                    acc2 = ternary_madd(acc2, m20, s20, b, scv2, av);
-                    acc3 = ternary_madd(acc3, m30, s30, b, scv3, av);
-                    acc4 = ternary_madd(acc4, m40, s40, b, scv4, av);
-                    acc5 = ternary_madd(acc5, m50, s50, b, scv5, av);
-                    acc6 = ternary_madd(acc6, m60, s60, b, scv6, av);
-                    acc7 = ternary_madd(acc7, m70, s70, b, scv7, av);
+                    LUT_ACCUM_ZMM(acc0, m00, s00, b, scv0, av);
+                    LUT_ACCUM_ZMM(acc1, m10, s10, b, scv1, av);
+                    LUT_ACCUM_ZMM(acc2, m20, s20, b, scv2, av);
+                    LUT_ACCUM_ZMM(acc3, m30, s30, b, scv3, av);
+                    LUT_ACCUM_ZMM(acc4, m40, s40, b, scv4, av);
+                    LUT_ACCUM_ZMM(acc5, m50, s50, b, scv5, av);
+                    LUT_ACCUM_ZMM(acc6, m60, s60, b, scv6, av);
+                    LUT_ACCUM_ZMM(acc7, m70, s70, b, scv7, av);
                 }
-                for (int b = 0; b < 64; b += 16) {
+                for (int b = 0; b < 64; b += 8) {
                     __m512 av = _mm512_load_ps(ap + 64 + b);
-                    acc0 = ternary_madd(acc0, m01, s01, b, scv0, av);
-                    acc1 = ternary_madd(acc1, m11, s11, b, scv1, av);
-                    acc2 = ternary_madd(acc2, m21, s21, b, scv2, av);
-                    acc3 = ternary_madd(acc3, m31, s31, b, scv3, av);
-                    acc4 = ternary_madd(acc4, m41, s41, b, scv4, av);
-                    acc5 = ternary_madd(acc5, m51, s51, b, scv5, av);
-                    acc6 = ternary_madd(acc6, m61, s61, b, scv6, av);
-                    acc7 = ternary_madd(acc7, m71, s71, b, scv7, av);
+                    LUT_ACCUM_ZMM(acc0, m01, s01, b, scv0, av);
+                    LUT_ACCUM_ZMM(acc1, m11, s11, b, scv1, av);
+                    LUT_ACCUM_ZMM(acc2, m21, s21, b, scv2, av);
+                    LUT_ACCUM_ZMM(acc3, m31, s31, b, scv3, av);
+                    LUT_ACCUM_ZMM(acc4, m41, s41, b, scv4, av);
+                    LUT_ACCUM_ZMM(acc5, m51, s51, b, scv5, av);
+                    LUT_ACCUM_ZMM(acc6, m61, s61, b, scv6, av);
+                    LUT_ACCUM_ZMM(acc7, m71, s71, b, scv7, av);
                 }
             }
             C[i*N+j+0]=hsum_zmm(acc0); C[i*N+j+1]=hsum_zmm(acc1);
@@ -312,10 +325,10 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
                 uint64_t sgn0=B_T->sign[bidx*2+0],      sgn1=B_T->sign[bidx*2+1];
                 __m512 scv = _mm512_set1_ps(sf[bidx]);
                 const float *ap = &A[i * K + bk * G128_BLOCK_SIZE];
-                for (int b = 0; b < 64; b += 16)
-                    acc = ternary_madd(acc, mag0, sgn0, b, scv, _mm512_load_ps(ap + b));
-                for (int b = 0; b < 64; b += 16)
-                    acc = ternary_madd(acc, mag1, sgn1, b, scv, _mm512_load_ps(ap + 64 + b));
+                for (int b = 0; b < 64; b += 8)
+                    LUT_ACCUM_ZMM(acc, mag0, sgn0, b, scv, _mm512_load_ps(ap + b));
+                for (int b = 0; b < 64; b += 8)
+                    LUT_ACCUM_ZMM(acc, mag1, sgn1, b, scv, _mm512_load_ps(ap + 64 + b));
             }
             C[i*N+j] = hsum_zmm(acc);
         }
@@ -323,6 +336,7 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
 }
 
 void lm_head_prefilter(float *A, G128Matrix *B_T, float *C, int N, int max_blocks) {
+    init_avx512_lut_once();
     int nkb = (int)B_T->num_blocks_col;
     if (max_blocks <= 0 || max_blocks > nkb) max_blocks = nkb;
     const float *sf = B_T->scales_f32;
@@ -367,27 +381,27 @@ void lm_head_prefilter(float *A, G128Matrix *B_T, float *C, int N, int max_block
                 __m512 scv4=_mm512_set1_ps(sc4), scv5=_mm512_set1_ps(sc5);
                 __m512 scv6=_mm512_set1_ps(sc6), scv7=_mm512_set1_ps(sc7);
                 const float *bk_ap = &ap[bk * G128_BLOCK_SIZE];
-                for (int b = 0; b < 64; b += 16) {
+                for (int b = 0; b < 64; b += 8) {
                     __m512 av = _mm512_load_ps(&bk_ap[b]);
-                    acc0 = ternary_madd(acc0, m00, s00, b, scv0, av);
-                    acc1 = ternary_madd(acc1, m10, s10, b, scv1, av);
-                    acc2 = ternary_madd(acc2, m20, s20, b, scv2, av);
-                    acc3 = ternary_madd(acc3, m30, s30, b, scv3, av);
-                    acc4 = ternary_madd(acc4, m40, s40, b, scv4, av);
-                    acc5 = ternary_madd(acc5, m50, s50, b, scv5, av);
-                    acc6 = ternary_madd(acc6, m60, s60, b, scv6, av);
-                    acc7 = ternary_madd(acc7, m70, s70, b, scv7, av);
+                    LUT_ACCUM_ZMM(acc0, m00, s00, b, scv0, av);
+                    LUT_ACCUM_ZMM(acc1, m10, s10, b, scv1, av);
+                    LUT_ACCUM_ZMM(acc2, m20, s20, b, scv2, av);
+                    LUT_ACCUM_ZMM(acc3, m30, s30, b, scv3, av);
+                    LUT_ACCUM_ZMM(acc4, m40, s40, b, scv4, av);
+                    LUT_ACCUM_ZMM(acc5, m50, s50, b, scv5, av);
+                    LUT_ACCUM_ZMM(acc6, m60, s60, b, scv6, av);
+                    LUT_ACCUM_ZMM(acc7, m70, s70, b, scv7, av);
                 }
-                for (int b = 0; b < 64; b += 16) {
+                for (int b = 0; b < 64; b += 8) {
                     __m512 av = _mm512_load_ps(&bk_ap[64 + b]);
-                    acc0 = ternary_madd(acc0, m01, s01, b, scv0, av);
-                    acc1 = ternary_madd(acc1, m11, s11, b, scv1, av);
-                    acc2 = ternary_madd(acc2, m21, s21, b, scv2, av);
-                    acc3 = ternary_madd(acc3, m31, s31, b, scv3, av);
-                    acc4 = ternary_madd(acc4, m41, s41, b, scv4, av);
-                    acc5 = ternary_madd(acc5, m51, s51, b, scv5, av);
-                    acc6 = ternary_madd(acc6, m61, s61, b, scv6, av);
-                    acc7 = ternary_madd(acc7, m71, s71, b, scv7, av);
+                    LUT_ACCUM_ZMM(acc0, m01, s01, b, scv0, av);
+                    LUT_ACCUM_ZMM(acc1, m11, s11, b, scv1, av);
+                    LUT_ACCUM_ZMM(acc2, m21, s21, b, scv2, av);
+                    LUT_ACCUM_ZMM(acc3, m31, s31, b, scv3, av);
+                    LUT_ACCUM_ZMM(acc4, m41, s41, b, scv4, av);
+                    LUT_ACCUM_ZMM(acc5, m51, s51, b, scv5, av);
+                    LUT_ACCUM_ZMM(acc6, m61, s61, b, scv6, av);
+                    LUT_ACCUM_ZMM(acc7, m71, s71, b, scv7, av);
                 }
             }
             C[j+0]=hsum_zmm(acc0); C[j+1]=hsum_zmm(acc1);
@@ -404,10 +418,10 @@ void lm_head_prefilter(float *A, G128Matrix *B_T, float *C, int N, int max_block
                 uint64_t sgn0=B_T->sign[bidx*2+0],      sgn1=B_T->sign[bidx*2+1];
                 __m512 scv = _mm512_set1_ps(sf[bidx]);
                 const float *bk_ap = &ap[bk * G128_BLOCK_SIZE];
-                for (int b = 0; b < 64; b += 16)
-                    acc = ternary_madd(acc, mag0, sgn0, b, scv, _mm512_load_ps(&bk_ap[b]));
-                for (int b = 0; b < 64; b += 16)
-                    acc = ternary_madd(acc, mag1, sgn1, b, scv, _mm512_load_ps(&bk_ap[64 + b]));
+                for (int b = 0; b < 64; b += 8)
+                    LUT_ACCUM_ZMM(acc, mag0, sgn0, b, scv, _mm512_load_ps(&bk_ap[b]));
+                for (int b = 0; b < 64; b += 8)
+                    LUT_ACCUM_ZMM(acc, mag1, sgn1, b, scv, _mm512_load_ps(&bk_ap[64 + b]));
             }
             C[j] = hsum_zmm(acc);
         }
@@ -415,6 +429,7 @@ void lm_head_prefilter(float *A, G128Matrix *B_T, float *C, int N, int max_block
 }
 
 void matmul_g128_selected(float *A, G128Matrix *B_T, float *C, int M, int K, int N_full, int N_sel, const int *sel_rows) {
+    init_avx512_lut_once();
     int nkb = (int)B_T->num_blocks_col;
     const float *sf = B_T->scales_f32;
     for (int i = 0; i < M; i++) {
@@ -461,27 +476,27 @@ void matmul_g128_selected(float *A, G128Matrix *B_T, float *C, int M, int K, int
                 __m512 scv4=_mm512_set1_ps(sc4), scv5=_mm512_set1_ps(sc5);
                 __m512 scv6=_mm512_set1_ps(sc6), scv7=_mm512_set1_ps(sc7);
                 const float *ap = &A[i * K + bk * G128_BLOCK_SIZE];
-                for (int b = 0; b < 64; b += 16) {
+                for (int b = 0; b < 64; b += 8) {
                     __m512 av = _mm512_load_ps(ap + b);
-                    acc0 = ternary_madd(acc0, m00, s00, b, scv0, av);
-                    acc1 = ternary_madd(acc1, m10, s10, b, scv1, av);
-                    acc2 = ternary_madd(acc2, m20, s20, b, scv2, av);
-                    acc3 = ternary_madd(acc3, m30, s30, b, scv3, av);
-                    acc4 = ternary_madd(acc4, m40, s40, b, scv4, av);
-                    acc5 = ternary_madd(acc5, m50, s50, b, scv5, av);
-                    acc6 = ternary_madd(acc6, m60, s60, b, scv6, av);
-                    acc7 = ternary_madd(acc7, m70, s70, b, scv7, av);
+                    LUT_ACCUM_ZMM(acc0, m00, s00, b, scv0, av);
+                    LUT_ACCUM_ZMM(acc1, m10, s10, b, scv1, av);
+                    LUT_ACCUM_ZMM(acc2, m20, s20, b, scv2, av);
+                    LUT_ACCUM_ZMM(acc3, m30, s30, b, scv3, av);
+                    LUT_ACCUM_ZMM(acc4, m40, s40, b, scv4, av);
+                    LUT_ACCUM_ZMM(acc5, m50, s50, b, scv5, av);
+                    LUT_ACCUM_ZMM(acc6, m60, s60, b, scv6, av);
+                    LUT_ACCUM_ZMM(acc7, m70, s70, b, scv7, av);
                 }
-                for (int b = 0; b < 64; b += 16) {
+                for (int b = 0; b < 64; b += 8) {
                     __m512 av = _mm512_load_ps(ap + 64 + b);
-                    acc0 = ternary_madd(acc0, m01, s01, b, scv0, av);
-                    acc1 = ternary_madd(acc1, m11, s11, b, scv1, av);
-                    acc2 = ternary_madd(acc2, m21, s21, b, scv2, av);
-                    acc3 = ternary_madd(acc3, m31, s31, b, scv3, av);
-                    acc4 = ternary_madd(acc4, m41, s41, b, scv4, av);
-                    acc5 = ternary_madd(acc5, m51, s51, b, scv5, av);
-                    acc6 = ternary_madd(acc6, m61, s61, b, scv6, av);
-                    acc7 = ternary_madd(acc7, m71, s71, b, scv7, av);
+                    LUT_ACCUM_ZMM(acc0, m01, s01, b, scv0, av);
+                    LUT_ACCUM_ZMM(acc1, m11, s11, b, scv1, av);
+                    LUT_ACCUM_ZMM(acc2, m21, s21, b, scv2, av);
+                    LUT_ACCUM_ZMM(acc3, m31, s31, b, scv3, av);
+                    LUT_ACCUM_ZMM(acc4, m41, s41, b, scv4, av);
+                    LUT_ACCUM_ZMM(acc5, m51, s51, b, scv5, av);
+                    LUT_ACCUM_ZMM(acc6, m61, s61, b, scv6, av);
+                    LUT_ACCUM_ZMM(acc7, m71, s71, b, scv7, av);
                 }
             }
             C[i*N_full + r0]=hsum_zmm(acc0); C[i*N_full + r1]=hsum_zmm(acc1);
@@ -499,10 +514,10 @@ void matmul_g128_selected(float *A, G128Matrix *B_T, float *C, int M, int K, int
                 uint64_t sgn0=B_T->sign[bidx*2+0],      sgn1=B_T->sign[bidx*2+1];
                 __m512 scv = _mm512_set1_ps(sf[bidx]);
                 const float *ap = &A[i * K + bk * G128_BLOCK_SIZE];
-                for (int b = 0; b < 64; b += 16)
-                    acc = ternary_madd(acc, mag0, sgn0, b, scv, _mm512_load_ps(ap + b));
-                for (int b = 0; b < 64; b += 16)
-                    acc = ternary_madd(acc, mag1, sgn1, b, scv, _mm512_load_ps(ap + 64 + b));
+                for (int b = 0; b < 64; b += 8)
+                    LUT_ACCUM_ZMM(acc, mag0, sgn0, b, scv, _mm512_load_ps(ap + b));
+                for (int b = 0; b < 64; b += 8)
+                    LUT_ACCUM_ZMM(acc, mag1, sgn1, b, scv, _mm512_load_ps(ap + 64 + b));
             }
             C[i*N_full + r] = hsum_zmm(acc);
         }
