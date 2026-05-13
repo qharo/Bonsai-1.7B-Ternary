@@ -225,10 +225,10 @@ static void init_avx512_lut_once(void) {
     uint8_t _sn1 = ((uint64_t)(sw) >> ((b)+8)) & 0xFF; \
     __m512 _wm0 = _mm512_castsi512_ps(_mm512_load_si512((const __m512i*)avx512_mag_lut[_mn0])); \
     __m512 _ws0 = _mm512_castsi512_ps(_mm512_load_si512((const __m512i*)avx512_mag_lut[_sn0])); \
-    __m512 _wm1 = _mm512_castsi512_ps(_mm512_load_si512((const __m512i*)avx512_mag_lut[_mn1])); \
-    __m512 _ws1 = _mm512_castsi512_ps(_mm512_load_si512((const __m512i*)avx512_mag_lut[_sn1])); \
-    _wm1 = _mm512_castsi512_ps(_mm512_bslli_epi128(_mm512_castps_si512(_wm1), 32)); \
-    _ws1 = _mm512_castsi512_ps(_mm512_bslli_epi128(_mm512_castps_si512(_ws1), 32)); \
+    __m256 _wm1_lo = _mm256_load_ps((const float*)avx512_mag_lut[_mn1]); \
+    __m512 _wm1 = _mm512_insertf32x8(_mm512_setzero_ps(), _wm1_lo, 1); \
+    __m256 _ws1_lo = _mm256_load_ps((const float*)avx512_mag_lut[_sn1]); \
+    __m512 _ws1 = _mm512_insertf32x8(_mm512_setzero_ps(), _ws1_lo, 1); \
     __m512 _wm = _mm512_or_ps(_wm0, _wm1); \
     __m512 _ws = _mm512_or_ps(_ws0, _ws1); \
     __m512 _ss = _mm512_xor_ps((sc), _mm512_and_ps(_ws, _mm512_set1_ps(-0.0f))); \
