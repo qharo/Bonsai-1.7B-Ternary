@@ -217,8 +217,9 @@ def np_softmax(x):
 
 def sample_token(logits, temperature, top_p, top_k):
     logits = np.frombuffer(logits, dtype=np.float32).copy()
-    if temperature > 0:
-        logits /= temperature
+    if temperature <= 0:
+        return int(np.argmax(logits))
+    logits /= temperature
     if top_k > 0:
         # argpartition is O(n) vs argsort O(n log n)
         top_k = min(top_k, len(logits))

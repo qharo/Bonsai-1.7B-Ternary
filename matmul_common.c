@@ -552,7 +552,7 @@ void find_top_k(float *scores, int N, int K, int *out_indices) {
     free(heap);
 }
 
-const int lm_head_prefilter_available = 1;
+const int lm_head_prefilter_available = 0;
 
 #elif defined(__AVX2__)
 
