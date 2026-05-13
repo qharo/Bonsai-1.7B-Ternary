@@ -14,6 +14,17 @@
 #define MAX_SEQ_LEN 512
 #define LM_HEAD_CANDIDATES 4096
 
+typedef enum {
+    MATMUL_Q_PROJ    = 0,
+    MATMUL_K_PROJ    = 1,
+    MATMUL_V_PROJ    = 2,
+    MATMUL_O_PROJ    = 3,
+    MATMUL_GATE_PROJ = 4,
+    MATMUL_UP_PROJ   = 5,
+    MATMUL_DOWN_PROJ = 6,
+    MATMUL_COUNT     = 7
+} MatmulType;
+
 typedef struct {
     float *data;
     int num_rows, num_cols;
@@ -26,11 +37,16 @@ typedef struct {
 } LayerWeights;
 
 typedef struct {
-    uint64_t decode_count;      // number of decode steps profiled
-    double   matmul_ns;         // cumulative ns in G128 matmuls (decode only)
-    double   attn_ns;           // cumulative ns in attention core (decode only)
-    double   logits_ns;         // cumulative ns in final embed projection (decode only)
-    double   total_ns;          // cumulative ns across entire model_decode
+    uint64_t decode_count;           // number of decode steps profiled
+    double   matmul_ns;              // cumulative ns in G128 matmuls (decode only)
+    double   attn_ns;                // cumulative ns in attention core (decode only)
+    double   logits_ns;              // cumulative ns in final embed projection (decode only)
+    double   total_ns;               // cumulative ns across entire model_decode
+    double   per_matmul_ns[MATMUL_COUNT];   // per-matmul-type ns
+    double   benchmark_ms[5];               // thread scaling: 1,2,4,8,16 threads
+    uint64_t per_matmul_calls[MATMUL_COUNT];   // per-type call count
+    uint64_t per_matmul_elements[MATMUL_COUNT]; // per-type ternary elements processed
+    int      benchmark_nthreads[5];           // thread counts for benchmark
 } ProfileStats;
 
 typedef struct {
@@ -62,3 +78,5 @@ int model_omp_max_threads(void);
 long model_debug_offset_loaded(void);
 long model_debug_offset_kv_len(void);
 void model_set_omp_threads(int n);
+void model_run_benchmark(ModelState *s);
+const char* model_matmul_type_name(int type);

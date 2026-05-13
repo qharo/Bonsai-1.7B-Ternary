@@ -85,6 +85,11 @@ def load_library():
             ("attn_ns", ctypes.c_double),
             ("logits_ns", ctypes.c_double),
             ("total_ns", ctypes.c_double),
+            ("per_matmul_ns", ctypes.c_double * 7),
+            ("benchmark_ms", ctypes.c_double * 5),
+            ("per_matmul_calls", ctypes.c_uint64 * 7),
+            ("per_matmul_elements", ctypes.c_uint64 * 7),
+            ("benchmark_nthreads", ctypes.c_int * 5),
         ]
 
     class ModelStateStruct(ctypes.Structure):
@@ -146,6 +151,10 @@ def init_model():
     _lib.model_set_omp_threads.argtypes = [ctypes.c_int]
     _lib.model_set_omp_threads.restype = None
     _lib.model_set_omp_threads(ctypes.c_int(os.cpu_count() or 16))
+    _lib.model_run_benchmark.argtypes = [ctypes.POINTER(ModelState)]
+    _lib.model_run_benchmark.restype = None
+    _lib.model_matmul_type_name.argtypes = [ctypes.c_int]
+    _lib.model_matmul_type_name.restype = ctypes.c_char_p
 
     t0 = time.perf_counter()
     _model = ModelState()
@@ -174,6 +183,7 @@ def init_model():
 
     log_startup_diagnostics(load_s, tts_load_s)
     log_pod_info()
+    log_benchmark()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -522,6 +532,31 @@ def _format_profile(p):
     attn_ms = p.attn_ns / 1e6
     logits_ms = p.logits_ns / 1e6
     total_ms = p.total_ns / 1e6
+    # Per-matmul breakdown
+    per_matmul = {}
+    total_elements = 0
+    for i, name in enumerate(_MATMUL_TYPE_NAMES):
+        calls = p.per_matmul_calls[i]
+        ns = p.per_matmul_ns[i]
+        elems = p.per_matmul_elements[i]
+        total_elements += elems
+        if calls > 0:
+            per_matmul[name] = {
+                "calls": calls,
+                "ms": round(ns / 1e6, 2),
+                "ms_per_call": round(ns / 1e6 / calls, 2) if calls else 0,
+                "elements": elems,
+            }
+    # Uop efficiency: est. ~13 uops per 16 elements in LUT_ACCUM_ZMM
+    est_uops = (total_elements / 16) * 13 if total_elements else 0
+    uop_slots = c * 16 * 2.9e9 * 3  # 16 cores × freq × ~3 uops/cycle × decode_count seconds
+    # Actually uop_slots should be per step, not total
+    decode_time_ns = p.total_ns  # total decode time
+    uop_slots_per_step = 16 * 2.9e9 * 3 * (decode_time_ns / 1e9) / c if c > 0 else 1
+    uop_efficiency = (est_uops / c) / uop_slots_per_step * 100 if uop_slots_per_step > 0 else 0
+    # Effective bandwidth (bytes read = elements × 0.28125 for G128 ternary)
+    bytes_read = total_elements * 0.28125 if c > 0 else 0
+    bw_gbs = (bytes_read / 1e9) / (matmul_ms / 1000 / c) if matmul_ms > 0 and c > 0 else 0
     return {
         "decode_count": c,
         "kv_len": _model.kv_len if _model else 0,
@@ -543,6 +578,13 @@ def _format_profile(p):
             "attention": round(attn_ms / 1000, 2),
             "logits": round(logits_ms / 1000, 2),
             "total": round(total_ms / 1000, 2),
+        },
+        "per_matmul": per_matmul,
+        "diagnostic": {
+            "total_ternary_elements": total_elements,
+            "est_uops": int(est_uops),
+            "uop_efficiency_pct": round(uop_efficiency, 1),
+            "eff_bw_gbs": round(bw_gbs, 2),
         },
     }
 
@@ -574,6 +616,25 @@ def log_startup_diagnostics(load_s, tts_load_s):
         "model_dir": MODEL_DIR,
     }
     print(f"[DIAG] {json.dumps(diag)}", flush=True)
+
+_MATMUL_TYPE_NAMES = [
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_proj", "up_proj", "down_proj"
+]
+
+def log_benchmark():
+    if not _model:
+        return
+    p = ProfileStats()
+    _lib.model_get_profile(ctypes.byref(_model), ctypes.byref(p))
+    bench = []
+    for i in range(5):
+        nt = p.benchmark_nthreads[i]
+        if nt > 0:
+            bench.append({"threads": nt, "ms": round(p.benchmark_ms[i], 2)})
+    if bench:
+        info = {"benchmark": bench}
+        print(f"[BENCH] {json.dumps(info)}", flush=True)
 
 def log_pod_info():
     info = {"env": {}}

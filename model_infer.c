@@ -174,6 +174,16 @@ static void apply_rope(float *q, int seqlen, int nh, int hd, float *invf, float 
     }
 }
 
+// Profile helper: accumulate timing + element count for a single matmul
+static inline void profile_matmul(ModelState *s, int type, uint64_t t0, int seqlen, int K, int N) {
+    uint64_t t1 = now_ns();
+    double dt = (double)(t1 - t0);
+    s->profile.matmul_ns += dt;
+    s->profile.per_matmul_ns[type] += dt;
+    s->profile.per_matmul_calls[type]++;
+    s->profile.per_matmul_elements[type] += (uint64_t)seqlen * (uint64_t)K * (uint64_t)N;
+}
+
 // decode_pos: ignored during prefill; for decode = position of the new token in the sequence
 static void forward_layer(ModelState *s, int lid, int seqlen, int prefill, int decode_pos) {
     LayerWeights *lw = &s->layers[lid];
@@ -187,9 +197,15 @@ static void forward_layer(ModelState *s, int lid, int seqlen, int prefill, int d
 
     if (!prefill) _t0 = now_ns();
     matmul_simd_g128(n, &lw->q_proj, q, seqlen, HIDDEN_SIZE, HIDDEN_SIZE);
+    if (!prefill) profile_matmul(s, MATMUL_Q_PROJ, _t0, seqlen, HIDDEN_SIZE, HIDDEN_SIZE);
+
+    if (!prefill) _t0 = now_ns();
     matmul_simd_g128(n, &lw->k_proj, k, seqlen, HIDDEN_SIZE, NUM_KV_HEADS*HEAD_DIM);
+    if (!prefill) profile_matmul(s, MATMUL_K_PROJ, _t0, seqlen, HIDDEN_SIZE, NUM_KV_HEADS*HEAD_DIM);
+
+    if (!prefill) _t0 = now_ns();
     matmul_simd_g128(n, &lw->v_proj, v, seqlen, HIDDEN_SIZE, NUM_KV_HEADS*HEAD_DIM);
-    if (!prefill) { _t1 = now_ns(); s->profile.matmul_ns += (double)(_t1 - _t0); }
+    if (!prefill) profile_matmul(s, MATMUL_V_PROJ, _t0, seqlen, HIDDEN_SIZE, NUM_KV_HEADS*HEAD_DIM);
 
     for (int i = 0; i < seqlen; i++) {
         rms_norm_head(&q[i*HIDDEN_SIZE], lw->q_norm.data, NUM_HEADS, HEAD_DIM);
@@ -248,17 +264,25 @@ static void forward_layer(ModelState *s, int lid, int seqlen, int prefill, int d
 
     if (!prefill) _t0 = now_ns();
     matmul_simd_g128(ao, &lw->o_proj, h, seqlen, HIDDEN_SIZE, HIDDEN_SIZE);
+    if (!prefill) profile_matmul(s, MATMUL_O_PROJ, _t0, seqlen, HIDDEN_SIZE, HIDDEN_SIZE);
     for (int i = 0; i < seqlen*HIDDEN_SIZE; i++) h[i] += res[i];
     memcpy(res, h, seqlen*HIDDEN_SIZE*4);
 
     for (int i = 0; i < seqlen; i++) rms_norm(&h[i*HIDDEN_SIZE], lw->ln2.data, &n[i*HIDDEN_SIZE], HIDDEN_SIZE);
 
+    if (!prefill) _t0 = now_ns();
     matmul_simd_g128(n, &lw->gate_proj, go, seqlen, HIDDEN_SIZE, INTERMEDIATE_SIZE);
+    if (!prefill) profile_matmul(s, MATMUL_GATE_PROJ, _t0, seqlen, HIDDEN_SIZE, INTERMEDIATE_SIZE);
+
+    if (!prefill) _t0 = now_ns();
     matmul_simd_g128(n, &lw->up_proj, uo, seqlen, HIDDEN_SIZE, INTERMEDIATE_SIZE);
+    if (!prefill) profile_matmul(s, MATMUL_UP_PROJ, _t0, seqlen, HIDDEN_SIZE, INTERMEDIATE_SIZE);
     silu(go, ma, seqlen*INTERMEDIATE_SIZE);
     for (int i = 0; i < seqlen*INTERMEDIATE_SIZE; i++) go[i] = ma[i] * uo[i];
+
+    if (!prefill) _t0 = now_ns();
     matmul_simd_g128(go, &lw->down_proj, h, seqlen, INTERMEDIATE_SIZE, HIDDEN_SIZE);
-    if (!prefill) { _t1 = now_ns(); s->profile.matmul_ns += (double)(_t1 - _t0); }
+    if (!prefill) profile_matmul(s, MATMUL_DOWN_PROJ, _t0, seqlen, INTERMEDIATE_SIZE, HIDDEN_SIZE);
     for (int i = 0; i < seqlen*HIDDEN_SIZE; i++) h[i] += res[i];
 }
 
@@ -424,6 +448,15 @@ void model_get_profile(ModelState *s, ProfileStats *out) {
     out->attn_ns      = s->profile.attn_ns;
     out->logits_ns    = s->profile.logits_ns;
     out->total_ns     = s->profile.total_ns;
+    for (int i = 0; i < MATMUL_COUNT; i++) {
+        out->per_matmul_ns[i]       = s->profile.per_matmul_ns[i];
+        out->per_matmul_calls[i]    = s->profile.per_matmul_calls[i];
+        out->per_matmul_elements[i] = s->profile.per_matmul_elements[i];
+    }
+    for (int i = 0; i < 5; i++) {
+        out->benchmark_ms[i]       = s->profile.benchmark_ms[i];
+        out->benchmark_nthreads[i] = s->profile.benchmark_nthreads[i];
+    }
 }
 
 void model_reset_profile(ModelState *s) {
@@ -475,4 +508,43 @@ void model_set_omp_threads(int n) {
 #else
     (void)n;
 #endif
+}
+
+const char* model_matmul_type_name(int type) {
+    switch (type) {
+        case MATMUL_Q_PROJ:     return "q_proj";
+        case MATMUL_K_PROJ:     return "k_proj";
+        case MATMUL_V_PROJ:     return "v_proj";
+        case MATMUL_O_PROJ:     return "o_proj";
+        case MATMUL_GATE_PROJ:  return "gate_proj";
+        case MATMUL_UP_PROJ:    return "up_proj";
+        case MATMUL_DOWN_PROJ:  return "down_proj";
+        default:                return "unknown";
+    }
+}
+
+void model_run_benchmark(ModelState *s) {
+    G128Matrix *w = &s->embed;
+    int K = (int)w->num_cols;
+    int N = 4096;
+    if (N > (int)w->num_rows) N = (int)w->num_rows;
+
+    float *A = (float*)aligned_calloc(64, (size_t)K * sizeof(float));
+    float *C = (float*)aligned_calloc(64, (size_t)N * sizeof(float));
+    for (int i = 0; i < K; i++) A[i] = 1.0f;
+
+    int threads[] = {1, 2, 4, 8, 16};
+    int prev = model_omp_max_threads();
+    for (int ti = 0; ti < 5; ti++) {
+        model_set_omp_threads(threads[ti]);
+        uint64_t t0 = now_ns();
+        matmul_simd_g128(A, w, C, 1, K, N);
+        uint64_t t1 = now_ns();
+        s->profile.benchmark_ms[ti] = (double)(t1 - t0) / 1e6;
+        s->profile.benchmark_nthreads[ti] = threads[ti];
+    }
+    model_set_omp_threads(prev);
+
+    free(A);
+    free(C);
 }
