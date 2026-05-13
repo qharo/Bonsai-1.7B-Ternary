@@ -459,10 +459,6 @@ void model_get_profile(ModelState *s, ProfileStats *out) {
         out->per_matmul_calls[i]    = s->profile.per_matmul_calls[i];
         out->per_matmul_elements[i] = s->profile.per_matmul_elements[i];
     }
-    for (int i = 0; i < 5; i++) {
-        out->benchmark_ms[i]       = s->profile.benchmark_ms[i];
-        out->benchmark_nthreads[i] = s->profile.benchmark_nthreads[i];
-    }
 }
 
 void model_reset_profile(ModelState *s) {
@@ -516,41 +512,4 @@ void model_set_omp_threads(int n) {
 #endif
 }
 
-const char* model_matmul_type_name(int type) {
-    switch (type) {
-        case MATMUL_Q_PROJ:     return "q_proj";
-        case MATMUL_K_PROJ:     return "k_proj";
-        case MATMUL_V_PROJ:     return "v_proj";
-        case MATMUL_O_PROJ:     return "o_proj";
-        case MATMUL_GATE_PROJ:  return "gate_proj";
-        case MATMUL_UP_PROJ:    return "up_proj";
-        case MATMUL_DOWN_PROJ:  return "down_proj";
-        default:                return "unknown";
-    }
-}
 
-void model_run_benchmark(ModelState *s) {
-    G128Matrix *w = &s->embed;
-    int K = (int)w->num_cols;
-    int N = 4096;
-    if (N > (int)w->num_rows) N = (int)w->num_rows;
-
-    float *A = (float*)aligned_calloc(64, (size_t)K * sizeof(float));
-    float *C = (float*)aligned_calloc(64, (size_t)N * sizeof(float));
-    for (int i = 0; i < K; i++) A[i] = 1.0f;
-
-    int threads[] = {1, 2, 4, 8, 16};
-    int prev = model_omp_max_threads();
-    for (int ti = 0; ti < 5; ti++) {
-        model_set_omp_threads(threads[ti]);
-        uint64_t t0 = now_ns();
-        matmul_simd_g128(A, w, C, 1, K, N);
-        uint64_t t1 = now_ns();
-        s->profile.benchmark_ms[ti] = (double)(t1 - t0) / 1e6;
-        s->profile.benchmark_nthreads[ti] = threads[ti];
-    }
-    model_set_omp_threads(prev);
-
-    free(A);
-    free(C);
-}

@@ -43,10 +43,8 @@ typedef struct {
     double   logits_ns;              // cumulative ns in final embed projection (decode only)
     double   total_ns;               // cumulative ns across entire model_decode
     double   per_matmul_ns[MATMUL_COUNT];   // per-matmul-type ns
-    double   benchmark_ms[5];               // thread scaling: 1,2,4,8,16 threads
     uint64_t per_matmul_calls[MATMUL_COUNT];   // per-type call count
     uint64_t per_matmul_elements[MATMUL_COUNT]; // per-type ternary elements processed
-    int      benchmark_nthreads[5];           // thread counts for benchmark
 } ProfileStats;
 
 typedef struct {
@@ -78,5 +76,3 @@ int model_omp_max_threads(void);
 long model_debug_offset_loaded(void);
 long model_debug_offset_kv_len(void);
 void model_set_omp_threads(int n);
-void model_run_benchmark(ModelState *s);
-const char* model_matmul_type_name(int type);

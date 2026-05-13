@@ -86,10 +86,8 @@ def load_library():
             ("logits_ns", ctypes.c_double),
             ("total_ns", ctypes.c_double),
             ("per_matmul_ns", ctypes.c_double * 7),
-            ("benchmark_ms", ctypes.c_double * 5),
             ("per_matmul_calls", ctypes.c_uint64 * 7),
             ("per_matmul_elements", ctypes.c_uint64 * 7),
-            ("benchmark_nthreads", ctypes.c_int * 5),
         ]
 
     class ModelStateStruct(ctypes.Structure):
@@ -151,10 +149,6 @@ def init_model():
     _lib.model_set_omp_threads.argtypes = [ctypes.c_int]
     _lib.model_set_omp_threads.restype = None
     _lib.model_set_omp_threads(ctypes.c_int(os.cpu_count() or 16))
-    _lib.model_run_benchmark.argtypes = [ctypes.POINTER(ModelState)]
-    _lib.model_run_benchmark.restype = None
-    _lib.model_matmul_type_name.argtypes = [ctypes.c_int]
-    _lib.model_matmul_type_name.restype = ctypes.c_char_p
 
     t0 = time.perf_counter()
     _model = ModelState()
@@ -183,8 +177,6 @@ def init_model():
 
     log_startup_diagnostics(load_s, tts_load_s)
     log_pod_info()
-    _lib.model_run_benchmark(ctypes.byref(_model))
-    log_benchmark()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -622,20 +614,6 @@ _MATMUL_TYPE_NAMES = [
     "q_proj", "k_proj", "v_proj", "o_proj",
     "gate_proj", "up_proj", "down_proj"
 ]
-
-def log_benchmark():
-    if not _model:
-        return
-    p = ProfileStats()
-    _lib.model_get_profile(ctypes.byref(_model), ctypes.byref(p))
-    bench = []
-    for i in range(5):
-        nt = p.benchmark_nthreads[i]
-        if nt > 0:
-            bench.append({"threads": nt, "ms": round(p.benchmark_ms[i], 2)})
-    if bench:
-        info = {"benchmark": bench}
-        print(f"[BENCH] {json.dumps(info)}", flush=True)
 
 def log_pod_info():
     info = {"env": {}}
