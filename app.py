@@ -104,7 +104,7 @@ def load_library():
             ("up_out", ctypes.c_void_p),
             ("mlp_act", ctypes.c_void_p),
             ("approx_logits", ctypes.c_void_p),
-            ("lm_head_candidates", ctypes.c_int * 8192),
+            ("lm_head_candidates", ctypes.c_int * 4096),
             ("kv_k", ctypes.c_float * (28 * 512 * 8 * 128)),
             ("kv_v", ctypes.c_float * (28 * 512 * 8 * 128)),
             ("inv_freq", ctypes.c_float * 64),
@@ -141,6 +141,8 @@ def init_model():
     _lib.model_reset_profile.restype = None
     _lib.model_matmul_path.restype = ctypes.c_char_p
     _lib.model_compile_info.restype = ctypes.c_char_p
+    _lib.model_omp_max_threads.argtypes = []
+    _lib.model_omp_max_threads.restype = ctypes.c_int
     _lib.model_set_omp_threads.argtypes = [ctypes.c_int]
     _lib.model_set_omp_threads.restype = None
     _lib.model_set_omp_threads(ctypes.c_int(os.cpu_count() or 16))
@@ -578,6 +580,11 @@ def log_pod_info():
     for var in ("OMP_NUM_THREADS", "OMP_SCHEDULE", "OMP_WAIT_POLICY", "OMP_PROC_BIND", "MODEL_DIR"):
         info["env"][var] = os.environ.get(var, "(unset)")
     info["cpu_count"] = os.cpu_count()
+    try:
+        omp_actual = _lib.model_omp_max_threads()
+        info["omp_actual_threads"] = omp_actual
+    except Exception:
+        pass
     try:
         with open("/proc/cpuinfo") as f:
             cpu = f.read()

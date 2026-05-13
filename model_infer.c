@@ -452,6 +452,23 @@ const char* model_compile_info(void) {
 #endif
 }
 
+int model_omp_max_threads(void) {
+#ifdef _OPENMP
+    return omp_get_max_threads();
+#else
+    return 1;
+#endif
+}
+
+// Debug: return offset of `loaded` field within ModelState
+#include <stddef.h>
+long model_debug_offset_loaded(void) {
+    return (long)offsetof(ModelState, loaded);
+}
+long model_debug_offset_kv_len(void) {
+    return (long)offsetof(ModelState, kv_len);
+}
+
 void model_set_omp_threads(int n) {
 #ifdef _OPENMP
     omp_set_num_threads(n);
