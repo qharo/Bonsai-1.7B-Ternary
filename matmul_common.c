@@ -206,15 +206,13 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
 #include <immintrin.h>
 
 
-// Decode 16 bits from mag/sgn via mask-to-vector AND/XOR/FMADD (same flow as proven LUT kernel)
+// Decode 16 bits from mag/sgn via masked VFMADD with VXORPS negation (no VFNMADD)
 #define LUT_ACCUM_ZMM_16(acc, mw, sw, b, sc, av) do { \
     uint32_t _m16 = (uint32_t)((uint64_t)(mw) >> (b)); \
     uint32_t _s16 = (uint32_t)((uint64_t)(sw) >> (b)); \
-    __m512i _mag = _mm512_maskz_set1_epi32(_cvtu32_mask16(_m16), -1); \
-    __m512i _sgn = _mm512_maskz_set1_epi32(_cvtu32_mask16(_m16 & _s16), -1); \
-    __m512  _sf  = _mm512_castsi512_ps(_mm512_and_si512(_sgn, _mm512_set1_epi32(0x80000000))); \
-    __m512  _w   = _mm512_and_ps(_mm512_xor_ps((sc), _sf), _mm512_castsi512_ps(_mag)); \
-    (acc) = _mm512_fmadd_ps(_w, (av), (acc)); \
+    __m512 _nsc = _mm512_xor_ps((sc), _mm512_set1_ps(-0.0f)); \
+    (acc) = _mm512_mask_fmadd_ps((acc), _cvtu32_mask16(_m16 & ~_s16), (sc), (av)); \
+    (acc) = _mm512_mask_fmadd_ps((acc), _cvtu32_mask16(_m16 &  _s16), (_nsc), (av)); \
 } while(0)
 
 static inline float hsum_zmm(__m512 v) {
