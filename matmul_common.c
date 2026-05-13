@@ -205,35 +205,13 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
 
 #include <immintrin.h>
 
-// 8-bit → 16-lane mask LUT: lane j = all-1s if bit j of index is set, else 0
-static uint32_t avx512_mag_lut[256][16] __attribute__((aligned(64)));
-static int avx512_lut_init = 0;
 
-static void init_avx512_lut_once(void) {
-    if (avx512_lut_init) return;
-    for (int i = 0; i < 256; i++)
-        for (int j = 0; j < 16; j++)
-            avx512_mag_lut[i][j] = ((i >> j) & 1) ? 0xFFFFFFFF : 0;
-    avx512_lut_init = 1;
-}
-
-// Decode 16 bits (two nibbles) from mag/sgn into all 16 ZMM lanes and FMA-accumulate
+// Decode 16 bits from mag/sgn via mask FMA: +sc where mag=1,sgn=0; -sc where mag=1,sgn=1; 0 where mag=0
 #define LUT_ACCUM_ZMM_16(acc, mw, sw, b, sc, av) do { \
-    uint8_t _mn0 = ((uint64_t)(mw) >> (b)) & 0xFF; \
-    uint8_t _sn0 = ((uint64_t)(sw) >> (b)) & 0xFF; \
-    uint8_t _mn1 = ((uint64_t)(mw) >> ((b)+8)) & 0xFF; \
-    uint8_t _sn1 = ((uint64_t)(sw) >> ((b)+8)) & 0xFF; \
-    __m512 _wm0 = _mm512_castsi512_ps(_mm512_load_si512((const __m512i*)avx512_mag_lut[_mn0])); \
-    __m512 _ws0 = _mm512_castsi512_ps(_mm512_load_si512((const __m512i*)avx512_mag_lut[_sn0])); \
-    __m256 _wm1_lo = _mm256_load_ps((const float*)avx512_mag_lut[_mn1]); \
-    __m512 _wm1 = _mm512_insertf32x8(_mm512_setzero_ps(), _wm1_lo, 1); \
-    __m256 _ws1_lo = _mm256_load_ps((const float*)avx512_mag_lut[_sn1]); \
-    __m512 _ws1 = _mm512_insertf32x8(_mm512_setzero_ps(), _ws1_lo, 1); \
-    __m512 _wm = _mm512_or_ps(_wm0, _wm1); \
-    __m512 _ws = _mm512_or_ps(_ws0, _ws1); \
-    __m512 _ss = _mm512_xor_ps((sc), _mm512_and_ps(_ws, _mm512_set1_ps(-0.0f))); \
-    __m512 _w  = _mm512_and_ps(_ss, _wm); \
-    (acc) = _mm512_fmadd_ps(_w, (av), (acc)); \
+    uint32_t _m16 = (uint32_t)((uint64_t)(mw) >> (b)); \
+    uint32_t _s16 = (uint32_t)((uint64_t)(sw) >> (b)); \
+    (acc) = _mm512_mask_fmadd_ps ((acc), _cvtu32_mask16(_m16 & ~_s16), (sc), (av)); \
+    (acc) = _mm512_mask_fnmadd_ps((acc), _cvtu32_mask16(_m16 &  _s16), (sc), (av)); \
 } while(0)
 
 static inline float hsum_zmm(__m512 v) {
@@ -247,7 +225,7 @@ static inline float hsum_zmm(__m512 v) {
 }
 
 void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) {
-    init_avx512_lut_once();
+
     int nkb = (int)B_T->num_blocks_col;
     const float *sf = B_T->scales_f32;
     for (int i = 0; i < M; i++) {
@@ -344,7 +322,7 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
 }
 
 void lm_head_prefilter(float *A, G128Matrix *B_T, float *C, int N, int max_blocks) {
-    init_avx512_lut_once();
+
     int nkb = (int)B_T->num_blocks_col;
     if (max_blocks <= 0 || max_blocks > nkb) max_blocks = nkb;
     const float *sf = B_T->scales_f32;
@@ -437,7 +415,7 @@ void lm_head_prefilter(float *A, G128Matrix *B_T, float *C, int N, int max_block
 }
 
 void matmul_g128_selected(float *A, G128Matrix *B_T, float *C, int M, int K, int N_full, int N_sel, const int *sel_rows) {
-    init_avx512_lut_once();
+
     int nkb = (int)B_T->num_blocks_col;
     const float *sf = B_T->scales_f32;
     for (int i = 0; i < M; i++) {
