@@ -793,7 +793,7 @@ static int _diag_test_f32(const char *name, const float *got, const float *exp, 
     return ok;
 }
 
-__attribute__((constructor)) static void avx512_diagnostic_impl(void) {
+void avx512_diagnostic(void) {
     static int done = 0;
     if (done) return; done = 1;
     fprintf(stdout, "[DIAG] AVX-512 instruction diagnostic\n");

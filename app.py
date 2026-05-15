@@ -155,6 +155,10 @@ def init_model():
     ret = _lib.model_load(ctypes.byref(_model), MODEL_DIR.encode())
     if ret != 0:
         raise RuntimeError(f"Failed to load model from {MODEL_DIR}")
+    if hasattr(_lib, 'avx512_diagnostic'):
+        _lib.avx512_diagnostic.argtypes = []
+        _lib.avx512_diagnostic.restype = None
+        _lib.avx512_diagnostic()
     load_s = time.perf_counter() - t0
 
     global _logits_buf
