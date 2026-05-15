@@ -98,6 +98,20 @@ static int load_g128(G128Matrix *m, const char *base) {
     for (uint64_t bi = 0; bi < nb; bi++)
         m->scales_f32[bi] = half_to_float(m->scales[bi]);
 
+    // build interleaved packed array for AVX-512: 4 × uint64 per block, each uint64 holds
+    // two 32-bit groups of (sgn[15:0] << 16) | mag[15:0]
+    posix_memalign((void**)&m->packed, 64, nb * 4 * sizeof(uint64_t));
+    for (uint64_t bi = 0; bi < nb; bi++) {
+        uint64_t m0 = m->magnitude[bi*2+0], m1 = m->magnitude[bi*2+1];
+        uint64_t s0 = m->sign[bi*2+0],      s1 = m->sign[bi*2+1];
+#define PK16(m16, s16) ((uint32_t)(s16) << 16 | (uint32_t)(m16))
+        m->packed[bi*4+0] = (uint64_t)PK16(m0>>16, s0>>16) << 32 | PK16(m0, s0);
+        m->packed[bi*4+1] = (uint64_t)PK16(m0>>48, s0>>48) << 32 | PK16(m0>>32, s0>>32);
+        m->packed[bi*4+2] = (uint64_t)PK16(m1>>16, s1>>16) << 32 | PK16(m1, s1);
+        m->packed[bi*4+3] = (uint64_t)PK16(m1>>48, s1>>48) << 32 | PK16(m1>>32, s1>>32);
+#undef PK16
+    }
+
     return 0;
 }
 
@@ -363,7 +377,7 @@ int model_load(ModelState *s, const char *dir) {
 }
 
 static void free_g128(G128Matrix *m) {
-    free(m->magnitude); free(m->sign); free(m->scales); free(m->scales_f32);
+    free(m->magnitude); free(m->sign); free(m->packed); free(m->scales); free(m->scales_f32);
 }
 
 void model_free(ModelState *s) {
@@ -510,6 +524,16 @@ void model_set_omp_threads(int n) {
 #else
     (void)n;
 #endif
+}
+
+int model_affinity_cpu_count(void) {
+#ifdef __linux__
+    cpu_set_t cs;
+    CPU_ZERO(&cs);
+    if (sched_getaffinity(0, sizeof(cs), &cs) == 0)
+        return CPU_COUNT(&cs);
+#endif
+    return -1;
 }
 
 

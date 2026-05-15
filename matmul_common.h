@@ -15,6 +15,7 @@ typedef struct {
     uint32_t num_blocks_col;
     uint64_t *magnitude;
     uint64_t *sign;
+    uint64_t *packed;       // combined mag|sign: 4 × uint64 per block (AVX-512)
     uint16_t *scales;
     float    *scales_f32;
 } G128Matrix;

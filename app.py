@@ -52,6 +52,7 @@ def load_library():
             ("num_blocks_col", ctypes.c_uint32),
             ("magnitude", ctypes.c_void_p),
             ("sign", ctypes.c_void_p),
+            ("packed", ctypes.c_void_p),
             ("scales", ctypes.c_void_p),
             ("scales_f32", ctypes.c_void_p),
         ]
@@ -128,6 +129,13 @@ def init_model():
     
     if _model is not None:
         return
+
+    n_cpus = os.cpu_count() or 16
+    os.environ['OMP_NUM_THREADS'] = str(n_cpus)
+    os.environ['OMP_THREAD_LIMIT'] = str(n_cpus)
+    os.environ['OMP_DYNAMIC'] = 'FALSE'
+    os.environ['OMP_PROC_BIND'] = 'true'
+    os.environ['OMP_PLACES'] = 'cores'
     
     load_library()
     
@@ -628,6 +636,11 @@ def log_pod_info():
     try:
         omp_actual = _lib.model_omp_max_threads()
         info["omp_actual_threads"] = omp_actual
+    except Exception:
+        pass
+    try:
+        affinity_cpus = _lib.model_affinity_cpu_count()
+        info["affinity_cpus"] = affinity_cpus
     except Exception:
         pass
     try:

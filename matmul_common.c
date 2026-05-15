@@ -19,6 +19,7 @@ void g128_matrix_init(G128Matrix *m, uint32_t num_rows, uint32_t num_cols) {
     uint64_t num_blocks = (uint64_t)num_rows * num_cols / G128_BLOCK_SIZE;
     m->magnitude  = calloc(num_blocks * 2, sizeof(uint64_t));
     m->sign       = calloc(num_blocks * 2, sizeof(uint64_t));
+    m->packed     = NULL;
     m->scales     = malloc(num_blocks * sizeof(uint16_t));
     m->scales_f32 = NULL;
 }
@@ -26,6 +27,7 @@ void g128_matrix_init(G128Matrix *m, uint32_t num_rows, uint32_t num_cols) {
 void g128_matrix_free(G128Matrix *m) {
     free(m->magnitude);
     free(m->sign);
+    free(m->packed);
     free(m->scales);
     free(m->scales_f32);
 }
@@ -206,13 +208,28 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
 #include <immintrin.h>
 
 
+// Hoisted broadcast of constant 1 for VPSLLD{z} sign-bit generation
+static const __m512i _o1 = _mm512_set1_epi32(1);
+
 // Zero mag=0 via VMOVAPS(zero-mask, port 0/5), sign bits via VPSLLD(zero-mask, port 0)
+// KMOVD+KSHIFTR approach: 1 port-5 uop instead of 2 (combine mag+sgn into 32-bit, split with KSHIFTR on port 0)
 #define LUT_ACCUM_ZMM_16(acc, mw, sw, b, sc, av) do { \
     uint32_t _m16 = (uint32_t)((uint64_t)(mw) >> (b)); \
     uint32_t _s16 = (uint32_t)((uint64_t)(sw) >> (b)); \
-    __m512 _magged = _mm512_maskz_mov_ps(_cvtu32_mask16(_m16), (av)); \
+    uint32_t _comb = _m16 | (_s16 << 16); \
+    __mmask32 _ck = _cvtu32_mask32(_comb); \
+    __m512 _magged = _mm512_maskz_mov_ps((__mmask16)_ck, (av)); \
     __m512 _signed = _mm512_xor_ps(_magged, _mm512_castsi512_ps( \
-        _mm512_maskz_slli_epi32(_cvtu32_mask16(_m16 & _s16), _o1, 31))); \
+        _mm512_maskz_slli_epi32((__mmask16)_kshiftri_mask32(_ck, 16), _o1, 31))); \
+    (acc) = _mm512_fmadd_ps(_signed, (sc), (acc)); \
+} while(0)
+
+// Packed-layout variant: takes pre-combined 32-bit (sgn[15:0]<<16 | mag[15:0])
+#define LUT_ACCUM_ZMM_COMB(acc, comb, sc, av) do { \
+    __mmask32 _ck = _cvtu32_mask32(comb); \
+    __m512 _magged = _mm512_maskz_mov_ps((__mmask16)_ck, (av)); \
+    __m512 _signed = _mm512_xor_ps(_magged, _mm512_castsi512_ps( \
+        _mm512_maskz_slli_epi32((__mmask16)_kshiftri_mask32(_ck, 16), _o1, 31))); \
     (acc) = _mm512_fmadd_ps(_signed, (sc), (acc)); \
 } while(0)
 
@@ -227,13 +244,16 @@ static inline float hsum_zmm(__m512 v) {
 }
 
 void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) {
-    const __m512i _o1 = _mm512_set1_epi32(1);
     int nkb = (int)B_T->num_blocks_col;
     const float *sf = B_T->scales_f32;
-    for (int i = 0; i < M; i++) {
-        int n8 = (N / 8) * 8;
-        #pragma omp parallel for schedule(static) if(n8 >= 512)
-        for (int j = 0; j < n8; j += 8) {
+    int n8 = (N / 8) * 8;
+    int n_j = n8 / 8;
+    int total_jobs = M * n_j;
+    if (total_jobs >= 32) {
+        #pragma omp parallel for schedule(static)
+        for (int idx = 0; idx < total_jobs; idx++) {
+            int i = idx / n_j;
+            int j = (idx % n_j) * 8;
             __m512 acc0 = _mm512_setzero_ps();
             __m512 acc1 = _mm512_setzero_ps();
             __m512 acc2 = _mm512_setzero_ps();
@@ -247,22 +267,38 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
                 int b2=(j+2)*nkb+bk, b3=(j+3)*nkb+bk;
                 int b4=(j+4)*nkb+bk, b5=(j+5)*nkb+bk;
                 int b6=(j+6)*nkb+bk, b7=(j+7)*nkb+bk;
-                uint64_t m00=B_T->magnitude[b0*2+0], m01=B_T->magnitude[b0*2+1];
-                uint64_t s00=B_T->sign[b0*2+0],      s01=B_T->sign[b0*2+1];
-                uint64_t m10=B_T->magnitude[b1*2+0], m11=B_T->magnitude[b1*2+1];
-                uint64_t s10=B_T->sign[b1*2+0],      s11=B_T->sign[b1*2+1];
-                uint64_t m20=B_T->magnitude[b2*2+0], m21=B_T->magnitude[b2*2+1];
-                uint64_t s20=B_T->sign[b2*2+0],      s21=B_T->sign[b2*2+1];
-                uint64_t m30=B_T->magnitude[b3*2+0], m31=B_T->magnitude[b3*2+1];
-                uint64_t s30=B_T->sign[b3*2+0],      s31=B_T->sign[b3*2+1];
-                uint64_t m40=B_T->magnitude[b4*2+0], m41=B_T->magnitude[b4*2+1];
-                uint64_t s40=B_T->sign[b4*2+0],      s41=B_T->sign[b4*2+1];
-                uint64_t m50=B_T->magnitude[b5*2+0], m51=B_T->magnitude[b5*2+1];
-                uint64_t s50=B_T->sign[b5*2+0],      s51=B_T->sign[b5*2+1];
-                uint64_t m60=B_T->magnitude[b6*2+0], m61=B_T->magnitude[b6*2+1];
-                uint64_t s60=B_T->sign[b6*2+0],      s61=B_T->sign[b6*2+1];
-                uint64_t m70=B_T->magnitude[b7*2+0], m71=B_T->magnitude[b7*2+1];
-                uint64_t s70=B_T->sign[b7*2+0],      s71=B_T->sign[b7*2+1];
+                uint64_t p00_0 = B_T->packed[b0*4+0], p00_1 = B_T->packed[b0*4+1];
+                uint64_t p00_2 = B_T->packed[b0*4+2], p00_3 = B_T->packed[b0*4+3];
+                uint32_t c00[4] = {(uint32_t)p00_0, (uint32_t)(p00_0>>32), (uint32_t)p00_1, (uint32_t)(p00_1>>32)};
+                uint32_t c01[4] = {(uint32_t)p00_2, (uint32_t)(p00_2>>32), (uint32_t)p00_3, (uint32_t)(p00_3>>32)};
+                uint64_t p10_0 = B_T->packed[b1*4+0], p10_1 = B_T->packed[b1*4+1];
+                uint64_t p10_2 = B_T->packed[b1*4+2], p10_3 = B_T->packed[b1*4+3];
+                uint32_t c10[4] = {(uint32_t)p10_0, (uint32_t)(p10_0>>32), (uint32_t)p10_1, (uint32_t)(p10_1>>32)};
+                uint32_t c11[4] = {(uint32_t)p10_2, (uint32_t)(p10_2>>32), (uint32_t)p10_3, (uint32_t)(p10_3>>32)};
+                uint64_t p20_0 = B_T->packed[b2*4+0], p20_1 = B_T->packed[b2*4+1];
+                uint64_t p20_2 = B_T->packed[b2*4+2], p20_3 = B_T->packed[b2*4+3];
+                uint32_t c20[4] = {(uint32_t)p20_0, (uint32_t)(p20_0>>32), (uint32_t)p20_1, (uint32_t)(p20_1>>32)};
+                uint32_t c21[4] = {(uint32_t)p20_2, (uint32_t)(p20_2>>32), (uint32_t)p20_3, (uint32_t)(p20_3>>32)};
+                uint64_t p30_0 = B_T->packed[b3*4+0], p30_1 = B_T->packed[b3*4+1];
+                uint64_t p30_2 = B_T->packed[b3*4+2], p30_3 = B_T->packed[b3*4+3];
+                uint32_t c30[4] = {(uint32_t)p30_0, (uint32_t)(p30_0>>32), (uint32_t)p30_1, (uint32_t)(p30_1>>32)};
+                uint32_t c31[4] = {(uint32_t)p30_2, (uint32_t)(p30_2>>32), (uint32_t)p30_3, (uint32_t)(p30_3>>32)};
+                uint64_t p40_0 = B_T->packed[b4*4+0], p40_1 = B_T->packed[b4*4+1];
+                uint64_t p40_2 = B_T->packed[b4*4+2], p40_3 = B_T->packed[b4*4+3];
+                uint32_t c40[4] = {(uint32_t)p40_0, (uint32_t)(p40_0>>32), (uint32_t)p40_1, (uint32_t)(p40_1>>32)};
+                uint32_t c41[4] = {(uint32_t)p40_2, (uint32_t)(p40_2>>32), (uint32_t)p40_3, (uint32_t)(p40_3>>32)};
+                uint64_t p50_0 = B_T->packed[b5*4+0], p50_1 = B_T->packed[b5*4+1];
+                uint64_t p50_2 = B_T->packed[b5*4+2], p50_3 = B_T->packed[b5*4+3];
+                uint32_t c50[4] = {(uint32_t)p50_0, (uint32_t)(p50_0>>32), (uint32_t)p50_1, (uint32_t)(p50_1>>32)};
+                uint32_t c51[4] = {(uint32_t)p50_2, (uint32_t)(p50_2>>32), (uint32_t)p50_3, (uint32_t)(p50_3>>32)};
+                uint64_t p60_0 = B_T->packed[b6*4+0], p60_1 = B_T->packed[b6*4+1];
+                uint64_t p60_2 = B_T->packed[b6*4+2], p60_3 = B_T->packed[b6*4+3];
+                uint32_t c60[4] = {(uint32_t)p60_0, (uint32_t)(p60_0>>32), (uint32_t)p60_1, (uint32_t)(p60_1>>32)};
+                uint32_t c61[4] = {(uint32_t)p60_2, (uint32_t)(p60_2>>32), (uint32_t)p60_3, (uint32_t)(p60_3>>32)};
+                uint64_t p70_0 = B_T->packed[b7*4+0], p70_1 = B_T->packed[b7*4+1];
+                uint64_t p70_2 = B_T->packed[b7*4+2], p70_3 = B_T->packed[b7*4+3];
+                uint32_t c70[4] = {(uint32_t)p70_0, (uint32_t)(p70_0>>32), (uint32_t)p70_1, (uint32_t)(p70_1>>32)};
+                uint32_t c71[4] = {(uint32_t)p70_2, (uint32_t)(p70_2>>32), (uint32_t)p70_3, (uint32_t)(p70_3>>32)};
                 float sc0=sf[b0], sc1=sf[b1], sc2=sf[b2], sc3=sf[b3];
                 float sc4=sf[b4], sc5=sf[b5], sc6=sf[b6], sc7=sf[b7];
                 __m512 scv0=_mm512_set1_ps(sc0), scv1=_mm512_set1_ps(sc1);
@@ -271,32 +307,36 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
                 __m512 scv6=_mm512_set1_ps(sc6), scv7=_mm512_set1_ps(sc7);
                 const float *ap = &A[i * K + bk * G128_BLOCK_SIZE];
                 if (bk + 1 < nkb) {
-                    int pf_bidx = j * nkb + bk + 1;
-                    _mm_prefetch((const char*)&B_T->magnitude[pf_bidx * 2], _MM_HINT_T1);
-                    _mm_prefetch((const char*)&B_T->sign[pf_bidx * 2], _MM_HINT_T1);
-                    _mm_prefetch((const char*)&sf[pf_bidx], _MM_HINT_T1);
+                    int pfb = j * nkb + bk + 1;
+                    _mm_prefetch((const char*)&B_T->packed[pfb * 4], _MM_HINT_T0);
+                    _mm_prefetch((const char*)&sf[pfb], _MM_HINT_T0);
+                    _mm_prefetch(&A[i * K + (bk + 1) * 128], _MM_HINT_T0);
+                    for (int ri = 2; ri < 8; ri += 2) {
+                        int pfb_ri = (j + ri) * nkb + bk + 1;
+                        _mm_prefetch((const char*)&B_T->packed[pfb_ri * 4], _MM_HINT_T0);
+                    }
                 }
-                for (int b = 0; b < 64; b += 16) {
-                    __m512 av = _mm512_load_ps(ap + b);
-                    LUT_ACCUM_ZMM_16(acc0, m00, s00, b, scv0, av);
-                    LUT_ACCUM_ZMM_16(acc1, m10, s10, b, scv1, av);
-                    LUT_ACCUM_ZMM_16(acc2, m20, s20, b, scv2, av);
-                    LUT_ACCUM_ZMM_16(acc3, m30, s30, b, scv3, av);
-                    LUT_ACCUM_ZMM_16(acc4, m40, s40, b, scv4, av);
-                    LUT_ACCUM_ZMM_16(acc5, m50, s50, b, scv5, av);
-                    LUT_ACCUM_ZMM_16(acc6, m60, s60, b, scv6, av);
-                    LUT_ACCUM_ZMM_16(acc7, m70, s70, b, scv7, av);
+                for (int bi = 0; bi < 4; bi++) {
+                    __m512 av = _mm512_load_ps(ap + bi * 16);
+                    LUT_ACCUM_ZMM_COMB(acc0, c00[bi], scv0, av);
+                    LUT_ACCUM_ZMM_COMB(acc1, c10[bi], scv1, av);
+                    LUT_ACCUM_ZMM_COMB(acc2, c20[bi], scv2, av);
+                    LUT_ACCUM_ZMM_COMB(acc3, c30[bi], scv3, av);
+                    LUT_ACCUM_ZMM_COMB(acc4, c40[bi], scv4, av);
+                    LUT_ACCUM_ZMM_COMB(acc5, c50[bi], scv5, av);
+                    LUT_ACCUM_ZMM_COMB(acc6, c60[bi], scv6, av);
+                    LUT_ACCUM_ZMM_COMB(acc7, c70[bi], scv7, av);
                 }
-                for (int b = 0; b < 64; b += 16) {
-                    __m512 av = _mm512_load_ps(ap + 64 + b);
-                    LUT_ACCUM_ZMM_16(acc0, m01, s01, b, scv0, av);
-                    LUT_ACCUM_ZMM_16(acc1, m11, s11, b, scv1, av);
-                    LUT_ACCUM_ZMM_16(acc2, m21, s21, b, scv2, av);
-                    LUT_ACCUM_ZMM_16(acc3, m31, s31, b, scv3, av);
-                    LUT_ACCUM_ZMM_16(acc4, m41, s41, b, scv4, av);
-                    LUT_ACCUM_ZMM_16(acc5, m51, s51, b, scv5, av);
-                    LUT_ACCUM_ZMM_16(acc6, m61, s61, b, scv6, av);
-                    LUT_ACCUM_ZMM_16(acc7, m71, s71, b, scv7, av);
+                for (int bi = 0; bi < 4; bi++) {
+                    __m512 av = _mm512_load_ps(ap + 64 + bi * 16);
+                    LUT_ACCUM_ZMM_COMB(acc0, c01[bi], scv0, av);
+                    LUT_ACCUM_ZMM_COMB(acc1, c11[bi], scv1, av);
+                    LUT_ACCUM_ZMM_COMB(acc2, c21[bi], scv2, av);
+                    LUT_ACCUM_ZMM_COMB(acc3, c31[bi], scv3, av);
+                    LUT_ACCUM_ZMM_COMB(acc4, c41[bi], scv4, av);
+                    LUT_ACCUM_ZMM_COMB(acc5, c51[bi], scv5, av);
+                    LUT_ACCUM_ZMM_COMB(acc6, c61[bi], scv6, av);
+                    LUT_ACCUM_ZMM_COMB(acc7, c71[bi], scv7, av);
                 }
             }
             C[i*N+j+0]=hsum_zmm(acc0); C[i*N+j+1]=hsum_zmm(acc1);
@@ -304,19 +344,118 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
             C[i*N+j+4]=hsum_zmm(acc4); C[i*N+j+5]=hsum_zmm(acc5);
             C[i*N+j+6]=hsum_zmm(acc6); C[i*N+j+7]=hsum_zmm(acc7);
         }
+    } else {
+        for (int i = 0; i < M; i++) {
+            #pragma omp parallel for schedule(static) if(n8 >= 512)
+            for (int j = 0; j < n8; j += 8) {
+                __m512 acc0 = _mm512_setzero_ps();
+                __m512 acc1 = _mm512_setzero_ps();
+                __m512 acc2 = _mm512_setzero_ps();
+                __m512 acc3 = _mm512_setzero_ps();
+                __m512 acc4 = _mm512_setzero_ps();
+                __m512 acc5 = _mm512_setzero_ps();
+                __m512 acc6 = _mm512_setzero_ps();
+                __m512 acc7 = _mm512_setzero_ps();
+                for (int bk = 0; bk < nkb; bk++) {
+                    int b0=(j+0)*nkb+bk, b1=(j+1)*nkb+bk;
+                    int b2=(j+2)*nkb+bk, b3=(j+3)*nkb+bk;
+                    int b4=(j+4)*nkb+bk, b5=(j+5)*nkb+bk;
+                    int b6=(j+6)*nkb+bk, b7=(j+7)*nkb+bk;
+                    uint64_t p00_0 = B_T->packed[b0*4+0], p00_1 = B_T->packed[b0*4+1];
+                    uint64_t p00_2 = B_T->packed[b0*4+2], p00_3 = B_T->packed[b0*4+3];
+                    uint32_t c00[4] = {(uint32_t)p00_0, (uint32_t)(p00_0>>32), (uint32_t)p00_1, (uint32_t)(p00_1>>32)};
+                    uint32_t c01[4] = {(uint32_t)p00_2, (uint32_t)(p00_2>>32), (uint32_t)p00_3, (uint32_t)(p00_3>>32)};
+                    uint64_t p10_0 = B_T->packed[b1*4+0], p10_1 = B_T->packed[b1*4+1];
+                    uint64_t p10_2 = B_T->packed[b1*4+2], p10_3 = B_T->packed[b1*4+3];
+                    uint32_t c10[4] = {(uint32_t)p10_0, (uint32_t)(p10_0>>32), (uint32_t)p10_1, (uint32_t)(p10_1>>32)};
+                    uint32_t c11[4] = {(uint32_t)p10_2, (uint32_t)(p10_2>>32), (uint32_t)p10_3, (uint32_t)(p10_3>>32)};
+                    uint64_t p20_0 = B_T->packed[b2*4+0], p20_1 = B_T->packed[b2*4+1];
+                    uint64_t p20_2 = B_T->packed[b2*4+2], p20_3 = B_T->packed[b2*4+3];
+                    uint32_t c20[4] = {(uint32_t)p20_0, (uint32_t)(p20_0>>32), (uint32_t)p20_1, (uint32_t)(p20_1>>32)};
+                    uint32_t c21[4] = {(uint32_t)p20_2, (uint32_t)(p20_2>>32), (uint32_t)p20_3, (uint32_t)(p20_3>>32)};
+                    uint64_t p30_0 = B_T->packed[b3*4+0], p30_1 = B_T->packed[b3*4+1];
+                    uint64_t p30_2 = B_T->packed[b3*4+2], p30_3 = B_T->packed[b3*4+3];
+                    uint32_t c30[4] = {(uint32_t)p30_0, (uint32_t)(p30_0>>32), (uint32_t)p30_1, (uint32_t)(p30_1>>32)};
+                    uint32_t c31[4] = {(uint32_t)p30_2, (uint32_t)(p30_2>>32), (uint32_t)p30_3, (uint32_t)(p30_3>>32)};
+                    uint64_t p40_0 = B_T->packed[b4*4+0], p40_1 = B_T->packed[b4*4+1];
+                    uint64_t p40_2 = B_T->packed[b4*4+2], p40_3 = B_T->packed[b4*4+3];
+                    uint32_t c40[4] = {(uint32_t)p40_0, (uint32_t)(p40_0>>32), (uint32_t)p40_1, (uint32_t)(p40_1>>32)};
+                    uint32_t c41[4] = {(uint32_t)p40_2, (uint32_t)(p40_2>>32), (uint32_t)p40_3, (uint32_t)(p40_3>>32)};
+                    uint64_t p50_0 = B_T->packed[b5*4+0], p50_1 = B_T->packed[b5*4+1];
+                    uint64_t p50_2 = B_T->packed[b5*4+2], p50_3 = B_T->packed[b5*4+3];
+                    uint32_t c50[4] = {(uint32_t)p50_0, (uint32_t)(p50_0>>32), (uint32_t)p50_1, (uint32_t)(p50_1>>32)};
+                    uint32_t c51[4] = {(uint32_t)p50_2, (uint32_t)(p50_2>>32), (uint32_t)p50_3, (uint32_t)(p50_3>>32)};
+                    uint64_t p60_0 = B_T->packed[b6*4+0], p60_1 = B_T->packed[b6*4+1];
+                    uint64_t p60_2 = B_T->packed[b6*4+2], p60_3 = B_T->packed[b6*4+3];
+                    uint32_t c60[4] = {(uint32_t)p60_0, (uint32_t)(p60_0>>32), (uint32_t)p60_1, (uint32_t)(p60_1>>32)};
+                    uint32_t c61[4] = {(uint32_t)p60_2, (uint32_t)(p60_2>>32), (uint32_t)p60_3, (uint32_t)(p60_3>>32)};
+                    uint64_t p70_0 = B_T->packed[b7*4+0], p70_1 = B_T->packed[b7*4+1];
+                    uint64_t p70_2 = B_T->packed[b7*4+2], p70_3 = B_T->packed[b7*4+3];
+                    uint32_t c70[4] = {(uint32_t)p70_0, (uint32_t)(p70_0>>32), (uint32_t)p70_1, (uint32_t)(p70_1>>32)};
+                    uint32_t c71[4] = {(uint32_t)p70_2, (uint32_t)(p70_2>>32), (uint32_t)p70_3, (uint32_t)(p70_3>>32)};
+                    float sc0=sf[b0], sc1=sf[b1], sc2=sf[b2], sc3=sf[b3];
+                    float sc4=sf[b4], sc5=sf[b5], sc6=sf[b6], sc7=sf[b7];
+                    __m512 scv0=_mm512_set1_ps(sc0), scv1=_mm512_set1_ps(sc1);
+                    __m512 scv2=_mm512_set1_ps(sc2), scv3=_mm512_set1_ps(sc3);
+                    __m512 scv4=_mm512_set1_ps(sc4), scv5=_mm512_set1_ps(sc5);
+                    __m512 scv6=_mm512_set1_ps(sc6), scv7=_mm512_set1_ps(sc7);
+                    const float *ap = &A[i * K + bk * G128_BLOCK_SIZE];
+                    if (bk + 1 < nkb) {
+                        int pfb = j * nkb + bk + 1;
+                        _mm_prefetch((const char*)&B_T->packed[pfb * 4], _MM_HINT_T0);
+                        _mm_prefetch((const char*)&sf[pfb], _MM_HINT_T0);
+                        _mm_prefetch(&A[i * K + (bk + 1) * 128], _MM_HINT_T0);
+                        for (int ri = 2; ri < 8; ri += 2) {
+                            int pfb_ri = (j + ri) * nkb + bk + 1;
+                            _mm_prefetch((const char*)&B_T->packed[pfb_ri * 4], _MM_HINT_T0);
+                        }
+                    }
+                    for (int bi = 0; bi < 4; bi++) {
+                        __m512 av = _mm512_load_ps(ap + bi * 16);
+                        LUT_ACCUM_ZMM_COMB(acc0, c00[bi], scv0, av);
+                        LUT_ACCUM_ZMM_COMB(acc1, c10[bi], scv1, av);
+                        LUT_ACCUM_ZMM_COMB(acc2, c20[bi], scv2, av);
+                        LUT_ACCUM_ZMM_COMB(acc3, c30[bi], scv3, av);
+                        LUT_ACCUM_ZMM_COMB(acc4, c40[bi], scv4, av);
+                        LUT_ACCUM_ZMM_COMB(acc5, c50[bi], scv5, av);
+                        LUT_ACCUM_ZMM_COMB(acc6, c60[bi], scv6, av);
+                        LUT_ACCUM_ZMM_COMB(acc7, c70[bi], scv7, av);
+                    }
+                    for (int bi = 0; bi < 4; bi++) {
+                        __m512 av = _mm512_load_ps(ap + 64 + bi * 16);
+                        LUT_ACCUM_ZMM_COMB(acc0, c01[bi], scv0, av);
+                        LUT_ACCUM_ZMM_COMB(acc1, c11[bi], scv1, av);
+                        LUT_ACCUM_ZMM_COMB(acc2, c21[bi], scv2, av);
+                        LUT_ACCUM_ZMM_COMB(acc3, c31[bi], scv3, av);
+                        LUT_ACCUM_ZMM_COMB(acc4, c41[bi], scv4, av);
+                        LUT_ACCUM_ZMM_COMB(acc5, c51[bi], scv5, av);
+                        LUT_ACCUM_ZMM_COMB(acc6, c61[bi], scv6, av);
+                        LUT_ACCUM_ZMM_COMB(acc7, c71[bi], scv7, av);
+                    }
+                }
+                C[i*N+j+0]=hsum_zmm(acc0); C[i*N+j+1]=hsum_zmm(acc1);
+                C[i*N+j+2]=hsum_zmm(acc2); C[i*N+j+3]=hsum_zmm(acc3);
+                C[i*N+j+4]=hsum_zmm(acc4); C[i*N+j+5]=hsum_zmm(acc5);
+                C[i*N+j+6]=hsum_zmm(acc6); C[i*N+j+7]=hsum_zmm(acc7);
+            }
+        }
+    }
+    for (int i = 0; i < M; i++) {
         for (int j = n8; j < N; j++) {
             __m512 acc = _mm512_setzero_ps();
             int rb = j * nkb;
             for (int bk = 0; bk < nkb; bk++) {
                 int bidx = rb + bk;
-                uint64_t mag0=B_T->magnitude[bidx*2+0], mag1=B_T->magnitude[bidx*2+1];
-                uint64_t sgn0=B_T->sign[bidx*2+0],      sgn1=B_T->sign[bidx*2+1];
+                uint64_t pk0 = B_T->packed[bidx*4+0], pk1 = B_T->packed[bidx*4+1];
+                uint64_t pk2 = B_T->packed[bidx*4+2], pk3 = B_T->packed[bidx*4+3];
+                uint32_t c_lo[4] = {(uint32_t)pk0, (uint32_t)(pk0>>32), (uint32_t)pk1, (uint32_t)(pk1>>32)};
+                uint32_t c_hi[4] = {(uint32_t)pk2, (uint32_t)(pk2>>32), (uint32_t)pk3, (uint32_t)(pk3>>32)};
                 __m512 scv = _mm512_set1_ps(sf[bidx]);
                 const float *ap = &A[i * K + bk * G128_BLOCK_SIZE];
-                for (int b = 0; b < 64; b += 16)
-                    LUT_ACCUM_ZMM_16(acc, mag0, sgn0, b, scv, _mm512_load_ps(ap + b));
-                for (int b = 0; b < 64; b += 16)
-                    LUT_ACCUM_ZMM_16(acc, mag1, sgn1, b, scv, _mm512_load_ps(ap + 64 + b));
+                for (int bi = 0; bi < 4; bi++)
+                    LUT_ACCUM_ZMM_COMB(acc, c_lo[bi], scv, _mm512_load_ps(ap + bi * 16));
+                for (int bi = 0; bi < 4; bi++)
+                    LUT_ACCUM_ZMM_COMB(acc, c_hi[bi], scv, _mm512_load_ps(ap + 64 + bi * 16));
             }
             C[i*N+j] = hsum_zmm(acc);
         }
@@ -324,7 +463,6 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
 }
 
 void lm_head_prefilter(float *A, G128Matrix *B_T, float *C, int N, int max_blocks) {
-    const __m512i _o1 = _mm512_set1_epi32(1);
     int nkb = (int)B_T->num_blocks_col;
     if (max_blocks <= 0 || max_blocks > nkb) max_blocks = nkb;
     const float *sf = B_T->scales_f32;
@@ -346,22 +484,38 @@ void lm_head_prefilter(float *A, G128Matrix *B_T, float *C, int N, int max_block
                 int b2=(j+2)*nkb+bk, b3=(j+3)*nkb+bk;
                 int b4=(j+4)*nkb+bk, b5=(j+5)*nkb+bk;
                 int b6=(j+6)*nkb+bk, b7=(j+7)*nkb+bk;
-                uint64_t m00=B_T->magnitude[b0*2+0], m01=B_T->magnitude[b0*2+1];
-                uint64_t s00=B_T->sign[b0*2+0],      s01=B_T->sign[b0*2+1];
-                uint64_t m10=B_T->magnitude[b1*2+0], m11=B_T->magnitude[b1*2+1];
-                uint64_t s10=B_T->sign[b1*2+0],      s11=B_T->sign[b1*2+1];
-                uint64_t m20=B_T->magnitude[b2*2+0], m21=B_T->magnitude[b2*2+1];
-                uint64_t s20=B_T->sign[b2*2+0],      s21=B_T->sign[b2*2+1];
-                uint64_t m30=B_T->magnitude[b3*2+0], m31=B_T->magnitude[b3*2+1];
-                uint64_t s30=B_T->sign[b3*2+0],      s31=B_T->sign[b3*2+1];
-                uint64_t m40=B_T->magnitude[b4*2+0], m41=B_T->magnitude[b4*2+1];
-                uint64_t s40=B_T->sign[b4*2+0],      s41=B_T->sign[b4*2+1];
-                uint64_t m50=B_T->magnitude[b5*2+0], m51=B_T->magnitude[b5*2+1];
-                uint64_t s50=B_T->sign[b5*2+0],      s51=B_T->sign[b5*2+1];
-                uint64_t m60=B_T->magnitude[b6*2+0], m61=B_T->magnitude[b6*2+1];
-                uint64_t s60=B_T->sign[b6*2+0],      s61=B_T->sign[b6*2+1];
-                uint64_t m70=B_T->magnitude[b7*2+0], m71=B_T->magnitude[b7*2+1];
-                uint64_t s70=B_T->sign[b7*2+0],      s71=B_T->sign[b7*2+1];
+                uint64_t p00_0 = B_T->packed[b0*4+0], p00_1 = B_T->packed[b0*4+1];
+                uint64_t p00_2 = B_T->packed[b0*4+2], p00_3 = B_T->packed[b0*4+3];
+                uint32_t c00[4] = {(uint32_t)p00_0, (uint32_t)(p00_0>>32), (uint32_t)p00_1, (uint32_t)(p00_1>>32)};
+                uint32_t c01[4] = {(uint32_t)p00_2, (uint32_t)(p00_2>>32), (uint32_t)p00_3, (uint32_t)(p00_3>>32)};
+                uint64_t p10_0 = B_T->packed[b1*4+0], p10_1 = B_T->packed[b1*4+1];
+                uint64_t p10_2 = B_T->packed[b1*4+2], p10_3 = B_T->packed[b1*4+3];
+                uint32_t c10[4] = {(uint32_t)p10_0, (uint32_t)(p10_0>>32), (uint32_t)p10_1, (uint32_t)(p10_1>>32)};
+                uint32_t c11[4] = {(uint32_t)p10_2, (uint32_t)(p10_2>>32), (uint32_t)p10_3, (uint32_t)(p10_3>>32)};
+                uint64_t p20_0 = B_T->packed[b2*4+0], p20_1 = B_T->packed[b2*4+1];
+                uint64_t p20_2 = B_T->packed[b2*4+2], p20_3 = B_T->packed[b2*4+3];
+                uint32_t c20[4] = {(uint32_t)p20_0, (uint32_t)(p20_0>>32), (uint32_t)p20_1, (uint32_t)(p20_1>>32)};
+                uint32_t c21[4] = {(uint32_t)p20_2, (uint32_t)(p20_2>>32), (uint32_t)p20_3, (uint32_t)(p20_3>>32)};
+                uint64_t p30_0 = B_T->packed[b3*4+0], p30_1 = B_T->packed[b3*4+1];
+                uint64_t p30_2 = B_T->packed[b3*4+2], p30_3 = B_T->packed[b3*4+3];
+                uint32_t c30[4] = {(uint32_t)p30_0, (uint32_t)(p30_0>>32), (uint32_t)p30_1, (uint32_t)(p30_1>>32)};
+                uint32_t c31[4] = {(uint32_t)p30_2, (uint32_t)(p30_2>>32), (uint32_t)p30_3, (uint32_t)(p30_3>>32)};
+                uint64_t p40_0 = B_T->packed[b4*4+0], p40_1 = B_T->packed[b4*4+1];
+                uint64_t p40_2 = B_T->packed[b4*4+2], p40_3 = B_T->packed[b4*4+3];
+                uint32_t c40[4] = {(uint32_t)p40_0, (uint32_t)(p40_0>>32), (uint32_t)p40_1, (uint32_t)(p40_1>>32)};
+                uint32_t c41[4] = {(uint32_t)p40_2, (uint32_t)(p40_2>>32), (uint32_t)p40_3, (uint32_t)(p40_3>>32)};
+                uint64_t p50_0 = B_T->packed[b5*4+0], p50_1 = B_T->packed[b5*4+1];
+                uint64_t p50_2 = B_T->packed[b5*4+2], p50_3 = B_T->packed[b5*4+3];
+                uint32_t c50[4] = {(uint32_t)p50_0, (uint32_t)(p50_0>>32), (uint32_t)p50_1, (uint32_t)(p50_1>>32)};
+                uint32_t c51[4] = {(uint32_t)p50_2, (uint32_t)(p50_2>>32), (uint32_t)p50_3, (uint32_t)(p50_3>>32)};
+                uint64_t p60_0 = B_T->packed[b6*4+0], p60_1 = B_T->packed[b6*4+1];
+                uint64_t p60_2 = B_T->packed[b6*4+2], p60_3 = B_T->packed[b6*4+3];
+                uint32_t c60[4] = {(uint32_t)p60_0, (uint32_t)(p60_0>>32), (uint32_t)p60_1, (uint32_t)(p60_1>>32)};
+                uint32_t c61[4] = {(uint32_t)p60_2, (uint32_t)(p60_2>>32), (uint32_t)p60_3, (uint32_t)(p60_3>>32)};
+                uint64_t p70_0 = B_T->packed[b7*4+0], p70_1 = B_T->packed[b7*4+1];
+                uint64_t p70_2 = B_T->packed[b7*4+2], p70_3 = B_T->packed[b7*4+3];
+                uint32_t c70[4] = {(uint32_t)p70_0, (uint32_t)(p70_0>>32), (uint32_t)p70_1, (uint32_t)(p70_1>>32)};
+                uint32_t c71[4] = {(uint32_t)p70_2, (uint32_t)(p70_2>>32), (uint32_t)p70_3, (uint32_t)(p70_3>>32)};
                 float sc0=sf[b0], sc1=sf[b1], sc2=sf[b2], sc3=sf[b3];
                 float sc4=sf[b4], sc5=sf[b5], sc6=sf[b6], sc7=sf[b7];
                 __m512 scv0=_mm512_set1_ps(sc0), scv1=_mm512_set1_ps(sc1);
@@ -369,27 +523,27 @@ void lm_head_prefilter(float *A, G128Matrix *B_T, float *C, int N, int max_block
                 __m512 scv4=_mm512_set1_ps(sc4), scv5=_mm512_set1_ps(sc5);
                 __m512 scv6=_mm512_set1_ps(sc6), scv7=_mm512_set1_ps(sc7);
                 const float *bk_ap = &ap[bk * G128_BLOCK_SIZE];
-                for (int b = 0; b < 64; b += 16) {
-                    __m512 av = _mm512_load_ps(&bk_ap[b]);
-                    LUT_ACCUM_ZMM_16(acc0, m00, s00, b, scv0, av);
-                    LUT_ACCUM_ZMM_16(acc1, m10, s10, b, scv1, av);
-                    LUT_ACCUM_ZMM_16(acc2, m20, s20, b, scv2, av);
-                    LUT_ACCUM_ZMM_16(acc3, m30, s30, b, scv3, av);
-                    LUT_ACCUM_ZMM_16(acc4, m40, s40, b, scv4, av);
-                    LUT_ACCUM_ZMM_16(acc5, m50, s50, b, scv5, av);
-                    LUT_ACCUM_ZMM_16(acc6, m60, s60, b, scv6, av);
-                    LUT_ACCUM_ZMM_16(acc7, m70, s70, b, scv7, av);
+                for (int bi = 0; bi < 4; bi++) {
+                    __m512 av = _mm512_load_ps(&bk_ap[bi * 16]);
+                    LUT_ACCUM_ZMM_COMB(acc0, c00[bi], scv0, av);
+                    LUT_ACCUM_ZMM_COMB(acc1, c10[bi], scv1, av);
+                    LUT_ACCUM_ZMM_COMB(acc2, c20[bi], scv2, av);
+                    LUT_ACCUM_ZMM_COMB(acc3, c30[bi], scv3, av);
+                    LUT_ACCUM_ZMM_COMB(acc4, c40[bi], scv4, av);
+                    LUT_ACCUM_ZMM_COMB(acc5, c50[bi], scv5, av);
+                    LUT_ACCUM_ZMM_COMB(acc6, c60[bi], scv6, av);
+                    LUT_ACCUM_ZMM_COMB(acc7, c70[bi], scv7, av);
                 }
-                for (int b = 0; b < 64; b += 16) {
-                    __m512 av = _mm512_load_ps(&bk_ap[64 + b]);
-                    LUT_ACCUM_ZMM_16(acc0, m01, s01, b, scv0, av);
-                    LUT_ACCUM_ZMM_16(acc1, m11, s11, b, scv1, av);
-                    LUT_ACCUM_ZMM_16(acc2, m21, s21, b, scv2, av);
-                    LUT_ACCUM_ZMM_16(acc3, m31, s31, b, scv3, av);
-                    LUT_ACCUM_ZMM_16(acc4, m41, s41, b, scv4, av);
-                    LUT_ACCUM_ZMM_16(acc5, m51, s51, b, scv5, av);
-                    LUT_ACCUM_ZMM_16(acc6, m61, s61, b, scv6, av);
-                    LUT_ACCUM_ZMM_16(acc7, m71, s71, b, scv7, av);
+                for (int bi = 0; bi < 4; bi++) {
+                    __m512 av = _mm512_load_ps(&bk_ap[64 + bi * 16]);
+                    LUT_ACCUM_ZMM_COMB(acc0, c01[bi], scv0, av);
+                    LUT_ACCUM_ZMM_COMB(acc1, c11[bi], scv1, av);
+                    LUT_ACCUM_ZMM_COMB(acc2, c21[bi], scv2, av);
+                    LUT_ACCUM_ZMM_COMB(acc3, c31[bi], scv3, av);
+                    LUT_ACCUM_ZMM_COMB(acc4, c41[bi], scv4, av);
+                    LUT_ACCUM_ZMM_COMB(acc5, c51[bi], scv5, av);
+                    LUT_ACCUM_ZMM_COMB(acc6, c61[bi], scv6, av);
+                    LUT_ACCUM_ZMM_COMB(acc7, c71[bi], scv7, av);
                 }
             }
             C[j+0]=hsum_zmm(acc0); C[j+1]=hsum_zmm(acc1);
@@ -402,14 +556,16 @@ void lm_head_prefilter(float *A, G128Matrix *B_T, float *C, int N, int max_block
             int rb = j * nkb;
             for (int bk = 0; bk < max_blocks; bk++) {
                 int bidx = rb + bk;
-                uint64_t mag0=B_T->magnitude[bidx*2+0], mag1=B_T->magnitude[bidx*2+1];
-                uint64_t sgn0=B_T->sign[bidx*2+0],      sgn1=B_T->sign[bidx*2+1];
+                uint64_t pk0 = B_T->packed[bidx*4+0], pk1 = B_T->packed[bidx*4+1];
+                uint64_t pk2 = B_T->packed[bidx*4+2], pk3 = B_T->packed[bidx*4+3];
+                uint32_t c_lo[4] = {(uint32_t)pk0, (uint32_t)(pk0>>32), (uint32_t)pk1, (uint32_t)(pk1>>32)};
+                uint32_t c_hi[4] = {(uint32_t)pk2, (uint32_t)(pk2>>32), (uint32_t)pk3, (uint32_t)(pk3>>32)};
                 __m512 scv = _mm512_set1_ps(sf[bidx]);
                 const float *bk_ap = &ap[bk * G128_BLOCK_SIZE];
-                for (int b = 0; b < 64; b += 16)
-                    LUT_ACCUM_ZMM_16(acc, mag0, sgn0, b, scv, _mm512_load_ps(&bk_ap[b]));
-                for (int b = 0; b < 64; b += 16)
-                    LUT_ACCUM_ZMM_16(acc, mag1, sgn1, b, scv, _mm512_load_ps(&bk_ap[64 + b]));
+                for (int bi = 0; bi < 4; bi++)
+                    LUT_ACCUM_ZMM_COMB(acc, c_lo[bi], scv, _mm512_load_ps(&bk_ap[bi * 16]));
+                for (int bi = 0; bi < 4; bi++)
+                    LUT_ACCUM_ZMM_COMB(acc, c_hi[bi], scv, _mm512_load_ps(&bk_ap[64 + bi * 16]));
             }
             C[j] = hsum_zmm(acc);
         }
@@ -417,7 +573,6 @@ void lm_head_prefilter(float *A, G128Matrix *B_T, float *C, int N, int max_block
 }
 
 void matmul_g128_selected(float *A, G128Matrix *B_T, float *C, int M, int K, int N_full, int N_sel, const int *sel_rows) {
-    const __m512i _o1 = _mm512_set1_epi32(1);
     int nkb = (int)B_T->num_blocks_col;
     const float *sf = B_T->scales_f32;
     for (int i = 0; i < M; i++) {
@@ -441,22 +596,38 @@ void matmul_g128_selected(float *A, G128Matrix *B_T, float *C, int M, int K, int
                 int b2=r2*nkb+bk, b3=r3*nkb+bk;
                 int b4=r4*nkb+bk, b5=r5*nkb+bk;
                 int b6=r6*nkb+bk, b7=r7*nkb+bk;
-                uint64_t m00=B_T->magnitude[b0*2+0], m01=B_T->magnitude[b0*2+1];
-                uint64_t s00=B_T->sign[b0*2+0],      s01=B_T->sign[b0*2+1];
-                uint64_t m10=B_T->magnitude[b1*2+0], m11=B_T->magnitude[b1*2+1];
-                uint64_t s10=B_T->sign[b1*2+0],      s11=B_T->sign[b1*2+1];
-                uint64_t m20=B_T->magnitude[b2*2+0], m21=B_T->magnitude[b2*2+1];
-                uint64_t s20=B_T->sign[b2*2+0],      s21=B_T->sign[b2*2+1];
-                uint64_t m30=B_T->magnitude[b3*2+0], m31=B_T->magnitude[b3*2+1];
-                uint64_t s30=B_T->sign[b3*2+0],      s31=B_T->sign[b3*2+1];
-                uint64_t m40=B_T->magnitude[b4*2+0], m41=B_T->magnitude[b4*2+1];
-                uint64_t s40=B_T->sign[b4*2+0],      s41=B_T->sign[b4*2+1];
-                uint64_t m50=B_T->magnitude[b5*2+0], m51=B_T->magnitude[b5*2+1];
-                uint64_t s50=B_T->sign[b5*2+0],      s51=B_T->sign[b5*2+1];
-                uint64_t m60=B_T->magnitude[b6*2+0], m61=B_T->magnitude[b6*2+1];
-                uint64_t s60=B_T->sign[b6*2+0],      s61=B_T->sign[b6*2+1];
-                uint64_t m70=B_T->magnitude[b7*2+0], m71=B_T->magnitude[b7*2+1];
-                uint64_t s70=B_T->sign[b7*2+0],      s71=B_T->sign[b7*2+1];
+                uint64_t p00_0 = B_T->packed[b0*4+0], p00_1 = B_T->packed[b0*4+1];
+                uint64_t p00_2 = B_T->packed[b0*4+2], p00_3 = B_T->packed[b0*4+3];
+                uint32_t c00[4] = {(uint32_t)p00_0, (uint32_t)(p00_0>>32), (uint32_t)p00_1, (uint32_t)(p00_1>>32)};
+                uint32_t c01[4] = {(uint32_t)p00_2, (uint32_t)(p00_2>>32), (uint32_t)p00_3, (uint32_t)(p00_3>>32)};
+                uint64_t p10_0 = B_T->packed[b1*4+0], p10_1 = B_T->packed[b1*4+1];
+                uint64_t p10_2 = B_T->packed[b1*4+2], p10_3 = B_T->packed[b1*4+3];
+                uint32_t c10[4] = {(uint32_t)p10_0, (uint32_t)(p10_0>>32), (uint32_t)p10_1, (uint32_t)(p10_1>>32)};
+                uint32_t c11[4] = {(uint32_t)p10_2, (uint32_t)(p10_2>>32), (uint32_t)p10_3, (uint32_t)(p10_3>>32)};
+                uint64_t p20_0 = B_T->packed[b2*4+0], p20_1 = B_T->packed[b2*4+1];
+                uint64_t p20_2 = B_T->packed[b2*4+2], p20_3 = B_T->packed[b2*4+3];
+                uint32_t c20[4] = {(uint32_t)p20_0, (uint32_t)(p20_0>>32), (uint32_t)p20_1, (uint32_t)(p20_1>>32)};
+                uint32_t c21[4] = {(uint32_t)p20_2, (uint32_t)(p20_2>>32), (uint32_t)p20_3, (uint32_t)(p20_3>>32)};
+                uint64_t p30_0 = B_T->packed[b3*4+0], p30_1 = B_T->packed[b3*4+1];
+                uint64_t p30_2 = B_T->packed[b3*4+2], p30_3 = B_T->packed[b3*4+3];
+                uint32_t c30[4] = {(uint32_t)p30_0, (uint32_t)(p30_0>>32), (uint32_t)p30_1, (uint32_t)(p30_1>>32)};
+                uint32_t c31[4] = {(uint32_t)p30_2, (uint32_t)(p30_2>>32), (uint32_t)p30_3, (uint32_t)(p30_3>>32)};
+                uint64_t p40_0 = B_T->packed[b4*4+0], p40_1 = B_T->packed[b4*4+1];
+                uint64_t p40_2 = B_T->packed[b4*4+2], p40_3 = B_T->packed[b4*4+3];
+                uint32_t c40[4] = {(uint32_t)p40_0, (uint32_t)(p40_0>>32), (uint32_t)p40_1, (uint32_t)(p40_1>>32)};
+                uint32_t c41[4] = {(uint32_t)p40_2, (uint32_t)(p40_2>>32), (uint32_t)p40_3, (uint32_t)(p40_3>>32)};
+                uint64_t p50_0 = B_T->packed[b5*4+0], p50_1 = B_T->packed[b5*4+1];
+                uint64_t p50_2 = B_T->packed[b5*4+2], p50_3 = B_T->packed[b5*4+3];
+                uint32_t c50[4] = {(uint32_t)p50_0, (uint32_t)(p50_0>>32), (uint32_t)p50_1, (uint32_t)(p50_1>>32)};
+                uint32_t c51[4] = {(uint32_t)p50_2, (uint32_t)(p50_2>>32), (uint32_t)p50_3, (uint32_t)(p50_3>>32)};
+                uint64_t p60_0 = B_T->packed[b6*4+0], p60_1 = B_T->packed[b6*4+1];
+                uint64_t p60_2 = B_T->packed[b6*4+2], p60_3 = B_T->packed[b6*4+3];
+                uint32_t c60[4] = {(uint32_t)p60_0, (uint32_t)(p60_0>>32), (uint32_t)p60_1, (uint32_t)(p60_1>>32)};
+                uint32_t c61[4] = {(uint32_t)p60_2, (uint32_t)(p60_2>>32), (uint32_t)p60_3, (uint32_t)(p60_3>>32)};
+                uint64_t p70_0 = B_T->packed[b7*4+0], p70_1 = B_T->packed[b7*4+1];
+                uint64_t p70_2 = B_T->packed[b7*4+2], p70_3 = B_T->packed[b7*4+3];
+                uint32_t c70[4] = {(uint32_t)p70_0, (uint32_t)(p70_0>>32), (uint32_t)p70_1, (uint32_t)(p70_1>>32)};
+                uint32_t c71[4] = {(uint32_t)p70_2, (uint32_t)(p70_2>>32), (uint32_t)p70_3, (uint32_t)(p70_3>>32)};
                 float sc0=sf[b0], sc1=sf[b1], sc2=sf[b2], sc3=sf[b3];
                 float sc4=sf[b4], sc5=sf[b5], sc6=sf[b6], sc7=sf[b7];
                 __m512 scv0=_mm512_set1_ps(sc0), scv1=_mm512_set1_ps(sc1);
@@ -464,27 +635,27 @@ void matmul_g128_selected(float *A, G128Matrix *B_T, float *C, int M, int K, int
                 __m512 scv4=_mm512_set1_ps(sc4), scv5=_mm512_set1_ps(sc5);
                 __m512 scv6=_mm512_set1_ps(sc6), scv7=_mm512_set1_ps(sc7);
                 const float *ap = &A[i * K + bk * G128_BLOCK_SIZE];
-                for (int b = 0; b < 64; b += 16) {
-                    __m512 av = _mm512_load_ps(ap + b);
-                    LUT_ACCUM_ZMM_16(acc0, m00, s00, b, scv0, av);
-                    LUT_ACCUM_ZMM_16(acc1, m10, s10, b, scv1, av);
-                    LUT_ACCUM_ZMM_16(acc2, m20, s20, b, scv2, av);
-                    LUT_ACCUM_ZMM_16(acc3, m30, s30, b, scv3, av);
-                    LUT_ACCUM_ZMM_16(acc4, m40, s40, b, scv4, av);
-                    LUT_ACCUM_ZMM_16(acc5, m50, s50, b, scv5, av);
-                    LUT_ACCUM_ZMM_16(acc6, m60, s60, b, scv6, av);
-                    LUT_ACCUM_ZMM_16(acc7, m70, s70, b, scv7, av);
+                for (int bi = 0; bi < 4; bi++) {
+                    __m512 av = _mm512_load_ps(ap + bi * 16);
+                    LUT_ACCUM_ZMM_COMB(acc0, c00[bi], scv0, av);
+                    LUT_ACCUM_ZMM_COMB(acc1, c10[bi], scv1, av);
+                    LUT_ACCUM_ZMM_COMB(acc2, c20[bi], scv2, av);
+                    LUT_ACCUM_ZMM_COMB(acc3, c30[bi], scv3, av);
+                    LUT_ACCUM_ZMM_COMB(acc4, c40[bi], scv4, av);
+                    LUT_ACCUM_ZMM_COMB(acc5, c50[bi], scv5, av);
+                    LUT_ACCUM_ZMM_COMB(acc6, c60[bi], scv6, av);
+                    LUT_ACCUM_ZMM_COMB(acc7, c70[bi], scv7, av);
                 }
-                for (int b = 0; b < 64; b += 16) {
-                    __m512 av = _mm512_load_ps(ap + 64 + b);
-                    LUT_ACCUM_ZMM_16(acc0, m01, s01, b, scv0, av);
-                    LUT_ACCUM_ZMM_16(acc1, m11, s11, b, scv1, av);
-                    LUT_ACCUM_ZMM_16(acc2, m21, s21, b, scv2, av);
-                    LUT_ACCUM_ZMM_16(acc3, m31, s31, b, scv3, av);
-                    LUT_ACCUM_ZMM_16(acc4, m41, s41, b, scv4, av);
-                    LUT_ACCUM_ZMM_16(acc5, m51, s51, b, scv5, av);
-                    LUT_ACCUM_ZMM_16(acc6, m61, s61, b, scv6, av);
-                    LUT_ACCUM_ZMM_16(acc7, m71, s71, b, scv7, av);
+                for (int bi = 0; bi < 4; bi++) {
+                    __m512 av = _mm512_load_ps(ap + 64 + bi * 16);
+                    LUT_ACCUM_ZMM_COMB(acc0, c01[bi], scv0, av);
+                    LUT_ACCUM_ZMM_COMB(acc1, c11[bi], scv1, av);
+                    LUT_ACCUM_ZMM_COMB(acc2, c21[bi], scv2, av);
+                    LUT_ACCUM_ZMM_COMB(acc3, c31[bi], scv3, av);
+                    LUT_ACCUM_ZMM_COMB(acc4, c41[bi], scv4, av);
+                    LUT_ACCUM_ZMM_COMB(acc5, c51[bi], scv5, av);
+                    LUT_ACCUM_ZMM_COMB(acc6, c61[bi], scv6, av);
+                    LUT_ACCUM_ZMM_COMB(acc7, c71[bi], scv7, av);
                 }
             }
             C[i*N_full + r0]=hsum_zmm(acc0); C[i*N_full + r1]=hsum_zmm(acc1);
@@ -498,14 +669,16 @@ void matmul_g128_selected(float *A, G128Matrix *B_T, float *C, int M, int K, int
             int rb = r * nkb;
             for (int bk = 0; bk < nkb; bk++) {
                 int bidx = rb + bk;
-                uint64_t mag0=B_T->magnitude[bidx*2+0], mag1=B_T->magnitude[bidx*2+1];
-                uint64_t sgn0=B_T->sign[bidx*2+0],      sgn1=B_T->sign[bidx*2+1];
+                uint64_t pk0 = B_T->packed[bidx*4+0], pk1 = B_T->packed[bidx*4+1];
+                uint64_t pk2 = B_T->packed[bidx*4+2], pk3 = B_T->packed[bidx*4+3];
+                uint32_t c_lo[4] = {(uint32_t)pk0, (uint32_t)(pk0>>32), (uint32_t)pk1, (uint32_t)(pk1>>32)};
+                uint32_t c_hi[4] = {(uint32_t)pk2, (uint32_t)(pk2>>32), (uint32_t)pk3, (uint32_t)(pk3>>32)};
                 __m512 scv = _mm512_set1_ps(sf[bidx]);
                 const float *ap = &A[i * K + bk * G128_BLOCK_SIZE];
-                for (int b = 0; b < 64; b += 16)
-                    LUT_ACCUM_ZMM_16(acc, mag0, sgn0, b, scv, _mm512_load_ps(ap + b));
-                for (int b = 0; b < 64; b += 16)
-                    LUT_ACCUM_ZMM_16(acc, mag1, sgn1, b, scv, _mm512_load_ps(ap + 64 + b));
+                for (int bi = 0; bi < 4; bi++)
+                    LUT_ACCUM_ZMM_COMB(acc, c_lo[bi], scv, _mm512_load_ps(ap + bi * 16));
+                for (int bi = 0; bi < 4; bi++)
+                    LUT_ACCUM_ZMM_COMB(acc, c_hi[bi], scv, _mm512_load_ps(ap + 64 + bi * 16));
             }
             C[i*N_full + r] = hsum_zmm(acc);
         }

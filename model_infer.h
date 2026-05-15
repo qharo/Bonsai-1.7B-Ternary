@@ -76,3 +76,4 @@ int model_omp_max_threads(void);
 long model_debug_offset_loaded(void);
 long model_debug_offset_kv_len(void);
 void model_set_omp_threads(int n);
+int model_affinity_cpu_count(void);
