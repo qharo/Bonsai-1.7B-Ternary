@@ -208,9 +208,6 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
 #include <immintrin.h>
 
 
-// Hoisted broadcast of constant 1 for VPSLLD{z} sign-bit generation
-static const __m512i _o1 = _mm512_set1_epi32(1);
-
 // Zero mag=0 via VMOVAPS(zero-mask, port 0/5), sign bits via VPSLLD(zero-mask, port 0)
 // KMOVD+KSHIFTR approach: 1 port-5 uop instead of 2 (combine mag+sgn into 32-bit, split with KSHIFTR on port 0)
 #define LUT_ACCUM_ZMM_16(acc, mw, sw, b, sc, av) do { \
@@ -244,6 +241,7 @@ static inline float hsum_zmm(__m512 v) {
 }
 
 void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) {
+    __m512i _o1 = _mm512_set1_epi32(1);
     int nkb = (int)B_T->num_blocks_col;
     const float *sf = B_T->scales_f32;
     int n8 = (N / 8) * 8;
@@ -463,6 +461,7 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
 }
 
 void lm_head_prefilter(float *A, G128Matrix *B_T, float *C, int N, int max_blocks) {
+    __m512i _o1 = _mm512_set1_epi32(1);
     int nkb = (int)B_T->num_blocks_col;
     if (max_blocks <= 0 || max_blocks > nkb) max_blocks = nkb;
     const float *sf = B_T->scales_f32;
@@ -573,6 +572,7 @@ void lm_head_prefilter(float *A, G128Matrix *B_T, float *C, int N, int max_block
 }
 
 void matmul_g128_selected(float *A, G128Matrix *B_T, float *C, int M, int K, int N_full, int N_sel, const int *sel_rows) {
+    __m512i _o1 = _mm512_set1_epi32(1);
     int nkb = (int)B_T->num_blocks_col;
     const float *sf = B_T->scales_f32;
     for (int i = 0; i < M; i++) {

@@ -16,6 +16,7 @@
 #else
 #include <time.h>
 #endif
+#include <sched.h>
 
 // 64-byte aligned calloc for AVX-512 (safe on all POSIX platforms)
 static inline void *aligned_calloc(size_t alignment, size_t size) {
