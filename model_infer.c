@@ -524,6 +524,9 @@ long model_debug_offset_kv_len(void) {
 
 void model_set_omp_threads(int n) {
 #ifdef _OPENMP
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d", n);
+    setenv("OMP_NUM_THREADS", buf, 1);
     omp_set_num_threads(n);
 #else
     (void)n;
