@@ -208,26 +208,28 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
 #include <immintrin.h>
 
 
-// Zero mag=0 via VMOVAPS(zero-mask, port 0/5), sign bits via VPSLLD(zero-mask, port 0)
-// KMOVD+KSHIFTR approach: 1 port-5 uop instead of 2 (combine mag+sgn into 32-bit, split with KSHIFTR on port 0)
+// 5-uop ternary accumulate: kmovd + maskz_mov + kshiftri + mask_xor_ps + fmadd.
+// Uses mask_xor_ps to flip sign bits where sign=1 (port 0/5 once) instead of
+// maskz_slli_epi32 (port 0) + xorps (port 0/5) — saves 1 uop, reduces port-0 pressure.
+// _sign_bit must be in scope as: const __m512 _sign_bit = _mm512_set1_ps(-0.0f);
 #define LUT_ACCUM_ZMM_16(acc, mw, sw, b, sc, av) do { \
     uint32_t _m16 = (uint32_t)((uint64_t)(mw) >> (b)); \
     uint32_t _s16 = (uint32_t)((uint64_t)(sw) >> (b)); \
     uint32_t _comb = _m16 | (_s16 << 16); \
     __mmask32 _ck = _cvtu32_mask32(_comb); \
     __m512 _magged = _mm512_maskz_mov_ps((__mmask16)_ck, (av)); \
-    __m512 _signed = _mm512_xor_ps(_magged, _mm512_castsi512_ps( \
-        _mm512_maskz_slli_epi32((__mmask16)_kshiftri_mask32(_ck, 16), _o1, 31))); \
-    (acc) = _mm512_fmadd_ps(_signed, (sc), (acc)); \
+    (acc) = _mm512_fmadd_ps( \
+        _mm512_mask_xor_ps(_magged, (__mmask16)_kshiftri_mask32(_ck, 16), _magged, _sign_bit), \
+        (sc), (acc)); \
 } while(0)
 
 // Packed-layout variant: takes pre-combined 32-bit (sgn[15:0]<<16 | mag[15:0])
 #define LUT_ACCUM_ZMM_COMB(acc, comb, sc, av) do { \
     __mmask32 _ck = _cvtu32_mask32(comb); \
     __m512 _magged = _mm512_maskz_mov_ps((__mmask16)_ck, (av)); \
-    __m512 _signed = _mm512_xor_ps(_magged, _mm512_castsi512_ps( \
-        _mm512_maskz_slli_epi32((__mmask16)_kshiftri_mask32(_ck, 16), _o1, 31))); \
-    (acc) = _mm512_fmadd_ps(_signed, (sc), (acc)); \
+    (acc) = _mm512_fmadd_ps( \
+        _mm512_mask_xor_ps(_magged, (__mmask16)_kshiftri_mask32(_ck, 16), _magged, _sign_bit), \
+        (sc), (acc)); \
 } while(0)
 
 static inline float hsum_zmm(__m512 v) {
@@ -241,7 +243,7 @@ static inline float hsum_zmm(__m512 v) {
 }
 
 void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) {
-    __m512i _o1 = _mm512_set1_epi32(1);
+    const __m512 _sign_bit = _mm512_set1_ps(-0.0f);
     int nkb = (int)B_T->num_blocks_col;
     const float *sf = B_T->scales_f32;
     int n8 = (N / 8) * 8;
@@ -305,13 +307,9 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
                 __m512 scv6=_mm512_set1_ps(sc6), scv7=_mm512_set1_ps(sc7);
                 const float *ap = &A[i * K + bk * G128_BLOCK_SIZE];
                 if (bk + 1 < nkb) {
-                    int pfb = j * nkb + bk + 1;
-                    _mm_prefetch((const char*)&B_T->packed[pfb * 4], _MM_HINT_T0);
-                    _mm_prefetch((const char*)&sf[pfb], _MM_HINT_T0);
                     _mm_prefetch(&A[i * K + (bk + 1) * 128], _MM_HINT_T0);
-                    for (int ri = 2; ri < 8; ri += 2) {
-                        int pfb_ri = (j + ri) * nkb + bk + 1;
-                        _mm_prefetch((const char*)&B_T->packed[pfb_ri * 4], _MM_HINT_T0);
+                    for (int ri = 0; ri < 8; ri++) {
+                        _mm_prefetch((const char*)&B_T->packed[((j + ri) * nkb + bk + 1) * 4], _MM_HINT_T0);
                     }
                 }
                 for (int bi = 0; bi < 4; bi++) {
@@ -399,13 +397,9 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
                     __m512 scv6=_mm512_set1_ps(sc6), scv7=_mm512_set1_ps(sc7);
                     const float *ap = &A[i * K + bk * G128_BLOCK_SIZE];
                     if (bk + 1 < nkb) {
-                        int pfb = j * nkb + bk + 1;
-                        _mm_prefetch((const char*)&B_T->packed[pfb * 4], _MM_HINT_T0);
-                        _mm_prefetch((const char*)&sf[pfb], _MM_HINT_T0);
                         _mm_prefetch(&A[i * K + (bk + 1) * 128], _MM_HINT_T0);
-                        for (int ri = 2; ri < 8; ri += 2) {
-                            int pfb_ri = (j + ri) * nkb + bk + 1;
-                            _mm_prefetch((const char*)&B_T->packed[pfb_ri * 4], _MM_HINT_T0);
+                        for (int ri = 0; ri < 8; ri++) {
+                            _mm_prefetch((const char*)&B_T->packed[((j + ri) * nkb + bk + 1) * 4], _MM_HINT_T0);
                         }
                     }
                     for (int bi = 0; bi < 4; bi++) {
@@ -461,7 +455,7 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
 }
 
 void lm_head_prefilter(float *A, G128Matrix *B_T, float *C, int N, int max_blocks) {
-    __m512i _o1 = _mm512_set1_epi32(1);
+    const __m512 _sign_bit = _mm512_set1_ps(-0.0f);
     int nkb = (int)B_T->num_blocks_col;
     if (max_blocks <= 0 || max_blocks > nkb) max_blocks = nkb;
     const float *sf = B_T->scales_f32;
@@ -572,7 +566,7 @@ void lm_head_prefilter(float *A, G128Matrix *B_T, float *C, int N, int max_block
 }
 
 void matmul_g128_selected(float *A, G128Matrix *B_T, float *C, int M, int K, int N_full, int N_sel, const int *sel_rows) {
-    __m512i _o1 = _mm512_set1_epi32(1);
+    const __m512 _sign_bit = _mm512_set1_ps(-0.0f);
     int nkb = (int)B_T->num_blocks_col;
     const float *sf = B_T->scales_f32;
     for (int i = 0; i < M; i++) {
