@@ -124,20 +124,49 @@ def load_library():
     ModelState = ModelStateStruct
     ProfileStats = ProfileStatsStruct
 
+def _detect_container_cpus():
+    # cgroup v2: /sys/fs/cgroup/cpu.max  →  "quota period" or "max period"
+    try:
+        with open('/sys/fs/cgroup/cpu.max') as f:
+            quota_str, period_str = f.read().strip().split()
+            if quota_str != 'max':
+                return max(1, round(int(quota_str) / int(period_str)))
+    except Exception:
+        pass
+    # cgroup v1
+    try:
+        with open('/sys/fs/cgroup/cpu/cpu.cfs_quota_us') as fq, \
+             open('/sys/fs/cgroup/cpu/cpu.cfs_period_us') as fp:
+            quota, period = int(fq.read()), int(fp.read())
+            if quota > 0:
+                return max(1, round(quota / period))
+    except Exception:
+        pass
+    # Fallback: sched_getaffinity (may be inflated inside containers)
+    try:
+        return len(os.sched_getaffinity(0))
+    except Exception:
+        return os.cpu_count() or 2
+
+
 def init_model():
     global _model, _tokenizer, _lib, _tts, ModelState, ProfileStats
-    
+
     if _model is not None:
         return
 
-    n_cpus = len(os.sched_getaffinity(0))
-    if n_cpus <= 0:
-        n_cpus = os.cpu_count() or 2
+    # Detect the real allocated CPU count before the OMP pool is created.
+    # os.sched_getaffinity() can return the host CPU count on cgroup-limited pods;
+    # cgroup quota is the authoritative number that matches actual scheduling capacity.
+    n_cpus = _detect_container_cpus()
     os.environ['OMP_NUM_THREADS'] = str(n_cpus)
     os.environ['OMP_THREAD_LIMIT'] = str(n_cpus)
     os.environ['OMP_DYNAMIC'] = 'FALSE'
-    os.environ['OMP_PROC_BIND'] = 'true'
+    os.environ['OMP_PROC_BIND'] = 'close'
     os.environ['OMP_PLACES'] = 'cores'
+    # passive: idle OMP threads sleep instead of spinning, so they don't consume
+    # the CPU quota allocated to the working threads.
+    os.environ['OMP_WAIT_POLICY'] = 'passive'
 
     load_library()
 
@@ -158,6 +187,17 @@ def init_model():
     _lib.model_omp_max_threads.restype = ctypes.c_int
     _lib.model_set_omp_threads.argtypes = [ctypes.c_int]
     _lib.model_set_omp_threads.restype = None
+    _lib.model_affinity_cpu_count.argtypes = []
+    _lib.model_affinity_cpu_count.restype = ctypes.c_int
+
+    # Double-check: C sched_getaffinity may see a different (tighter) affinity than
+    # Python/cgroup. Use whichever gives the smaller count so we never over-subscribe.
+    c_affinity = _lib.model_affinity_cpu_count()
+    if c_affinity > 0 and c_affinity < n_cpus:
+        n_cpus = c_affinity
+        os.environ['OMP_NUM_THREADS'] = str(n_cpus)
+        os.environ['OMP_THREAD_LIMIT'] = str(n_cpus)
+
     _lib.model_set_omp_threads(ctypes.c_int(n_cpus))
 
     try:

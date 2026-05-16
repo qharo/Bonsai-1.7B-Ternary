@@ -31,7 +31,7 @@ EXPOSE 7860
 
 ENV MODEL_DIR=/app/models/Ternary-Bonsai-1.7B-unpacked
 ENV OMP_SCHEDULE=static
-ENV OMP_WAIT_POLICY=active
+ENV OMP_WAIT_POLICY=passive
 ENV OMP_PROC_BIND=close
 
 CMD ["python", "app.py"]
