@@ -130,15 +130,17 @@ def init_model():
     if _model is not None:
         return
 
-    n_cpus = os.cpu_count() or 16
+    load_library()
+
+    n_cpus = _lib.model_affinity_cpu_count()
+    if n_cpus <= 0:
+        n_cpus = os.cpu_count() or 2
     os.environ['OMP_NUM_THREADS'] = str(n_cpus)
     os.environ['OMP_THREAD_LIMIT'] = str(n_cpus)
     os.environ['OMP_DYNAMIC'] = 'FALSE'
     os.environ['OMP_PROC_BIND'] = 'true'
     os.environ['OMP_PLACES'] = 'cores'
-    
-    load_library()
-    
+
     _lib.model_load.argtypes = [ctypes.POINTER(ModelState), ctypes.c_char_p]
     _lib.model_load.restype = ctypes.c_int
     _lib.model_free.argtypes = [ctypes.POINTER(ModelState)]
@@ -156,7 +158,7 @@ def init_model():
     _lib.model_omp_max_threads.restype = ctypes.c_int
     _lib.model_set_omp_threads.argtypes = [ctypes.c_int]
     _lib.model_set_omp_threads.restype = None
-    _lib.model_set_omp_threads(ctypes.c_int(os.cpu_count() or 16))
+    _lib.model_set_omp_threads(ctypes.c_int(n_cpus))
 
     try:
         _lib.model_struct_size.argtypes = []
