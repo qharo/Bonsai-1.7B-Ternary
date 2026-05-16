@@ -34,4 +34,4 @@ ENV OMP_SCHEDULE=static
 ENV OMP_WAIT_POLICY=active
 ENV OMP_PROC_BIND=close
 
-CMD ["sh", "-c", "OMP_NUM_THREADS=$(nproc) python app.py"]
+CMD ["python", "app.py"]

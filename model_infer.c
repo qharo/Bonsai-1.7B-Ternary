@@ -527,7 +527,11 @@ void model_set_omp_threads(int n) {
     char buf[16];
     snprintf(buf, sizeof(buf), "%d", n);
     setenv("OMP_NUM_THREADS", buf, 1);
-    omp_set_num_threads(n);
+    for (int attempt = 0; attempt < 3; attempt++) {
+        omp_set_num_threads(n);
+        if (omp_get_max_threads() == n) break;
+        fprintf(stderr, "[OMP] attempt %d: set(%d) but max=%d\n", attempt, n, omp_get_max_threads());
+    }
 #else
     (void)n;
 #endif
