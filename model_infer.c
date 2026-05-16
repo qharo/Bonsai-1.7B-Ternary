@@ -105,7 +105,7 @@ static int load_g128(G128Matrix *m, const char *base) {
     for (uint64_t bi = 0; bi < nb; bi++) {
         uint64_t m0 = m->magnitude[bi*2+0], m1 = m->magnitude[bi*2+1];
         uint64_t s0 = m->sign[bi*2+0],      s1 = m->sign[bi*2+1];
-#define PK16(m16, s16) ((uint32_t)(s16) << 16 | (uint32_t)(m16))
+#define PK16(m16, s16) ((((uint32_t)(s16) & 0xFFFF) << 16) | ((uint32_t)(m16) & 0xFFFF))
         m->packed[bi*4+0] = (uint64_t)PK16(m0>>16, s0>>16) << 32 | PK16(m0, s0);
         m->packed[bi*4+1] = (uint64_t)PK16(m0>>48, s0>>48) << 32 | PK16(m0>>32, s0>>32);
         m->packed[bi*4+2] = (uint64_t)PK16(m1>>16, s1>>16) << 32 | PK16(m1, s1);
