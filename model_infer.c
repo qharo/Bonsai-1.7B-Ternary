@@ -512,6 +512,9 @@ int model_omp_max_threads(void) {
 
 // Debug: return offset of `loaded` field within ModelState
 #include <stddef.h>
+long model_struct_size(void) {
+    return (long)sizeof(ModelState);
+}
 long model_debug_offset_loaded(void) {
     return (long)offsetof(ModelState, loaded);
 }

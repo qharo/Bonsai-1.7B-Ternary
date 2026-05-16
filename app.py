@@ -158,6 +158,17 @@ def init_model():
     _lib.model_set_omp_threads.restype = None
     _lib.model_set_omp_threads(ctypes.c_int(os.cpu_count() or 16))
 
+    try:
+        _lib.model_struct_size.argtypes = []
+        _lib.model_struct_size.restype = ctypes.c_long
+        c_size = _lib.model_struct_size()
+        py_size = ctypes.sizeof(ModelState)
+        if c_size != py_size:
+            print(f"[WARN] ModelState struct size mismatch: C says {c_size}, Python says {py_size}")
+            print("[WARN] inference.so and app.py are out of sync — expect incorrect output")
+    except AttributeError:
+        pass
+
     t0 = time.perf_counter()
     _model = ModelState()
     ret = _lib.model_load(ctypes.byref(_model), MODEL_DIR.encode())

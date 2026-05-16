@@ -73,6 +73,7 @@ void model_reset_profile(ModelState *s);
 const char* model_matmul_path(void);
 const char* model_compile_info(void);
 int model_omp_max_threads(void);
+long model_struct_size(void);
 long model_debug_offset_loaded(void);
 long model_debug_offset_kv_len(void);
 void model_set_omp_threads(int n);
