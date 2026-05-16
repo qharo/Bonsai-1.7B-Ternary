@@ -130,9 +130,7 @@ def init_model():
     if _model is not None:
         return
 
-    load_library()
-
-    n_cpus = _lib.model_affinity_cpu_count()
+    n_cpus = len(os.sched_getaffinity(0))
     if n_cpus <= 0:
         n_cpus = os.cpu_count() or 2
     os.environ['OMP_NUM_THREADS'] = str(n_cpus)
@@ -140,6 +138,8 @@ def init_model():
     os.environ['OMP_DYNAMIC'] = 'FALSE'
     os.environ['OMP_PROC_BIND'] = 'true'
     os.environ['OMP_PLACES'] = 'cores'
+
+    load_library()
 
     _lib.model_load.argtypes = [ctypes.POINTER(ModelState), ctypes.c_char_p]
     _lib.model_load.restype = ctypes.c_int
