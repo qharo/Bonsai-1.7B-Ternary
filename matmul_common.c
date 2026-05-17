@@ -224,6 +224,8 @@ void matmul_simd_g128_tiled8_neon(float *A, G128Matrix *B_T, float *C, int M, in
     assert(N % 8 == 0 && "All production matmul shapes are N%8==0");
     #endif
     
+    if (!tiles || n_j <= 0) return;
+    
     #pragma omp parallel for schedule(static)
     for (int idx = 0; idx < total_jobs; idx++) {
         int i = idx / n_j;
@@ -252,95 +254,69 @@ void matmul_simd_g128_tiled8_neon(float *A, G128Matrix *B_T, float *C, int M, in
             const float *ap = &A[i * K + bk * G128_BLOCK_SIZE];
             const TileBlock8 *tb = &tiles[tg * nkb + bk];
             
-            for (int b = 0; b < 64; b += 4) {
-                float32x4_t av = vld1q_f32(ap + b);
-                uint64_t p0=tb->pos[0][b/4], n0=tb->neg[0][b/4];
-                uint64_t p1=tb->pos[1][b/4], n1=tb->neg[1][b/4];
-                uint64_t p2=tb->pos[2][b/4], n2=tb->neg[2][b/4];
-                uint64_t p3=tb->pos[3][b/4], n3=tb->neg[3][b/4];
-                uint64_t p4=tb->pos[4][b/4], n4=tb->neg[4][b/4];
-                uint64_t p5=tb->pos[5][b/4], n5=tb->neg[5][b/4];
-                uint64_t p6=tb->pos[6][b/4], n6=tb->neg[6][b/4];
-                uint64_t p7=tb->pos[7][b/4], n7=tb->neg[7][b/4];
+            for (int w = 0; w < 4; w++) {
+                uint64_t p0=tb->pos[0][w], n0=tb->neg[0][w];
+                uint64_t p1=tb->pos[1][w], n1=tb->neg[1][w];
+                uint64_t p2=tb->pos[2][w], n2=tb->neg[2][w];
+                uint64_t p3=tb->pos[3][w], n3=tb->neg[3][w];
+                uint64_t p4=tb->pos[4][w], n4=tb->neg[4][w];
+                uint64_t p5=tb->pos[5][w], n5=tb->neg[5][w];
+                uint64_t p6=tb->pos[6][w], n6=tb->neg[6][w];
+                uint64_t p7=tb->pos[7][w], n7=tb->neg[7][w];
                 
-                uint32x4_t pm0 = vreinterpretq_u32_u64(vdupq_n_u64(p0));
-                uint32x4_t nm0 = vreinterpretq_u32_u64(vdupq_n_u64(n0));
-                uint32x4_t pm1 = vreinterpretq_u32_u64(vdupq_n_u64(p1));
-                uint32x4_t nm1 = vreinterpretq_u32_u64(vdupq_n_u64(n1));
-                uint32x4_t pm2 = vreinterpretq_u32_u64(vdupq_n_u64(p2));
-                uint32x4_t nm2 = vreinterpretq_u32_u64(vdupq_n_u64(n2));
-                uint32x4_t pm3 = vreinterpretq_u32_u64(vdupq_n_u64(p3));
-                uint32x4_t nm3 = vreinterpretq_u32_u64(vdupq_n_u64(n3));
-                uint32x4_t pm4 = vreinterpretq_u32_u64(vdupq_n_u64(p4));
-                uint32x4_t nm4 = vreinterpretq_u32_u64(vdupq_n_u64(n4));
-                uint32x4_t pm5 = vreinterpretq_u32_u64(vdupq_n_u64(p5));
-                uint32x4_t nm5 = vreinterpretq_u32_u64(vdupq_n_u64(n5));
-                uint32x4_t pm6 = vreinterpretq_u32_u64(vdupq_n_u64(p6));
-                uint32x4_t nm6 = vreinterpretq_u32_u64(vdupq_n_u64(n6));
-                uint32x4_t pm7 = vreinterpretq_u32_u64(vdupq_n_u64(p7));
-                uint32x4_t nm7 = vreinterpretq_u32_u64(vdupq_n_u64(n7));
-                
-                acc0 = vmlaq_f32(acc0, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc0), pm0)), av);
-                acc0 = vmlaq_f32(acc0, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns0), nm0)), av);
-                acc1 = vmlaq_f32(acc1, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc1), pm1)), av);
-                acc1 = vmlaq_f32(acc1, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns1), nm1)), av);
-                acc2 = vmlaq_f32(acc2, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc2), pm2)), av);
-                acc2 = vmlaq_f32(acc2, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns2), nm2)), av);
-                acc3 = vmlaq_f32(acc3, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc3), pm3)), av);
-                acc3 = vmlaq_f32(acc3, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns3), nm3)), av);
-                acc4 = vmlaq_f32(acc4, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc4), pm4)), av);
-                acc4 = vmlaq_f32(acc4, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns4), nm4)), av);
-                acc5 = vmlaq_f32(acc5, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc5), pm5)), av);
-                acc5 = vmlaq_f32(acc5, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns5), nm5)), av);
-                acc6 = vmlaq_f32(acc6, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc6), pm6)), av);
-                acc6 = vmlaq_f32(acc6, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns6), nm6)), av);
-                acc7 = vmlaq_f32(acc7, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc7), pm7)), av);
-                acc7 = vmlaq_f32(acc7, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns7), nm7)), av);
-            }
-            for (int b = 0; b < 64; b += 4) {
-                float32x4_t av = vld1q_f32(ap + 64 + b);
-                uint64_t p0=tb->pos[0][4+b/4], n0=tb->neg[0][4+b/4];
-                uint64_t p1=tb->pos[1][4+b/4], n1=tb->neg[1][4+b/4];
-                uint64_t p2=tb->pos[2][4+b/4], n2=tb->neg[2][4+b/4];
-                uint64_t p3=tb->pos[3][4+b/4], n3=tb->neg[3][4+b/4];
-                uint64_t p4=tb->pos[4][4+b/4], n4=tb->neg[4][4+b/4];
-                uint64_t p5=tb->pos[5][4+b/4], n5=tb->neg[5][4+b/4];
-                uint64_t p6=tb->pos[6][4+b/4], n6=tb->neg[6][4+b/4];
-                uint64_t p7=tb->pos[7][4+b/4], n7=tb->neg[7][4+b/4];
-                
-                uint32x4_t pm0 = vreinterpretq_u32_u64(vdupq_n_u64(p0));
-                uint32x4_t nm0 = vreinterpretq_u32_u64(vdupq_n_u64(n0));
-                uint32x4_t pm1 = vreinterpretq_u32_u64(vdupq_n_u64(p1));
-                uint32x4_t nm1 = vreinterpretq_u32_u64(vdupq_n_u64(n1));
-                uint32x4_t pm2 = vreinterpretq_u32_u64(vdupq_n_u64(p2));
-                uint32x4_t nm2 = vreinterpretq_u32_u64(vdupq_n_u64(n2));
-                uint32x4_t pm3 = vreinterpretq_u32_u64(vdupq_n_u64(p3));
-                uint32x4_t nm3 = vreinterpretq_u32_u64(vdupq_n_u64(n3));
-                uint32x4_t pm4 = vreinterpretq_u32_u64(vdupq_n_u64(p4));
-                uint32x4_t nm4 = vreinterpretq_u32_u64(vdupq_n_u64(n4));
-                uint32x4_t pm5 = vreinterpretq_u32_u64(vdupq_n_u64(p5));
-                uint32x4_t nm5 = vreinterpretq_u32_u64(vdupq_n_u64(n5));
-                uint32x4_t pm6 = vreinterpretq_u32_u64(vdupq_n_u64(p6));
-                uint32x4_t nm6 = vreinterpretq_u32_u64(vdupq_n_u64(n6));
-                uint32x4_t pm7 = vreinterpretq_u32_u64(vdupq_n_u64(p7));
-                uint32x4_t nm7 = vreinterpretq_u32_u64(vdupq_n_u64(n7));
-                
-                acc0 = vmlaq_f32(acc0, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc0), pm0)), av);
-                acc0 = vmlaq_f32(acc0, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns0), nm0)), av);
-                acc1 = vmlaq_f32(acc1, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc1), pm1)), av);
-                acc1 = vmlaq_f32(acc1, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns1), nm1)), av);
-                acc2 = vmlaq_f32(acc2, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc2), pm2)), av);
-                acc2 = vmlaq_f32(acc2, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns2), nm2)), av);
-                acc3 = vmlaq_f32(acc3, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc3), pm3)), av);
-                acc3 = vmlaq_f32(acc3, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns3), nm3)), av);
-                acc4 = vmlaq_f32(acc4, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc4), pm4)), av);
-                acc4 = vmlaq_f32(acc4, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns4), nm4)), av);
-                acc5 = vmlaq_f32(acc5, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc5), pm5)), av);
-                acc5 = vmlaq_f32(acc5, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns5), nm5)), av);
-                acc6 = vmlaq_f32(acc6, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc6), pm6)), av);
-                acc6 = vmlaq_f32(acc6, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns6), nm6)), av);
-                acc7 = vmlaq_f32(acc7, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc7), pm7)), av);
-                acc7 = vmlaq_f32(acc7, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns7), nm7)), av);
+                for (int bit = 0; bit < 64; bit += 4) {
+                    float32x4_t av = vld1q_f32(ap + w * 32 + bit);
+                    uint32_t pm0 = (uint32_t)(p0 >> bit) & 0xF;
+                    uint32_t nm0 = (uint32_t)(n0 >> bit) & 0xF;
+                    uint32_t pm1 = (uint32_t)(p1 >> bit) & 0xF;
+                    uint32_t nm1 = (uint32_t)(n1 >> bit) & 0xF;
+                    uint32_t pm2 = (uint32_t)(p2 >> bit) & 0xF;
+                    uint32_t nm2 = (uint32_t)(n2 >> bit) & 0xF;
+                    uint32_t pm3 = (uint32_t)(p3 >> bit) & 0xF;
+                    uint32_t nm3 = (uint32_t)(n3 >> bit) & 0xF;
+                    uint32_t pm4 = (uint32_t)(p4 >> bit) & 0xF;
+                    uint32_t nm4 = (uint32_t)(n4 >> bit) & 0xF;
+                    uint32_t pm5 = (uint32_t)(p5 >> bit) & 0xF;
+                    uint32_t nm5 = (uint32_t)(n5 >> bit) & 0xF;
+                    uint32_t pm6 = (uint32_t)(p6 >> bit) & 0xF;
+                    uint32_t nm6 = (uint32_t)(n6 >> bit) & 0xF;
+                    uint32_t pm7 = (uint32_t)(p7 >> bit) & 0xF;
+                    uint32_t nm7 = (uint32_t)(n7 >> bit) & 0xF;
+                    
+                    uint32x4_t mask_p0 = vld1q_u32(mag_lut[pm0]);
+                    uint32x4_t mask_n0 = vld1q_u32(mag_lut[nm0]);
+                    uint32x4_t mask_p1 = vld1q_u32(mag_lut[pm1]);
+                    uint32x4_t mask_n1 = vld1q_u32(mag_lut[nm1]);
+                    uint32x4_t mask_p2 = vld1q_u32(mag_lut[pm2]);
+                    uint32x4_t mask_n2 = vld1q_u32(mag_lut[nm2]);
+                    uint32x4_t mask_p3 = vld1q_u32(mag_lut[pm3]);
+                    uint32x4_t mask_n3 = vld1q_u32(mag_lut[nm3]);
+                    uint32x4_t mask_p4 = vld1q_u32(mag_lut[pm4]);
+                    uint32x4_t mask_n4 = vld1q_u32(mag_lut[nm4]);
+                    uint32x4_t mask_p5 = vld1q_u32(mag_lut[pm5]);
+                    uint32x4_t mask_n5 = vld1q_u32(mag_lut[nm5]);
+                    uint32x4_t mask_p6 = vld1q_u32(mag_lut[pm6]);
+                    uint32x4_t mask_n6 = vld1q_u32(mag_lut[nm6]);
+                    uint32x4_t mask_p7 = vld1q_u32(mag_lut[pm7]);
+                    uint32x4_t mask_n7 = vld1q_u32(mag_lut[nm7]);
+                    
+                    acc0 = vmlaq_f32(acc0, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc0), mask_p0)), av);
+                    acc0 = vmlaq_f32(acc0, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns0), mask_n0)), av);
+                    acc1 = vmlaq_f32(acc1, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc1), mask_p1)), av);
+                    acc1 = vmlaq_f32(acc1, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns1), mask_n1)), av);
+                    acc2 = vmlaq_f32(acc2, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc2), mask_p2)), av);
+                    acc2 = vmlaq_f32(acc2, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns2), mask_n2)), av);
+                    acc3 = vmlaq_f32(acc3, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc3), mask_p3)), av);
+                    acc3 = vmlaq_f32(acc3, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns3), mask_n3)), av);
+                    acc4 = vmlaq_f32(acc4, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc4), mask_p4)), av);
+                    acc4 = vmlaq_f32(acc4, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns4), mask_n4)), av);
+                    acc5 = vmlaq_f32(acc5, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc5), mask_p5)), av);
+                    acc5 = vmlaq_f32(acc5, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns5), mask_n5)), av);
+                    acc6 = vmlaq_f32(acc6, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc6), mask_p6)), av);
+                    acc6 = vmlaq_f32(acc6, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns6), mask_n6)), av);
+                    acc7 = vmlaq_f32(acc7, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc7), mask_p7)), av);
+                    acc7 = vmlaq_f32(acc7, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns7), mask_n7)), av);
+                }
             }
         }
         C[i*N+j+0] = vaddvq_f32(acc0); C[i*N+j+1] = vaddvq_f32(acc1);
@@ -495,6 +471,8 @@ void matmul_simd_g128_tiled8(float *A, G128Matrix *B_T, float *C, int M, int K, 
     #ifdef DEBUG
     assert(N % 8 == 0 && "All production matmul shapes are N%8==0");
     #endif
+    
+    if (!tiles || n_j <= 0) return;
     
     #pragma omp parallel for schedule(static)
     for (int idx = 0; idx < total_jobs; idx++) {
@@ -1001,6 +979,8 @@ void matmul_simd_g128_tiled8_avx2(float *A, G128Matrix *B_T, float *C, int M, in
     #ifdef DEBUG
     assert(N % 8 == 0 && "All production matmul shapes are N%8==0");
     #endif
+    
+    if (!tiles || n_j <= 0) return;
     
     #pragma omp parallel for schedule(static)
     for (int idx = 0; idx < total_jobs; idx++) {

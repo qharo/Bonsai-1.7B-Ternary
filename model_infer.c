@@ -134,6 +134,7 @@ static int load_g128(G128Matrix *m, const char *base) {
                 TileBlock8 *tb = &m->tiles8[tg * m->num_blocks_col + bk];
                 for (int r = 0; r < 8; r++) {
                     uint64_t row = tg * 8 + r;
+                    if (row >= m->num_rows) break;
                     uint64_t bi = row * m->num_blocks_col + bk;
                     for (int w = 0; w < 4; w++) {
                         tb->pos[r][w] = m->packed_pos[bi*4 + w];
