@@ -9,6 +9,10 @@ import asyncio
 import concurrent.futures
 import numpy as np
 from contextlib import asynccontextmanager
+
+# Suppress transformers PyTorch advisory warnings (tokenizer works without PyTorch)
+os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = '1'
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
