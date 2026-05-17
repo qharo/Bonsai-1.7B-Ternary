@@ -52,7 +52,8 @@ def load_library():
             ("num_blocks_col", ctypes.c_uint32),
             ("magnitude", ctypes.c_void_p),
             ("sign", ctypes.c_void_p),
-            ("packed", ctypes.c_void_p),
+            ("packed_pos", ctypes.c_void_p),
+            ("packed_neg", ctypes.c_void_p),
             ("scales", ctypes.c_void_p),
             ("scales_f32", ctypes.c_void_p),
         ]
