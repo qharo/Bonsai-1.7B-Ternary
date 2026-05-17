@@ -1,12 +1,26 @@
 CC = clang
-CFLAGS = -O3 -std=c11 -Wall -Wextra -fPIC -march=native -ffast-math
+CFLAGS_BASE = -O3 -std=c11 -Wall -fPIC -march=native -ffast-math
 FRAMEWORKS = -framework Accelerate
 
-# Add OpenMP on Linux only
+# Detect if compiler supports OpenMP
+OPENMP_FLAG =
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Linux)
-    CFLAGS += -fopenmp
+    # Try clang with OpenMP first, fall back to gcc if needed
+    OPENMP_TEST := $(shell $(CC) -fopenmp -E - < /dev/null 2>/dev/null && echo yes)
+    ifeq ($(OPENMP_TEST),yes)
+        OPENMP_FLAG = -fopenmp
+    else
+        # Try gcc
+        GCC_EXISTS := $(shell which gcc 2>/dev/null)
+        ifneq ($(GCC_EXISTS),)
+            CC = gcc
+            OPENMP_FLAG = -fopenmp
+        endif
+    endif
 endif
+
+CFLAGS = $(CFLAGS_BASE) $(OPENMP_FLAG)
 
 MATMUL_FILES = matmul_naive.c matmul_bitnet.c matmul_simd.c matmul_swar.c matmul_lut.c
 

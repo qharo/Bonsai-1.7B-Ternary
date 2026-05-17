@@ -374,6 +374,60 @@ void matmul_simd_g128_tiled8_neon(float *A, G128Matrix *B_T, float *C, int M, in
 
 #include <immintrin.h>
 
+// Pre-separated pos/neg bitmap matmul: no runtime mask computation.
+// packed_pos holds mask_bits(weight==+scale), packed_neg holds mask_bits(weight==-scale).
+// pos and neg values are pre-packed as 32-bit chunks (lower 16 bits = first 16-elem group,
+// upper 16 bits = second 16-elem group), same layout as old 'packed'.
+#define LUT_ACCUM_POS(acc, mask_val, sc, av) \
+    (acc) = _mm512_mask3_fmadd_ps((av), (sc), (acc), (__mmask16)(uint32_t)(mask_val))
+#define LUT_ACCUM_NEG(acc, mask_val, sc, av) \
+    (acc) = _mm512_mask3_fnmadd_ps((av), (sc), (acc), (__mmask16)(uint32_t)(mask_val))
+
+// Process positive-weight bitmaps for 8 output rows, one packed word at a time.
+// Each word covers 32 elements (two 16-elem groups). Loads 8 uint64 values
+// then processes lower/upper halves with shared activation loads.
+#define PROCESS_WORD_POS(pword, ap_off) do { \
+    uint64_t _p0=pos[b0*4+(pword)],_p1=pos[b1*4+(pword)]; \
+    uint64_t _p2=pos[b2*4+(pword)],_p3=pos[b3*4+(pword)]; \
+    uint64_t _p4=pos[b4*4+(pword)],_p5=pos[b5*4+(pword)]; \
+    uint64_t _p6=pos[b6*4+(pword)],_p7=pos[b7*4+(pword)]; \
+    __m512 _av = _mm512_load_ps(ap + (ap_off)); \
+    LUT_ACCUM_POS(acc0,_p0,scv0,_av); LUT_ACCUM_POS(acc1,_p1,scv1,_av); \
+    LUT_ACCUM_POS(acc2,_p2,scv2,_av); LUT_ACCUM_POS(acc3,_p3,scv3,_av); \
+    LUT_ACCUM_POS(acc4,_p4,scv4,_av); LUT_ACCUM_POS(acc5,_p5,scv5,_av); \
+    LUT_ACCUM_POS(acc6,_p6,scv6,_av); LUT_ACCUM_POS(acc7,_p7,scv7,_av); \
+    _av = _mm512_load_ps(ap + (ap_off) + 16); \
+    LUT_ACCUM_POS(acc0,(uint32_t)(_p0>>32),scv0,_av); \
+    LUT_ACCUM_POS(acc1,(uint32_t)(_p1>>32),scv1,_av); \
+    LUT_ACCUM_POS(acc2,(uint32_t)(_p2>>32),scv2,_av); \
+    LUT_ACCUM_POS(acc3,(uint32_t)(_p3>>32),scv3,_av); \
+    LUT_ACCUM_POS(acc4,(uint32_t)(_p4>>32),scv4,_av); \
+    LUT_ACCUM_POS(acc5,(uint32_t)(_p5>>32),scv5,_av); \
+    LUT_ACCUM_POS(acc6,(uint32_t)(_p6>>32),scv6,_av); \
+    LUT_ACCUM_POS(acc7,(uint32_t)(_p7>>32),scv7,_av); \
+} while(0)
+
+#define PROCESS_WORD_NEG(pword, ap_off) do { \
+    uint64_t _n0=neg[b0*4+(pword)],_n1=neg[b1*4+(pword)]; \
+    uint64_t _n2=neg[b2*4+(pword)],_n3=neg[b3*4+(pword)]; \
+    uint64_t _n4=neg[b4*4+(pword)],_n5=neg[b5*4+(pword)]; \
+    uint64_t _n6=neg[b6*4+(pword)],_n7=neg[b7*4+(pword)]; \
+    __m512 _av = _mm512_load_ps(ap + (ap_off)); \
+    LUT_ACCUM_NEG(acc0,_n0,scv0,_av); LUT_ACCUM_NEG(acc1,_n1,scv1,_av); \
+    LUT_ACCUM_NEG(acc2,_n2,scv2,_av); LUT_ACCUM_NEG(acc3,_n3,scv3,_av); \
+    LUT_ACCUM_NEG(acc4,_n4,scv4,_av); LUT_ACCUM_NEG(acc5,_n5,scv5,_av); \
+    LUT_ACCUM_NEG(acc6,_n6,scv6,_av); LUT_ACCUM_NEG(acc7,_n7,scv7,_av); \
+    _av = _mm512_load_ps(ap + (ap_off) + 16); \
+    LUT_ACCUM_NEG(acc0,(uint32_t)(_n0>>32),scv0,_av); \
+    LUT_ACCUM_NEG(acc1,(uint32_t)(_n1>>32),scv1,_av); \
+    LUT_ACCUM_NEG(acc2,(uint32_t)(_n2>>32),scv2,_av); \
+    LUT_ACCUM_NEG(acc3,(uint32_t)(_n3>>32),scv3,_av); \
+    LUT_ACCUM_NEG(acc4,(uint32_t)(_n4>>32),scv4,_av); \
+    LUT_ACCUM_NEG(acc5,(uint32_t)(_n5>>32),scv5,_av); \
+    LUT_ACCUM_NEG(acc6,(uint32_t)(_n6>>32),scv6,_av); \
+    LUT_ACCUM_NEG(acc7,(uint32_t)(_n7>>32),scv7,_av); \
+} while(0)
+
 #define PROCESS_WORD_FUSED8(pword, ap_off) do { \
     const TileBlock8 *tb = &tiles[tg * nkb + bk]; \
     uint64_t _p0=tb->pos[0][pword], _p1=tb->pos[1][pword]; \
