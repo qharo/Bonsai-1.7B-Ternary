@@ -60,6 +60,9 @@ def load_library():
             ("packed_neg", ctypes.c_void_p),
             ("scales", ctypes.c_void_p),
             ("scales_f32", ctypes.c_void_p),
+            ("tiles8", ctypes.c_void_p),
+            ("num_tile_groups8", ctypes.c_uint64),
+            ("total_tiles8", ctypes.c_uint32),
         ]
     
     class FP32MatrixStruct(ctypes.Structure):
