@@ -459,6 +459,7 @@ static inline float hsum_zmm(__m512 v) {
 
 void matmul_simd_g128_tiled8(float *A, G128Matrix *B_T, float *C, int M, int K, int N) {
     int nkb = (int)B_T->num_blocks_col;
+    const float *sf = B_T->scales_f32;
     const TileBlock8 *tiles = B_T->tiles8;
     int n8 = (N / 8) * 8;
     int n_j = n8 / 8;
@@ -748,12 +749,12 @@ void lm_head_prefilter(float *A, G128Matrix *B_T, float *C, int N, int max_block
             for (int bi = 0; bi < 4; bi++) {
                 __m512 av = _mm512_load_ps(ap + bi * 16);
                 LUT_ACCUM_POS(acc, cp_lo[bi], scv, av);
-                LUT_ACCUM_NEG(acc, cn_lo[bi], av);
+                LUT_ACCUM_NEG(acc, cn_lo[bi], scv, av);
             }
             for (int bi = 0; bi < 4; bi++) {
                 __m512 av = _mm512_load_ps(ap + 64 + bi * 16);
                 LUT_ACCUM_POS(acc, cp_hi[bi], scv, av);
-                LUT_ACCUM_NEG(acc, cn_hi[bi], av);
+                LUT_ACCUM_NEG(acc, cn_hi[bi], scv, av);
             }
         }
         C[j] = hsum_zmm(acc);

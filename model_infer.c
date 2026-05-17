@@ -197,6 +197,8 @@ static void rms_norm_head(float *x, float *w, int nh, int hd) {
 }
 
 #ifdef __AVX512F__
+#include <immintrin.h>
+
 static inline __m512 exp_approx512(__m512 x) {
     __m512 one = _mm512_set1_ps(1.0f);
     __m512 a = _mm512_fmadd_ps(x, _mm512_set1_ps(1.0f/256.0f), one);
