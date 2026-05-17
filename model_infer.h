@@ -12,7 +12,8 @@
 #define NUM_LAYERS 28
 #define VOCAB_SIZE 151669
 #define MAX_SEQ_LEN 512
-#define LM_HEAD_CANDIDATES 4096
+#define LM_HEAD_CANDIDATES 16384
+#define LM_HEAD_PREFILTER_BLOCKS 2
 
 typedef enum {
     MATMUL_Q_PROJ    = 0,
@@ -57,6 +58,8 @@ typedef struct {
     int lm_head_candidates[LM_HEAD_CANDIDATES];
     float kv_k[NUM_LAYERS][NUM_KV_HEADS][MAX_SEQ_LEN][HEAD_DIM];
     float kv_v[NUM_LAYERS][NUM_KV_HEADS][MAX_SEQ_LEN][HEAD_DIM];
+    float rope_cos[MAX_SEQ_LEN][HEAD_DIM/2];
+    float rope_sin[MAX_SEQ_LEN][HEAD_DIM/2];
     float inv_freq[HEAD_DIM/2];
     float attn_scale;
     int kv_len;

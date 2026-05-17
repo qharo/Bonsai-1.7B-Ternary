@@ -241,18 +241,16 @@ void matmul_simd_g128_tiled8_neon(float *A, G128Matrix *B_T, float *C, int M, in
         int tg = j / 8;
         
         for (int bk = 0; bk < nkb; bk++) {
-            int b0=(j+0)*nkb+bk, b1=(j+1)*nkb+bk, b2=(j+2)*nkb+bk, b3=(j+3)*nkb+bk;
-            int b4=(j+4)*nkb+bk, b5=(j+5)*nkb+bk, b6=(j+6)*nkb+bk, b7=(j+7)*nkb+bk;
-            float32x4_t sc0=vdupq_n_f32(sf[b0]), sc1=vdupq_n_f32(sf[b1]);
-            float32x4_t sc2=vdupq_n_f32(sf[b2]), sc3=vdupq_n_f32(sf[b3]);
-            float32x4_t sc4=vdupq_n_f32(sf[b4]), sc5=vdupq_n_f32(sf[b5]);
-            float32x4_t sc6=vdupq_n_f32(sf[b6]), sc7=vdupq_n_f32(sf[b7]);
+            const TileBlock8 *tb = &tiles[tg * nkb + bk];
+            float32x4_t sc0=vdupq_n_f32(tb->scales[0]), sc1=vdupq_n_f32(tb->scales[1]);
+            float32x4_t sc2=vdupq_n_f32(tb->scales[2]), sc3=vdupq_n_f32(tb->scales[3]);
+            float32x4_t sc4=vdupq_n_f32(tb->scales[4]), sc5=vdupq_n_f32(tb->scales[5]);
+            float32x4_t sc6=vdupq_n_f32(tb->scales[6]), sc7=vdupq_n_f32(tb->scales[7]);
             float32x4_t ns0=vnegq_f32(sc0), ns1=vnegq_f32(sc1);
             float32x4_t ns2=vnegq_f32(sc2), ns3=vnegq_f32(sc3);
             float32x4_t ns4=vnegq_f32(sc4), ns5=vnegq_f32(sc5);
             float32x4_t ns6=vnegq_f32(sc6), ns7=vnegq_f32(sc7);
             const float *ap = &A[i * K + bk * G128_BLOCK_SIZE];
-            const TileBlock8 *tb = &tiles[tg * nkb + bk];
             
             for (int w = 0; w < 4; w++) {
                 uint64_t p0=tb->pos[0][w], n0=tb->neg[0][w];
@@ -404,9 +402,8 @@ void matmul_simd_g128_tiled8_neon(float *A, G128Matrix *B_T, float *C, int M, in
     LUT_ACCUM_NEG(acc7,(uint32_t)(_n7>>32),scv7,_av); \
 } while(0)
 
-#define PROCESS_WORD_FUSED8(pword, ap_off) do { \
-    const TileBlock8 *tb = &tiles[tg * nkb + bk]; \
-    uint64_t _p0=tb->pos[0][pword], _p1=tb->pos[1][pword]; \
+#define PROCESS_WORD_FUSED8(tb, pword, ap_off) do { \
+    uint64_t _p0=(tb)->pos[0][pword], _p1=(tb)->pos[1][pword]; \
     uint64_t _p2=tb->pos[2][pword], _p3=tb->pos[3][pword]; \
     uint64_t _p4=tb->pos[4][pword], _p5=tb->pos[5][pword]; \
     uint64_t _p6=tb->pos[6][pword], _p7=tb->pos[7][pword]; \
@@ -462,7 +459,6 @@ static inline float hsum_zmm(__m512 v) {
 
 void matmul_simd_g128_tiled8(float *A, G128Matrix *B_T, float *C, int M, int K, int N) {
     int nkb = (int)B_T->num_blocks_col;
-    const float *sf = B_T->scales_f32;
     const TileBlock8 *tiles = B_T->tiles8;
     int n8 = (N / 8) * 8;
     int n_j = n8 / 8;
@@ -489,12 +485,11 @@ void matmul_simd_g128_tiled8(float *A, G128Matrix *B_T, float *C, int M, int K, 
         int tg = j / 8;
         
         for (int bk = 0; bk < nkb; bk++) {
-            int b0=(j+0)*nkb+bk, b1=(j+1)*nkb+bk, b2=(j+2)*nkb+bk, b3=(j+3)*nkb+bk;
-            int b4=(j+4)*nkb+bk, b5=(j+5)*nkb+bk, b6=(j+6)*nkb+bk, b7=(j+7)*nkb+bk;
-            __m512 scv0=_mm512_set1_ps(sf[b0]), scv1=_mm512_set1_ps(sf[b1]);
-            __m512 scv2=_mm512_set1_ps(sf[b2]), scv3=_mm512_set1_ps(sf[b3]);
-            __m512 scv4=_mm512_set1_ps(sf[b4]), scv5=_mm512_set1_ps(sf[b5]);
-            __m512 scv6=_mm512_set1_ps(sf[b6]), scv7=_mm512_set1_ps(sf[b7]);
+            const TileBlock8 *tb = &tiles[tg * nkb + bk];
+            __m512 scv0=_mm512_set1_ps(tb->scales[0]), scv1=_mm512_set1_ps(tb->scales[1]);
+            __m512 scv2=_mm512_set1_ps(tb->scales[2]), scv3=_mm512_set1_ps(tb->scales[3]);
+            __m512 scv4=_mm512_set1_ps(tb->scales[4]), scv5=_mm512_set1_ps(tb->scales[5]);
+            __m512 scv6=_mm512_set1_ps(tb->scales[6]), scv7=_mm512_set1_ps(tb->scales[7]);
             const float *ap = &A[i * K + bk * G128_BLOCK_SIZE];
             
             if (bk + 2 < nkb) {
@@ -513,10 +508,10 @@ void matmul_simd_g128_tiled8(float *A, G128Matrix *B_T, float *C, int M, int K, 
                 _mm_prefetch(ap + G128_BLOCK_SIZE, _MM_HINT_T0);
             }
             
-            PROCESS_WORD_FUSED8(0, 0);
-            PROCESS_WORD_FUSED8(1, 32);
-            PROCESS_WORD_FUSED8(2, 64);
-            PROCESS_WORD_FUSED8(3, 96);
+            PROCESS_WORD_FUSED8(tb, 0, 0);
+            PROCESS_WORD_FUSED8(tb, 1, 32);
+            PROCESS_WORD_FUSED8(tb, 2, 64);
+            PROCESS_WORD_FUSED8(tb, 3, 96);
         }
         C[i*N+j+0]=hsum_zmm(acc0); C[i*N+j+1]=hsum_zmm(acc1);
         C[i*N+j+2]=hsum_zmm(acc2); C[i*N+j+3]=hsum_zmm(acc3);
@@ -696,10 +691,73 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
     }
 }
 
-// lm_head_prefilter: stub kept for interface compatibility.
-// Vocabulary-level prefiltering is held out — use full lm_head matmul instead.
 void lm_head_prefilter(float *A, G128Matrix *B_T, float *C, int N, int max_blocks) {
-    (void)A; (void)B_T; (void)C; (void)N; (void)max_blocks;
+    int nkb = (int)B_T->num_blocks_col;
+    if (max_blocks > nkb) max_blocks = nkb;
+    const float *sf = B_T->scales_f32;
+    const uint64_t *pos = B_T->packed_pos;
+    const uint64_t *neg = B_T->packed_neg;
+    int n8 = (N / 8) * 8;
+
+    #pragma omp parallel for schedule(static)
+    for (int j = 0; j < n8; j += 8) {
+        __m512 acc0 = _mm512_setzero_ps();
+        __m512 acc1 = _mm512_setzero_ps();
+        __m512 acc2 = _mm512_setzero_ps();
+        __m512 acc3 = _mm512_setzero_ps();
+        __m512 acc4 = _mm512_setzero_ps();
+        __m512 acc5 = _mm512_setzero_ps();
+        __m512 acc6 = _mm512_setzero_ps();
+        __m512 acc7 = _mm512_setzero_ps();
+        int r0=(j+0)*nkb, r1=(j+1)*nkb, r2=(j+2)*nkb, r3=(j+3)*nkb;
+        int r4=(j+4)*nkb, r5=(j+5)*nkb, r6=(j+6)*nkb, r7=(j+7)*nkb;
+        for (int bk = 0; bk < max_blocks; bk++) {
+            int b0=r0+bk, b1=r1+bk, b2=r2+bk, b3=r3+bk;
+            int b4=r4+bk, b5=r5+bk, b6=r6+bk, b7=r7+bk;
+            __m512 scv0=_mm512_set1_ps(sf[b0]), scv1=_mm512_set1_ps(sf[b1]);
+            __m512 scv2=_mm512_set1_ps(sf[b2]), scv3=_mm512_set1_ps(sf[b3]);
+            __m512 scv4=_mm512_set1_ps(sf[b4]), scv5=_mm512_set1_ps(sf[b5]);
+            __m512 scv6=_mm512_set1_ps(sf[b6]), scv7=_mm512_set1_ps(sf[b7]);
+            const float *ap = &A[bk * G128_BLOCK_SIZE];
+            PROCESS_WORD_POS(0, 0);   PROCESS_WORD_NEG(0, 0);
+            PROCESS_WORD_POS(1, 32);  PROCESS_WORD_NEG(1, 32);
+            PROCESS_WORD_POS(2, 64);  PROCESS_WORD_NEG(2, 64);
+            PROCESS_WORD_POS(3, 96);  PROCESS_WORD_NEG(3, 96);
+        }
+        C[j+0]=hsum_zmm(acc0); C[j+1]=hsum_zmm(acc1);
+        C[j+2]=hsum_zmm(acc2); C[j+3]=hsum_zmm(acc3);
+        C[j+4]=hsum_zmm(acc4); C[j+5]=hsum_zmm(acc5);
+        C[j+6]=hsum_zmm(acc6); C[j+7]=hsum_zmm(acc7);
+    }
+
+    for (int j = n8; j < N; j++) {
+        __m512 acc = _mm512_setzero_ps();
+        int rb = j * nkb;
+        for (int bk = 0; bk < max_blocks; bk++) {
+            int bidx = rb + bk;
+            uint64_t pkp0= B_T->packed_pos[bidx*4+0], pkp1= B_T->packed_pos[bidx*4+1];
+            uint64_t pkp2= B_T->packed_pos[bidx*4+2], pkp3= B_T->packed_pos[bidx*4+3];
+            uint64_t pkn0= B_T->packed_neg[bidx*4+0], pkn1= B_T->packed_neg[bidx*4+1];
+            uint64_t pkn2= B_T->packed_neg[bidx*4+2], pkn3= B_T->packed_neg[bidx*4+3];
+            uint32_t cp_lo[4]={(uint32_t)pkp0,(uint32_t)(pkp0>>32),(uint32_t)pkp1,(uint32_t)(pkp1>>32)};
+            uint32_t cp_hi[4]={(uint32_t)pkp2,(uint32_t)(pkp2>>32),(uint32_t)pkp3,(uint32_t)(pkp3>>32)};
+            uint32_t cn_lo[4]={(uint32_t)pkn0,(uint32_t)(pkn0>>32),(uint32_t)pkn1,(uint32_t)(pkn1>>32)};
+            uint32_t cn_hi[4]={(uint32_t)pkn2,(uint32_t)(pkn2>>32),(uint32_t)pkn3,(uint32_t)(pkn3>>32)};
+            __m512 scv = _mm512_set1_ps(sf[bidx]);
+            const float *ap = &A[bk * G128_BLOCK_SIZE];
+            for (int bi = 0; bi < 4; bi++) {
+                __m512 av = _mm512_load_ps(ap + bi * 16);
+                LUT_ACCUM_POS(acc, cp_lo[bi], scv, av);
+                LUT_ACCUM_NEG(acc, cn_lo[bi], av);
+            }
+            for (int bi = 0; bi < 4; bi++) {
+                __m512 av = _mm512_load_ps(ap + 64 + bi * 16);
+                LUT_ACCUM_POS(acc, cp_hi[bi], scv, av);
+                LUT_ACCUM_NEG(acc, cn_hi[bi], av);
+            }
+        }
+        C[j] = hsum_zmm(acc);
+    }
 }
 
 // Compute exact dot products for a selected subset of vocabulary rows.
@@ -820,7 +878,7 @@ void find_top_k(float *scores, int N, int K, int *out_indices) {
     free(heap);
 }
 
-const int lm_head_prefilter_available = 0;
+const int lm_head_prefilter_available = 1;
 
 #elif defined(__AVX2__)
 
@@ -997,12 +1055,11 @@ void matmul_simd_g128_tiled8_avx2(float *A, G128Matrix *B_T, float *C, int M, in
         int tg = j / 8;
         
         for (int bk = 0; bk < nkb; bk++) {
-            int b0=(j+0)*nkb+bk, b1=(j+1)*nkb+bk, b2=(j+2)*nkb+bk, b3=(j+3)*nkb+bk;
-            int b4=(j+4)*nkb+bk, b5=(j+5)*nkb+bk, b6=(j+6)*nkb+bk, b7=(j+7)*nkb+bk;
-            __m256 sc0=_mm256_set1_ps(sf[b0]), sc1=_mm256_set1_ps(sf[b1]);
-            __m256 sc2=_mm256_set1_ps(sf[b2]), sc3=_mm256_set1_ps(sf[b3]);
-            __m256 sc4=_mm256_set1_ps(sf[b4]), sc5=_mm256_set1_ps(sf[b5]);
-            __m256 sc6=_mm256_set1_ps(sf[b6]), sc7=_mm256_set1_ps(sf[b7]);
+            const TileBlock8 *tb = &tiles[tg * nkb + bk];
+            __m256 sc0=_mm256_set1_ps(tb->scales[0]), sc1=_mm256_set1_ps(tb->scales[1]);
+            __m256 sc2=_mm256_set1_ps(tb->scales[2]), sc3=_mm256_set1_ps(tb->scales[3]);
+            __m256 sc4=_mm256_set1_ps(tb->scales[4]), sc5=_mm256_set1_ps(tb->scales[5]);
+            __m256 sc6=_mm256_set1_ps(tb->scales[6]), sc7=_mm256_set1_ps(tb->scales[7]);
             __m256 ns0=_mm256_xor_ps(sc0, _mm256_set1_ps(-0.0f));
             __m256 ns1=_mm256_xor_ps(sc1, _mm256_set1_ps(-0.0f));
             __m256 ns2=_mm256_xor_ps(sc2, _mm256_set1_ps(-0.0f));

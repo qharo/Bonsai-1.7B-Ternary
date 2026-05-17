@@ -196,9 +196,35 @@ static void rms_norm_head(float *x, float *w, int nh, int hd) {
     }
 }
 
-static void silu(float *in, float *out, int n) {
-    for (int i = 0; i < n; i++) { float x = in[i]; out[i] = x / (1.0f + expf(-x)); }
+#ifdef __AVX512F__
+static inline __m512 exp_approx512(__m512 x) {
+    __m512 one = _mm512_set1_ps(1.0f);
+    __m512 a = _mm512_fmadd_ps(x, _mm512_set1_ps(1.0f/256.0f), one);
+    __m512 b = a; for (int i = 0; i < 8; i++) b = _mm512_mul_ps(b, b);
+    return b;
 }
+
+static void silu_mul(float *gate, float *up, float *out, int n) {
+    for (int i = 0; i <= n - 16; i += 16) {
+        __m512 g = _mm512_load_ps(gate + i);
+        __m512 u = _mm512_load_ps(up + i);
+        __m512 neg_g = _mm512_xor_ps(g, _mm512_set1_ps(-0.0f));
+        __m512 exp_neg_g = exp_approx512(neg_g);
+        __m512 denom = _mm512_add_ps(_mm512_set1_ps(1.0f), exp_neg_g);
+        __m512 sig = _mm512_div_ps(g, denom);
+        _mm512_store_ps(out + i, _mm512_mul_ps(sig, u));
+    }
+    for (int i = (n / 16) * 16; i < n; i++) {
+        float x = gate[i]; out[i] = (x / (1.0f + expf(-x))) * up[i];
+    }
+}
+#else
+static void silu_mul(float *gate, float *up, float *out, int n) {
+    for (int i = 0; i < n; i++) {
+        float x = gate[i]; out[i] = (x / (1.0f + expf(-x))) * up[i];
+    }
+}
+#endif
 
 static void softmax(float *s, int n) {
     float m = s[0]; for (int i = 1; i < n; i++) if (s[i] > m) m = s[i];
@@ -206,14 +232,52 @@ static void softmax(float *s, int n) {
     for (int i = 0; i < n; i++) s[i] /= sum;
 }
 
-static void apply_rope(float *q, int seqlen, int nh, int hd, float *invf, float as, int pos_offset) {
+#ifdef __AVX512F__
+
+static inline float hsum_zmm_local(__m512 v) {
+    __m256 lo = _mm512_castps512_ps256(v);
+    __m256 hi = _mm512_extractf32x8_ps(v, 1);
+    __m256 s2 = _mm256_add_ps(lo, hi);
+    __m128 s4 = _mm_add_ps(_mm256_castps256_ps128(s2), _mm256_extractf128_ps(s2, 1));
+    s4 = _mm_hadd_ps(s4, s4);
+    s4 = _mm_hadd_ps(s4, s4);
+    return _mm_cvtss_f32(s4);
+}
+
+static void attn_qk_dot_avx512(const float *q_head, const float *k_base, int kv_len,
+                                float *aw_row, float inv_sqrt_hd) {
+    for (int j = 0; j < kv_len; j++) {
+        const float *kc = &k_base[j * HEAD_DIM];
+        __m512 acc = _mm512_setzero_ps();
+        for (int d = 0; d < HEAD_DIM; d += 16)
+            acc = _mm512_fmadd_ps(_mm512_load_ps(q_head + d), _mm512_load_ps(kc + d), acc);
+        aw_row[j] = hsum_zmm_local(acc) * inv_sqrt_hd;
+    }
+}
+
+static void attn_vsum_avx512(const float *aw_row, const float *v_base, int kv_len,
+                              float *ao_head) {
+    for (int d = 0; d < HEAD_DIM; d += 16) {
+        __m512 vsum = _mm512_setzero_ps();
+        for (int j = 0; j < kv_len; j++) {
+            __m512 w = _mm512_set1_ps(aw_row[j]);
+            vsum = _mm512_fmadd_ps(w, _mm512_load_ps(&v_base[j * HEAD_DIM + d]), vsum);
+        }
+        _mm512_store_ps(ao_head + d, vsum);
+    }
+}
+
+#endif
+
+static void apply_rope(float *q, int seqlen, int nh, int hd, float rope_cos[][HEAD_DIM/2], float rope_sin[][HEAD_DIM/2], int pos_offset) {
     int half = hd / 2;
     for (int pos = 0; pos < seqlen; pos++) {
+        int rp = pos + pos_offset;
+        float *rc = rope_cos[rp], *rs = rope_sin[rp];
         for (int h = 0; h < nh; h++) {
             int off = pos * nh * hd + h * hd;
             for (int i = 0; i < half; i++) {
-                float a = (float)(pos + pos_offset) * invf[i];
-                float c = cosf(a) * as, s = sinf(a) * as;
+                float c = rc[i], s = rs[i];
                 float q0 = q[off + i], q1 = q[off + half + i];
                 q[off + i] = q0 * c - q1 * s;
                 q[off + half + i] = q0 * s + q1 * c;
@@ -237,7 +301,7 @@ static void forward_layer(ModelState *s, int lid, int seqlen, int prefill, int d
     LayerWeights *lw = &s->layers[lid];
     float *h = s->hidden, *n = s->normalized, *res = s->residual;
     float *q = s->q, *k = s->k, *v = s->v, *ao = s->attn_out, *aw = s->attn_weights;
-    float *go = s->gate_out, *uo = s->up_out, *ma = s->mlp_act;
+    float *go = s->gate_out, *uo = s->up_out;
     uint64_t _t0 = 0, _t1 = 0;
 
     memcpy(res, h, seqlen * HIDDEN_SIZE * 4);
@@ -261,8 +325,8 @@ static void forward_layer(ModelState *s, int lid, int seqlen, int prefill, int d
     }
 
     int rope_offset = prefill ? 0 : decode_pos;
-    apply_rope(q, seqlen, NUM_HEADS, HEAD_DIM, s->inv_freq, s->attn_scale, rope_offset);
-    apply_rope(k, seqlen, NUM_KV_HEADS, HEAD_DIM, s->inv_freq, s->attn_scale, rope_offset);
+    apply_rope(q, seqlen, NUM_HEADS, HEAD_DIM, s->rope_cos, s->rope_sin, rope_offset);
+    apply_rope(k, seqlen, NUM_KV_HEADS, HEAD_DIM, s->rope_cos, s->rope_sin, rope_offset);
 
     if (!prefill) _t0 = now_ns();
     // KV cache write (head-major layout: kv_k[lid][head][pos][dim])
@@ -281,10 +345,26 @@ static void forward_layer(ModelState *s, int lid, int seqlen, int prefill, int d
     }
 
     int kv_len = prefill ? seqlen : decode_pos + 1;
+    float inv_sqrt_hd = 1.0f / sqrtf((float)HEAD_DIM);
     for (int h = 0; h < NUM_HEADS; h++) {
         int qkh = h / (NUM_HEADS / NUM_KV_HEADS);
         float *k_cache_head = &s->kv_k[lid][qkh][0][0];
         float *v_cache_head = &s->kv_v[lid][qkh][0][0];
+#ifdef __AVX512F__
+        for (int i = 0; i < seqlen; i++) {
+            int query_pos = prefill ? i : decode_pos;
+            float *q_head = &q[i*HIDDEN_SIZE + h*HEAD_DIM];
+            float *aw_row = &aw[i * kv_len];
+            attn_qk_dot_avx512(q_head, k_cache_head, kv_len, aw_row, inv_sqrt_hd);
+            for (int j = query_pos + 1; j < kv_len; j++) aw_row[j] = -1e38f;
+            softmax(aw_row, kv_len);
+        }
+        for (int i = 0; i < seqlen; i++) {
+            float *aw_row = &aw[i * kv_len];
+            float *ao_head = &ao[i*HIDDEN_SIZE + h*HEAD_DIM];
+            attn_vsum_avx512(aw_row, v_cache_head, kv_len, ao_head);
+        }
+#else
         for (int i = 0; i < seqlen; i++) {
             int query_pos = prefill ? i : decode_pos;
             float *q_head = &q[i*HIDDEN_SIZE + h*HEAD_DIM];
@@ -294,7 +374,7 @@ static void forward_layer(ModelState *s, int lid, int seqlen, int prefill, int d
                 float sc = 0;
                 float *kc = &k_cache_head[j * HEAD_DIM];
                 for (int d = 0; d < HEAD_DIM; d++) sc += q_head[d] * kc[d];
-                aw_row[j] = sc / sqrtf((float)HEAD_DIM);
+                aw_row[j] = sc * inv_sqrt_hd;
             }
             softmax(aw_row, kv_len);
         }
@@ -307,6 +387,7 @@ static void forward_layer(ModelState *s, int lid, int seqlen, int prefill, int d
                 ao_head[d] = val;
             }
         }
+#endif
     }
     if (!prefill) { _t1 = now_ns(); s->profile.attn_ns += (double)(_t1 - _t0); }
 
@@ -325,8 +406,7 @@ static void forward_layer(ModelState *s, int lid, int seqlen, int prefill, int d
     if (!prefill) _t0 = now_ns();
     matmul_simd_g128(n, &lw->up_proj, uo, seqlen, HIDDEN_SIZE, INTERMEDIATE_SIZE);
     if (!prefill) profile_matmul(s, MATMUL_UP_PROJ, _t0, seqlen, HIDDEN_SIZE, INTERMEDIATE_SIZE);
-    silu(go, ma, seqlen*INTERMEDIATE_SIZE);
-    for (int i = 0; i < seqlen*INTERMEDIATE_SIZE; i++) go[i] = ma[i] * uo[i];
+    silu_mul(go, uo, go, seqlen*INTERMEDIATE_SIZE);
 
     if (!prefill) _t0 = now_ns();
     matmul_simd_g128(go, &lw->down_proj, h, seqlen, INTERMEDIATE_SIZE, HIDDEN_SIZE);
@@ -406,6 +486,14 @@ int model_load(ModelState *s, const char *dir) {
     }
     s->attn_scale = 1.0f + 0.1f * logf(4.0f);
 
+    for (int pos = 0; pos < MAX_SEQ_LEN; pos++) {
+        for (int i = 0; i < HEAD_DIM / 2; i++) {
+            float a = (float)pos * s->inv_freq[i];
+            s->rope_cos[pos][i] = cosf(a) * s->attn_scale;
+            s->rope_sin[pos][i] = sinf(a) * s->attn_scale;
+        }
+    }
+
     // Log tiling status for deployment verification
     uint64_t total_tiles = 0;
     size_t tile_memory = 0;
@@ -474,10 +562,11 @@ int model_prefill(ModelState *s, int32_t *tokens, int n, float *logits) {
     rms_norm(&s->hidden[(n-1)*HIDDEN_SIZE], s->final_norm.data, s->normalized, HIDDEN_SIZE);
     int vocab_n = (int)s->embed.num_rows;
     if (lm_head_prefilter_available) {
-        lm_head_prefilter(s->normalized, &s->embed, s->approx_logits, vocab_n, 2);
+        lm_head_prefilter(s->normalized, &s->embed, s->approx_logits, vocab_n, LM_HEAD_PREFILTER_BLOCKS);
         find_top_k(s->approx_logits, vocab_n, LM_HEAD_CANDIDATES, s->lm_head_candidates);
         for (int i = 0; i < vocab_n; i++) logits[i] = -1e38f;
-        matmul_g128_selected(s->normalized, &s->embed, logits, 1, HIDDEN_SIZE, vocab_n, LM_HEAD_CANDIDATES, s->lm_head_candidates);
+        matmul_g128_selected(s->normalized, &s->embed, logits, 1, HIDDEN_SIZE, vocab_n,
+                            LM_HEAD_CANDIDATES, s->lm_head_candidates);
     } else {
         matmul_simd_g128(s->normalized, &s->embed, logits, 1, HIDDEN_SIZE, vocab_n);
     }
@@ -501,8 +590,8 @@ int model_decode(ModelState *s, int32_t token, float *logits) {
     rms_norm(s->hidden, s->final_norm.data, s->normalized, HIDDEN_SIZE);
     int vocab_n = (int)s->embed.num_rows;
     if (lm_head_prefilter_available) {
-        // Phase 1: approximate scores from first 2 blocks (256/2048 dims)
-        lm_head_prefilter(s->normalized, &s->embed, s->approx_logits, vocab_n, 2);
+        // Phase 1: approximate scores from first N blocks of dimensions
+        lm_head_prefilter(s->normalized, &s->embed, s->approx_logits, vocab_n, LM_HEAD_PREFILTER_BLOCKS);
         // Phase 2: find top-K candidate rows
         find_top_k(s->approx_logits, vocab_n, LM_HEAD_CANDIDATES, s->lm_head_candidates);
         // Phase 3: zero out all logits, then compute exact full-dim scores for candidates
