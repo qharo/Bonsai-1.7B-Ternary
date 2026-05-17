@@ -8,6 +8,13 @@
 #define BITS_PER_LONG 64
 #define G128_BLOCK_SIZE 128
 
+typedef struct __attribute__((aligned(64))) {
+    uint64_t pos[8][4];   // 256 bytes: pos bitmaps for 8 rows
+    uint64_t neg[8][4];   // 256 bytes: neg bitmaps
+    float    scales[8];   // 32 bytes: one scale per row
+    float    _pad[7];     // 28 bytes pad → 576 bytes total
+} TileBlock8;
+
 typedef struct {
     uint32_t num_rows;      
     uint32_t num_cols;      
@@ -19,6 +26,9 @@ typedef struct {
     uint64_t *packed_neg;   // weight==-scale bitmap: 4 × uint64 per block (AVX-512)
     uint16_t *scales;
     float    *scales_f32;
+    TileBlock8 *tiles8;     // 8-row tiled layout for optimized matmul
+    uint64_t num_tile_groups8;  // N/8
+    uint32_t total_tiles8;      // num_tile_groups8 * num_blocks_col
 } G128Matrix;
 
 void g128_matrix_init(G128Matrix *m, uint32_t num_rows, uint32_t num_cols);

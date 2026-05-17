@@ -134,7 +134,14 @@ static const uint32_t mag_lut[16][4] = {
     (acc) = vmlaq_f32((acc), _w, (av)); \
 } while(0)
 
+void matmul_simd_g128_tiled8_neon(float *A, G128Matrix *B_T, float *C, int M, int K, int N);
+
 void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) {
+    if (B_T->tiles8 != NULL && B_T->num_tile_groups8 > 0 && N % 8 == 0) {
+        matmul_simd_g128_tiled8_neon(A, B_T, C, M, K, N);
+        return;
+    }
+    
     int nkb = (int)B_T->num_blocks_col;
     const float *sf = B_T->scales_f32;
     for (int i = 0; i < M; i++) {
@@ -205,62 +212,212 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
     }
 }
 
+void matmul_simd_g128_tiled8_neon(float *A, G128Matrix *B_T, float *C, int M, int K, int N) {
+    int nkb = (int)B_T->num_blocks_col;
+    const float *sf = B_T->scales_f32;
+    const TileBlock8 *tiles = B_T->tiles8;
+    int n8 = (N / 8) * 8;
+    int n_j = n8 / 8;
+    int total_jobs = M * n_j;
+    
+    #ifdef DEBUG
+    assert(N % 8 == 0 && "All production matmul shapes are N%8==0");
+    #endif
+    
+    #pragma omp parallel for schedule(static)
+    for (int idx = 0; idx < total_jobs; idx++) {
+        int i = idx / n_j;
+        int j = (idx % n_j) * 8;
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        float32x4_t acc2 = vdupq_n_f32(0.0f);
+        float32x4_t acc3 = vdupq_n_f32(0.0f);
+        float32x4_t acc4 = vdupq_n_f32(0.0f);
+        float32x4_t acc5 = vdupq_n_f32(0.0f);
+        float32x4_t acc6 = vdupq_n_f32(0.0f);
+        float32x4_t acc7 = vdupq_n_f32(0.0f);
+        int tg = j / 8;
+        
+        for (int bk = 0; bk < nkb; bk++) {
+            int b0=(j+0)*nkb+bk, b1=(j+1)*nkb+bk, b2=(j+2)*nkb+bk, b3=(j+3)*nkb+bk;
+            int b4=(j+4)*nkb+bk, b5=(j+5)*nkb+bk, b6=(j+6)*nkb+bk, b7=(j+7)*nkb+bk;
+            float32x4_t sc0=vdupq_n_f32(sf[b0]), sc1=vdupq_n_f32(sf[b1]);
+            float32x4_t sc2=vdupq_n_f32(sf[b2]), sc3=vdupq_n_f32(sf[b3]);
+            float32x4_t sc4=vdupq_n_f32(sf[b4]), sc5=vdupq_n_f32(sf[b5]);
+            float32x4_t sc6=vdupq_n_f32(sf[b6]), sc7=vdupq_n_f32(sf[b7]);
+            float32x4_t ns0=vnegq_f32(sc0), ns1=vnegq_f32(sc1);
+            float32x4_t ns2=vnegq_f32(sc2), ns3=vnegq_f32(sc3);
+            float32x4_t ns4=vnegq_f32(sc4), ns5=vnegq_f32(sc5);
+            float32x4_t ns6=vnegq_f32(sc6), ns7=vnegq_f32(sc7);
+            const float *ap = &A[i * K + bk * G128_BLOCK_SIZE];
+            const TileBlock8 *tb = &tiles[tg * nkb + bk];
+            
+            for (int b = 0; b < 64; b += 4) {
+                float32x4_t av = vld1q_f32(ap + b);
+                uint64_t p0=tb->pos[0][b/4], n0=tb->neg[0][b/4];
+                uint64_t p1=tb->pos[1][b/4], n1=tb->neg[1][b/4];
+                uint64_t p2=tb->pos[2][b/4], n2=tb->neg[2][b/4];
+                uint64_t p3=tb->pos[3][b/4], n3=tb->neg[3][b/4];
+                uint64_t p4=tb->pos[4][b/4], n4=tb->neg[4][b/4];
+                uint64_t p5=tb->pos[5][b/4], n5=tb->neg[5][b/4];
+                uint64_t p6=tb->pos[6][b/4], n6=tb->neg[6][b/4];
+                uint64_t p7=tb->pos[7][b/4], n7=tb->neg[7][b/4];
+                
+                uint32x4_t pm0 = vreinterpretq_u32_u64(vdupq_n_u64(p0));
+                uint32x4_t nm0 = vreinterpretq_u32_u64(vdupq_n_u64(n0));
+                uint32x4_t pm1 = vreinterpretq_u32_u64(vdupq_n_u64(p1));
+                uint32x4_t nm1 = vreinterpretq_u32_u64(vdupq_n_u64(n1));
+                uint32x4_t pm2 = vreinterpretq_u32_u64(vdupq_n_u64(p2));
+                uint32x4_t nm2 = vreinterpretq_u32_u64(vdupq_n_u64(n2));
+                uint32x4_t pm3 = vreinterpretq_u32_u64(vdupq_n_u64(p3));
+                uint32x4_t nm3 = vreinterpretq_u32_u64(vdupq_n_u64(n3));
+                uint32x4_t pm4 = vreinterpretq_u32_u64(vdupq_n_u64(p4));
+                uint32x4_t nm4 = vreinterpretq_u32_u64(vdupq_n_u64(n4));
+                uint32x4_t pm5 = vreinterpretq_u32_u64(vdupq_n_u64(p5));
+                uint32x4_t nm5 = vreinterpretq_u32_u64(vdupq_n_u64(n5));
+                uint32x4_t pm6 = vreinterpretq_u32_u64(vdupq_n_u64(p6));
+                uint32x4_t nm6 = vreinterpretq_u32_u64(vdupq_n_u64(n6));
+                uint32x4_t pm7 = vreinterpretq_u32_u64(vdupq_n_u64(p7));
+                uint32x4_t nm7 = vreinterpretq_u32_u64(vdupq_n_u64(n7));
+                
+                acc0 = vmlaq_f32(acc0, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc0), pm0)), av);
+                acc0 = vmlaq_f32(acc0, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns0), nm0)), av);
+                acc1 = vmlaq_f32(acc1, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc1), pm1)), av);
+                acc1 = vmlaq_f32(acc1, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns1), nm1)), av);
+                acc2 = vmlaq_f32(acc2, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc2), pm2)), av);
+                acc2 = vmlaq_f32(acc2, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns2), nm2)), av);
+                acc3 = vmlaq_f32(acc3, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc3), pm3)), av);
+                acc3 = vmlaq_f32(acc3, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns3), nm3)), av);
+                acc4 = vmlaq_f32(acc4, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc4), pm4)), av);
+                acc4 = vmlaq_f32(acc4, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns4), nm4)), av);
+                acc5 = vmlaq_f32(acc5, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc5), pm5)), av);
+                acc5 = vmlaq_f32(acc5, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns5), nm5)), av);
+                acc6 = vmlaq_f32(acc6, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc6), pm6)), av);
+                acc6 = vmlaq_f32(acc6, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns6), nm6)), av);
+                acc7 = vmlaq_f32(acc7, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc7), pm7)), av);
+                acc7 = vmlaq_f32(acc7, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns7), nm7)), av);
+            }
+            for (int b = 0; b < 64; b += 4) {
+                float32x4_t av = vld1q_f32(ap + 64 + b);
+                uint64_t p0=tb->pos[0][4+b/4], n0=tb->neg[0][4+b/4];
+                uint64_t p1=tb->pos[1][4+b/4], n1=tb->neg[1][4+b/4];
+                uint64_t p2=tb->pos[2][4+b/4], n2=tb->neg[2][4+b/4];
+                uint64_t p3=tb->pos[3][4+b/4], n3=tb->neg[3][4+b/4];
+                uint64_t p4=tb->pos[4][4+b/4], n4=tb->neg[4][4+b/4];
+                uint64_t p5=tb->pos[5][4+b/4], n5=tb->neg[5][4+b/4];
+                uint64_t p6=tb->pos[6][4+b/4], n6=tb->neg[6][4+b/4];
+                uint64_t p7=tb->pos[7][4+b/4], n7=tb->neg[7][4+b/4];
+                
+                uint32x4_t pm0 = vreinterpretq_u32_u64(vdupq_n_u64(p0));
+                uint32x4_t nm0 = vreinterpretq_u32_u64(vdupq_n_u64(n0));
+                uint32x4_t pm1 = vreinterpretq_u32_u64(vdupq_n_u64(p1));
+                uint32x4_t nm1 = vreinterpretq_u32_u64(vdupq_n_u64(n1));
+                uint32x4_t pm2 = vreinterpretq_u32_u64(vdupq_n_u64(p2));
+                uint32x4_t nm2 = vreinterpretq_u32_u64(vdupq_n_u64(n2));
+                uint32x4_t pm3 = vreinterpretq_u32_u64(vdupq_n_u64(p3));
+                uint32x4_t nm3 = vreinterpretq_u32_u64(vdupq_n_u64(n3));
+                uint32x4_t pm4 = vreinterpretq_u32_u64(vdupq_n_u64(p4));
+                uint32x4_t nm4 = vreinterpretq_u32_u64(vdupq_n_u64(n4));
+                uint32x4_t pm5 = vreinterpretq_u32_u64(vdupq_n_u64(p5));
+                uint32x4_t nm5 = vreinterpretq_u32_u64(vdupq_n_u64(n5));
+                uint32x4_t pm6 = vreinterpretq_u32_u64(vdupq_n_u64(p6));
+                uint32x4_t nm6 = vreinterpretq_u32_u64(vdupq_n_u64(n6));
+                uint32x4_t pm7 = vreinterpretq_u32_u64(vdupq_n_u64(p7));
+                uint32x4_t nm7 = vreinterpretq_u32_u64(vdupq_n_u64(n7));
+                
+                acc0 = vmlaq_f32(acc0, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc0), pm0)), av);
+                acc0 = vmlaq_f32(acc0, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns0), nm0)), av);
+                acc1 = vmlaq_f32(acc1, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc1), pm1)), av);
+                acc1 = vmlaq_f32(acc1, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns1), nm1)), av);
+                acc2 = vmlaq_f32(acc2, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc2), pm2)), av);
+                acc2 = vmlaq_f32(acc2, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns2), nm2)), av);
+                acc3 = vmlaq_f32(acc3, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc3), pm3)), av);
+                acc3 = vmlaq_f32(acc3, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns3), nm3)), av);
+                acc4 = vmlaq_f32(acc4, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc4), pm4)), av);
+                acc4 = vmlaq_f32(acc4, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns4), nm4)), av);
+                acc5 = vmlaq_f32(acc5, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc5), pm5)), av);
+                acc5 = vmlaq_f32(acc5, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns5), nm5)), av);
+                acc6 = vmlaq_f32(acc6, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc6), pm6)), av);
+                acc6 = vmlaq_f32(acc6, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns6), nm6)), av);
+                acc7 = vmlaq_f32(acc7, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(sc7), pm7)), av);
+                acc7 = vmlaq_f32(acc7, vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(ns7), nm7)), av);
+            }
+        }
+        C[i*N+j+0] = vaddvq_f32(acc0); C[i*N+j+1] = vaddvq_f32(acc1);
+        C[i*N+j+2] = vaddvq_f32(acc2); C[i*N+j+3] = vaddvq_f32(acc3);
+        C[i*N+j+4] = vaddvq_f32(acc4); C[i*N+j+5] = vaddvq_f32(acc5);
+        C[i*N+j+6] = vaddvq_f32(acc6); C[i*N+j+7] = vaddvq_f32(acc7);
+    }
+    
+    for (int i = 0; i < M; i++) {
+        for (int j = n8; j < N; j++) {
+            float32x4_t acc = vdupq_n_f32(0.0f);
+            int rb = j * nkb;
+            for (int bk = 0; bk < nkb; bk++) {
+                int bidx = rb + bk;
+                uint64_t mag0=B_T->magnitude[bidx*2+0], mag1=B_T->magnitude[bidx*2+1];
+                uint64_t sgn0=B_T->sign[bidx*2+0],      sgn1=B_T->sign[bidx*2+1];
+                float sc = sf[bidx];
+                float32x4_t ns=vdupq_n_f32(-sc), ps=vdupq_n_f32(sc);
+                const float *ap = &A[i * K + bk * G128_BLOCK_SIZE];
+                for (int b = 0; b < 64; b += 4)
+                    LUT_ACCUM(acc, mag0, sgn0, b, ns, ps, vld1q_f32(ap + b));
+                for (int b = 0; b < 64; b += 4)
+                    LUT_ACCUM(acc, mag1, sgn1, b, ns, ps, vld1q_f32(ap + 64 + b));
+            }
+            C[i*N+j] = vaddvq_f32(acc);
+        }
+    }
+}
+
 #elif defined(__AVX512F__)
 
 #include <immintrin.h>
 
-// Pre-separated pos/neg bitmap matmul: no runtime mask computation.
-// packed_pos holds mask_bits(weight==+scale), packed_neg holds mask_bits(weight==-scale).
-// pos and neg values are pre-packed as 32-bit chunks (lower 16 bits = first 16-elem group,
-// upper 16 bits = second 16-elem group), same layout as old 'packed'.
-#define LUT_ACCUM_POS(acc, mask_val, sc, av) \
-    (acc) = _mm512_mask3_fmadd_ps((av), (sc), (acc), (__mmask16)(uint32_t)(mask_val))
-#define LUT_ACCUM_NEG(acc, mask_val, sc, av) \
-    (acc) = _mm512_mask3_fnmadd_ps((av), (sc), (acc), (__mmask16)(uint32_t)(mask_val))
-
-// Process positive-weight bitmaps for 8 output rows, one packed word at a time.
-// Each word covers 32 elements (two 16-elem groups). Loads 8 uint64 values
-// then processes lower/upper halves with shared activation loads.
-#define PROCESS_WORD_POS(pword, ap_off) do { \
-    uint64_t _p0=pos[b0*4+(pword)],_p1=pos[b1*4+(pword)]; \
-    uint64_t _p2=pos[b2*4+(pword)],_p3=pos[b3*4+(pword)]; \
-    uint64_t _p4=pos[b4*4+(pword)],_p5=pos[b5*4+(pword)]; \
-    uint64_t _p6=pos[b6*4+(pword)],_p7=pos[b7*4+(pword)]; \
+#define PROCESS_WORD_FUSED8(pword, ap_off) do { \
+    const TileBlock8 *tb = &tiles[tg * nkb + bk]; \
+    uint64_t _p0=tb->pos[0][pword], _p1=tb->pos[1][pword]; \
+    uint64_t _p2=tb->pos[2][pword], _p3=tb->pos[3][pword]; \
+    uint64_t _p4=tb->pos[4][pword], _p5=tb->pos[5][pword]; \
+    uint64_t _p6=tb->pos[6][pword], _p7=tb->pos[7][pword]; \
+    uint64_t _n0=tb->neg[0][pword], _n1=tb->neg[1][pword]; \
+    uint64_t _n2=tb->neg[2][pword], _n3=tb->neg[3][pword]; \
+    uint64_t _n4=tb->neg[4][pword], _n5=tb->neg[5][pword]; \
+    uint64_t _n6=tb->neg[6][pword], _n7=tb->neg[7][pword]; \
     __m512 _av = _mm512_load_ps(ap + (ap_off)); \
-    LUT_ACCUM_POS(acc0,_p0,scv0,_av); LUT_ACCUM_POS(acc1,_p1,scv1,_av); \
-    LUT_ACCUM_POS(acc2,_p2,scv2,_av); LUT_ACCUM_POS(acc3,_p3,scv3,_av); \
-    LUT_ACCUM_POS(acc4,_p4,scv4,_av); LUT_ACCUM_POS(acc5,_p5,scv5,_av); \
-    LUT_ACCUM_POS(acc6,_p6,scv6,_av); LUT_ACCUM_POS(acc7,_p7,scv7,_av); \
+    acc0 = _mm512_mask3_fmadd_ps(_av,scv0,acc0,(__mmask16)(uint32_t)_p0); \
+    acc0 = _mm512_mask3_fnmadd_ps(_av,scv0,acc0,(__mmask16)(uint32_t)_n0); \
+    acc1 = _mm512_mask3_fmadd_ps(_av,scv1,acc1,(__mmask16)(uint32_t)_p1); \
+    acc1 = _mm512_mask3_fnmadd_ps(_av,scv1,acc1,(__mmask16)(uint32_t)_n1); \
+    acc2 = _mm512_mask3_fmadd_ps(_av,scv2,acc2,(__mmask16)(uint32_t)_p2); \
+    acc2 = _mm512_mask3_fnmadd_ps(_av,scv2,acc2,(__mmask16)(uint32_t)_n2); \
+    acc3 = _mm512_mask3_fmadd_ps(_av,scv3,acc3,(__mmask16)(uint32_t)_p3); \
+    acc3 = _mm512_mask3_fnmadd_ps(_av,scv3,acc3,(__mmask16)(uint32_t)_n3); \
+    acc4 = _mm512_mask3_fmadd_ps(_av,scv4,acc4,(__mmask16)(uint32_t)_p4); \
+    acc4 = _mm512_mask3_fnmadd_ps(_av,scv4,acc4,(__mmask16)(uint32_t)_n4); \
+    acc5 = _mm512_mask3_fmadd_ps(_av,scv5,acc5,(__mmask16)(uint32_t)_p5); \
+    acc5 = _mm512_mask3_fnmadd_ps(_av,scv5,acc5,(__mmask16)(uint32_t)_n5); \
+    acc6 = _mm512_mask3_fmadd_ps(_av,scv6,acc6,(__mmask16)(uint32_t)_p6); \
+    acc6 = _mm512_mask3_fnmadd_ps(_av,scv6,acc6,(__mmask16)(uint32_t)_n6); \
+    acc7 = _mm512_mask3_fmadd_ps(_av,scv7,acc7,(__mmask16)(uint32_t)_p7); \
+    acc7 = _mm512_mask3_fnmadd_ps(_av,scv7,acc7,(__mmask16)(uint32_t)_n7); \
     _av = _mm512_load_ps(ap + (ap_off) + 16); \
-    LUT_ACCUM_POS(acc0,(uint32_t)(_p0>>32),scv0,_av); \
-    LUT_ACCUM_POS(acc1,(uint32_t)(_p1>>32),scv1,_av); \
-    LUT_ACCUM_POS(acc2,(uint32_t)(_p2>>32),scv2,_av); \
-    LUT_ACCUM_POS(acc3,(uint32_t)(_p3>>32),scv3,_av); \
-    LUT_ACCUM_POS(acc4,(uint32_t)(_p4>>32),scv4,_av); \
-    LUT_ACCUM_POS(acc5,(uint32_t)(_p5>>32),scv5,_av); \
-    LUT_ACCUM_POS(acc6,(uint32_t)(_p6>>32),scv6,_av); \
-    LUT_ACCUM_POS(acc7,(uint32_t)(_p7>>32),scv7,_av); \
-} while(0)
-
-#define PROCESS_WORD_NEG(pword, ap_off) do { \
-    uint64_t _n0=neg[b0*4+(pword)],_n1=neg[b1*4+(pword)]; \
-    uint64_t _n2=neg[b2*4+(pword)],_n3=neg[b3*4+(pword)]; \
-    uint64_t _n4=neg[b4*4+(pword)],_n5=neg[b5*4+(pword)]; \
-    uint64_t _n6=neg[b6*4+(pword)],_n7=neg[b7*4+(pword)]; \
-    __m512 _av = _mm512_load_ps(ap + (ap_off)); \
-    LUT_ACCUM_NEG(acc0,_n0,scv0,_av); LUT_ACCUM_NEG(acc1,_n1,scv1,_av); \
-    LUT_ACCUM_NEG(acc2,_n2,scv2,_av); LUT_ACCUM_NEG(acc3,_n3,scv3,_av); \
-    LUT_ACCUM_NEG(acc4,_n4,scv4,_av); LUT_ACCUM_NEG(acc5,_n5,scv5,_av); \
-    LUT_ACCUM_NEG(acc6,_n6,scv6,_av); LUT_ACCUM_NEG(acc7,_n7,scv7,_av); \
-    _av = _mm512_load_ps(ap + (ap_off) + 16); \
-    LUT_ACCUM_NEG(acc0,(uint32_t)(_n0>>32),scv0,_av); \
-    LUT_ACCUM_NEG(acc1,(uint32_t)(_n1>>32),scv1,_av); \
-    LUT_ACCUM_NEG(acc2,(uint32_t)(_n2>>32),scv2,_av); \
-    LUT_ACCUM_NEG(acc3,(uint32_t)(_n3>>32),scv3,_av); \
-    LUT_ACCUM_NEG(acc4,(uint32_t)(_n4>>32),scv4,_av); \
-    LUT_ACCUM_NEG(acc5,(uint32_t)(_n5>>32),scv5,_av); \
-    LUT_ACCUM_NEG(acc6,(uint32_t)(_n6>>32),scv6,_av); \
-    LUT_ACCUM_NEG(acc7,(uint32_t)(_n7>>32),scv7,_av); \
+    acc0 = _mm512_mask3_fmadd_ps(_av,scv0,acc0,(__mmask16)(uint32_t)(_p0>>32)); \
+    acc0 = _mm512_mask3_fnmadd_ps(_av,scv0,acc0,(__mmask16)(uint32_t)(_n0>>32)); \
+    acc1 = _mm512_mask3_fmadd_ps(_av,scv1,acc1,(__mmask16)(uint32_t)(_p1>>32)); \
+    acc1 = _mm512_mask3_fnmadd_ps(_av,scv1,acc1,(__mmask16)(uint32_t)(_n1>>32)); \
+    acc2 = _mm512_mask3_fmadd_ps(_av,scv2,acc2,(__mmask16)(uint32_t)(_p2>>32)); \
+    acc2 = _mm512_mask3_fnmadd_ps(_av,scv2,acc2,(__mmask16)(uint32_t)(_n2>>32)); \
+    acc3 = _mm512_mask3_fmadd_ps(_av,scv3,acc3,(__mmask16)(uint32_t)(_p3>>32)); \
+    acc3 = _mm512_mask3_fnmadd_ps(_av,scv3,acc3,(__mmask16)(uint32_t)(_n3>>32)); \
+    acc4 = _mm512_mask3_fmadd_ps(_av,scv4,acc4,(__mmask16)(uint32_t)(_p4>>32)); \
+    acc4 = _mm512_mask3_fnmadd_ps(_av,scv4,acc4,(__mmask16)(uint32_t)(_n4>>32)); \
+    acc5 = _mm512_mask3_fmadd_ps(_av,scv5,acc5,(__mmask16)(uint32_t)(_p5>>32)); \
+    acc5 = _mm512_mask3_fnmadd_ps(_av,scv5,acc5,(__mmask16)(uint32_t)(_n5>>32)); \
+    acc6 = _mm512_mask3_fmadd_ps(_av,scv6,acc6,(__mmask16)(uint32_t)(_p6>>32)); \
+    acc6 = _mm512_mask3_fnmadd_ps(_av,scv6,acc6,(__mmask16)(uint32_t)(_n6>>32)); \
+    acc7 = _mm512_mask3_fmadd_ps(_av,scv7,acc7,(__mmask16)(uint32_t)(_p7>>32)); \
+    acc7 = _mm512_mask3_fnmadd_ps(_av,scv7,acc7,(__mmask16)(uint32_t)(_n7>>32)); \
 } while(0)
 
 static inline float hsum_zmm(__m512 v) {
@@ -273,7 +430,106 @@ static inline float hsum_zmm(__m512 v) {
     return _mm_cvtss_f32(s4);
 }
 
+void matmul_simd_g128_tiled8(float *A, G128Matrix *B_T, float *C, int M, int K, int N) {
+    int nkb = (int)B_T->num_blocks_col;
+    const float *sf = B_T->scales_f32;
+    const TileBlock8 *tiles = B_T->tiles8;
+    int n8 = (N / 8) * 8;
+    int n_j = n8 / 8;
+    int total_jobs = M * n_j;
+    
+    #ifdef DEBUG
+    assert(N % 8 == 0 && "All production matmul shapes are N%8==0");
+    #endif
+    
+    #pragma omp parallel for schedule(static)
+    for (int idx = 0; idx < total_jobs; idx++) {
+        int i = idx / n_j;
+        int j = (idx % n_j) * 8;
+        __m512 acc0 = _mm512_setzero_ps();
+        __m512 acc1 = _mm512_setzero_ps();
+        __m512 acc2 = _mm512_setzero_ps();
+        __m512 acc3 = _mm512_setzero_ps();
+        __m512 acc4 = _mm512_setzero_ps();
+        __m512 acc5 = _mm512_setzero_ps();
+        __m512 acc6 = _mm512_setzero_ps();
+        __m512 acc7 = _mm512_setzero_ps();
+        int tg = j / 8;
+        
+        for (int bk = 0; bk < nkb; bk++) {
+            int b0=(j+0)*nkb+bk, b1=(j+1)*nkb+bk, b2=(j+2)*nkb+bk, b3=(j+3)*nkb+bk;
+            int b4=(j+4)*nkb+bk, b5=(j+5)*nkb+bk, b6=(j+6)*nkb+bk, b7=(j+7)*nkb+bk;
+            __m512 scv0=_mm512_set1_ps(sf[b0]), scv1=_mm512_set1_ps(sf[b1]);
+            __m512 scv2=_mm512_set1_ps(sf[b2]), scv3=_mm512_set1_ps(sf[b3]);
+            __m512 scv4=_mm512_set1_ps(sf[b4]), scv5=_mm512_set1_ps(sf[b5]);
+            __m512 scv6=_mm512_set1_ps(sf[b6]), scv7=_mm512_set1_ps(sf[b7]);
+            const float *ap = &A[i * K + bk * G128_BLOCK_SIZE];
+            
+            if (bk + 2 < nkb) {
+                const TileBlock8 *tb_pf = &tiles[tg * nkb + bk + 2];
+                _mm_prefetch((const char*)tb_pf,               _MM_HINT_T1);
+                _mm_prefetch((const char*)tb_pf + 64,          _MM_HINT_T1);
+                _mm_prefetch((const char*)tb_pf + 128,         _MM_HINT_T1);
+                _mm_prefetch((const char*)tb_pf + 192,         _MM_HINT_T1);
+                _mm_prefetch((const char*)tb_pf + 256,         _MM_HINT_T1);
+                _mm_prefetch((const char*)tb_pf + 320,         _MM_HINT_T1);
+                _mm_prefetch((const char*)tb_pf + 384,         _MM_HINT_T1);
+                _mm_prefetch((const char*)tb_pf + 448,         _MM_HINT_T1);
+                _mm_prefetch((const char*)tb_pf + 512,         _MM_HINT_T1);
+                _mm_prefetch(ap + G128_BLOCK_SIZE, _MM_HINT_T0);
+            } else if (bk + 1 < nkb) {
+                _mm_prefetch(ap + G128_BLOCK_SIZE, _MM_HINT_T0);
+            }
+            
+            PROCESS_WORD_FUSED8(0, 0);
+            PROCESS_WORD_FUSED8(1, 32);
+            PROCESS_WORD_FUSED8(2, 64);
+            PROCESS_WORD_FUSED8(3, 96);
+        }
+        C[i*N+j+0]=hsum_zmm(acc0); C[i*N+j+1]=hsum_zmm(acc1);
+        C[i*N+j+2]=hsum_zmm(acc2); C[i*N+j+3]=hsum_zmm(acc3);
+        C[i*N+j+4]=hsum_zmm(acc4); C[i*N+j+5]=hsum_zmm(acc5);
+        C[i*N+j+6]=hsum_zmm(acc6); C[i*N+j+7]=hsum_zmm(acc7);
+    }
+    
+    for (int i = 0; i < M; i++) {
+        for (int j = n8; j < N; j++) {
+            __m512 acc = _mm512_setzero_ps();
+            int rb = j * nkb;
+            for (int bk = 0; bk < nkb; bk++) {
+                int bidx = rb + bk;
+                uint64_t pkp0= B_T->packed_pos[bidx*4+0], pkp1= B_T->packed_pos[bidx*4+1];
+                uint64_t pkp2= B_T->packed_pos[bidx*4+2], pkp3= B_T->packed_pos[bidx*4+3];
+                uint64_t pkn0= B_T->packed_neg[bidx*4+0], pkn1= B_T->packed_neg[bidx*4+1];
+                uint64_t pkn2= B_T->packed_neg[bidx*4+2], pkn3= B_T->packed_neg[bidx*4+3];
+                uint32_t cp_lo[4]={(uint32_t)pkp0,(uint32_t)(pkp0>>32),(uint32_t)pkp1,(uint32_t)(pkp1>>32)};
+                uint32_t cp_hi[4]={(uint32_t)pkp2,(uint32_t)(pkp2>>32),(uint32_t)pkp3,(uint32_t)(pkp3>>32)};
+                uint32_t cn_lo[4]={(uint32_t)pkn0,(uint32_t)(pkn0>>32),(uint32_t)pkn1,(uint32_t)(pkn1>>32)};
+                uint32_t cn_hi[4]={(uint32_t)pkn2,(uint32_t)(pkn2>>32),(uint32_t)pkn3,(uint32_t)(pkn3>>32)};
+                __m512 scv = _mm512_set1_ps(sf[bidx]);
+                const float *ap = &A[i * K + bk * G128_BLOCK_SIZE];
+                for (int bi = 0; bi < 4; bi++) {
+                    __m512 av = _mm512_load_ps(ap + bi * 16);
+                    acc = _mm512_mask3_fmadd_ps(av, scv, acc, (__mmask16)cp_lo[bi]);
+                    acc = _mm512_mask3_fnmadd_ps(av, scv, acc, (__mmask16)cn_lo[bi]);
+                }
+                for (int bi = 0; bi < 4; bi++) {
+                    __m512 av = _mm512_load_ps(ap + 64 + bi * 16);
+                    acc = _mm512_mask3_fmadd_ps(av, scv, acc, (__mmask16)cp_hi[bi]);
+                    acc = _mm512_mask3_fnmadd_ps(av, scv, acc, (__mmask16)cn_hi[bi]);
+                }
+            }
+            C[i*N+j] = hsum_zmm(acc);
+        }
+    }
+}
+
 void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) {
+    if (B_T->tiles8 != NULL && B_T->num_tile_groups8 > 0 && N % 8 == 0) {
+        matmul_simd_g128_tiled8(A, B_T, C, M, K, N);
+        return;
+    }
+    
     int nkb = (int)B_T->num_blocks_col;
     const float *sf = B_T->scales_f32;
     const uint64_t *pos = B_T->packed_pos;
@@ -574,6 +830,11 @@ static inline float hsum_avx2(__m256 v) {
 } while(0)
 
 void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) {
+    if (B_T->tiles8 != NULL && B_T->num_tile_groups8 > 0 && N % 8 == 0) {
+        matmul_simd_g128_tiled8_avx2(A, B_T, C, M, K, N);
+        return;
+    }
+    
     init_avx2_lut_once();
     int nkb = (int)B_T->num_blocks_col;
     const float *sf = B_T->scales_f32;
@@ -645,6 +906,142 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
             C[i*N+j+4]=hsum_avx2(acc4); C[i*N+j+5]=hsum_avx2(acc5);
             C[i*N+j+6]=hsum_avx2(acc6); C[i*N+j+7]=hsum_avx2(acc7);
         }
+        for (int j = n8; j < N; j++) {
+            __m256 acc = _mm256_setzero_ps();
+            int rb = j * nkb;
+            for (int bk = 0; bk < nkb; bk++) {
+                int bidx = rb + bk;
+                uint64_t mag0=B_T->magnitude[bidx*2+0], mag1=B_T->magnitude[bidx*2+1];
+                uint64_t sgn0=B_T->sign[bidx*2+0],      sgn1=B_T->sign[bidx*2+1];
+                __m256 ps = _mm256_set1_ps(sf[bidx]);
+                const float *ap = &A[i * K + bk * G128_BLOCK_SIZE];
+                for (int b = 0; b < 64; b += 8)
+                    LUT_ACCUM_AVX2(acc, mag0, sgn0, b, ps, _mm256_loadu_ps(ap + b));
+                for (int b = 0; b < 64; b += 8)
+                    LUT_ACCUM_AVX2(acc, mag1, sgn1, b, ps, _mm256_loadu_ps(ap + 64 + b));
+            }
+            C[i*N+j] = hsum_avx2(acc);
+        }
+    }
+}
+
+#define PROCESS_WORD_AVX2_FUSED(acc, pos_byte, neg_byte, sc, av) do { \
+    __m256 _pm = _mm256_castsi256_ps(                                   \
+        _mm256_load_si256((const __m256i*)avx2_mag_lut[pos_byte]));    \
+    __m256 _nm = _mm256_castsi256_ps(                                   \
+        _mm256_load_si256((const __m256i*)avx2_mag_lut[neg_byte]));    \
+    __m256 _ns = _mm256_xor_ps(sc, _mm256_set1_ps(-0.0f));             \
+    (acc) = _mm256_fmadd_ps(_mm256_and_ps(sc, _pm), (av), (acc));      \
+    (acc) = _mm256_fmadd_ps(_mm256_and_ps(_ns, _nm), (av), (acc));     \
+} while(0)
+
+void matmul_simd_g128_tiled8_avx2(float *A, G128Matrix *B_T, float *C, int M, int K, int N) {
+    init_avx2_lut_once();
+    int nkb = (int)B_T->num_blocks_col;
+    const float *sf = B_T->scales_f32;
+    const TileBlock8 *tiles = B_T->tiles8;
+    int n8 = (N / 8) * 8;
+    int n_j = n8 / 8;
+    int total_jobs = M * n_j;
+    
+    #ifdef DEBUG
+    assert(N % 8 == 0 && "All production matmul shapes are N%8==0");
+    #endif
+    
+    #pragma omp parallel for schedule(static)
+    for (int idx = 0; idx < total_jobs; idx++) {
+        int i = idx / n_j;
+        int j = (idx % n_j) * 8;
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+        __m256 acc2 = _mm256_setzero_ps();
+        __m256 acc3 = _mm256_setzero_ps();
+        __m256 acc4 = _mm256_setzero_ps();
+        __m256 acc5 = _mm256_setzero_ps();
+        __m256 acc6 = _mm256_setzero_ps();
+        __m256 acc7 = _mm256_setzero_ps();
+        int tg = j / 8;
+        
+        for (int bk = 0; bk < nkb; bk++) {
+            int b0=(j+0)*nkb+bk, b1=(j+1)*nkb+bk, b2=(j+2)*nkb+bk, b3=(j+3)*nkb+bk;
+            int b4=(j+4)*nkb+bk, b5=(j+5)*nkb+bk, b6=(j+6)*nkb+bk, b7=(j+7)*nkb+bk;
+            __m256 sc0=_mm256_set1_ps(sf[b0]), sc1=_mm256_set1_ps(sf[b1]);
+            __m256 sc2=_mm256_set1_ps(sf[b2]), sc3=_mm256_set1_ps(sf[b3]);
+            __m256 sc4=_mm256_set1_ps(sf[b4]), sc5=_mm256_set1_ps(sf[b5]);
+            __m256 sc6=_mm256_set1_ps(sf[b6]), sc7=_mm256_set1_ps(sf[b7]);
+            __m256 ns0=_mm256_xor_ps(sc0, _mm256_set1_ps(-0.0f));
+            __m256 ns1=_mm256_xor_ps(sc1, _mm256_set1_ps(-0.0f));
+            __m256 ns2=_mm256_xor_ps(sc2, _mm256_set1_ps(-0.0f));
+            __m256 ns3=_mm256_xor_ps(sc3, _mm256_set1_ps(-0.0f));
+            __m256 ns4=_mm256_xor_ps(sc4, _mm256_set1_ps(-0.0f));
+            __m256 ns5=_mm256_xor_ps(sc5, _mm256_set1_ps(-0.0f));
+            __m256 ns6=_mm256_xor_ps(sc6, _mm256_set1_ps(-0.0f));
+            __m256 ns7=_mm256_xor_ps(sc7, _mm256_set1_ps(-0.0f));
+            const float *ap = &A[i * K + bk * G128_BLOCK_SIZE];
+            
+            if (bk + 2 < nkb) {
+                const TileBlock8 *tb_pf = &tiles[tg * nkb + bk + 2];
+                _mm_prefetch((const char*)tb_pf, _MM_HINT_T1);
+                _mm_prefetch((const char*)tb_pf + 64, _MM_HINT_T1);
+                _mm_prefetch((const char*)tb_pf + 128, _MM_HINT_T1);
+                _mm_prefetch((const char*)tb_pf + 192, _MM_HINT_T1);
+                _mm_prefetch((const char*)tb_pf + 256, _MM_HINT_T1);
+                _mm_prefetch((const char*)tb_pf + 320, _MM_HINT_T1);
+                _mm_prefetch((const char*)tb_pf + 384, _MM_HINT_T1);
+                _mm_prefetch((const char*)tb_pf + 448, _MM_HINT_T1);
+                _mm_prefetch((const char*)tb_pf + 512, _MM_HINT_T1);
+                _mm_prefetch(ap + G128_BLOCK_SIZE, _MM_HINT_T0);
+            } else if (bk + 1 < nkb) {
+                _mm_prefetch(ap + G128_BLOCK_SIZE, _MM_HINT_T0);
+            }
+            
+            const TileBlock8 *tb = &tiles[tg * nkb + bk];
+            for (int b = 0; b < 64; b += 8) {
+                __m256 av = _mm256_loadu_ps(ap + b);
+                uint8_t p0=((uint8_t*)tb->pos[0])[b/8], n0=((uint8_t*)tb->neg[0])[b/8];
+                uint8_t p1=((uint8_t*)tb->pos[1])[b/8], n1=((uint8_t*)tb->neg[1])[b/8];
+                uint8_t p2=((uint8_t*)tb->pos[2])[b/8], n2=((uint8_t*)tb->neg[2])[b/8];
+                uint8_t p3=((uint8_t*)tb->pos[3])[b/8], n3=((uint8_t*)tb->neg[3])[b/8];
+                uint8_t p4=((uint8_t*)tb->pos[4])[b/8], n4=((uint8_t*)tb->neg[4])[b/8];
+                uint8_t p5=((uint8_t*)tb->pos[5])[b/8], n5=((uint8_t*)tb->neg[5])[b/8];
+                uint8_t p6=((uint8_t*)tb->pos[6])[b/8], n6=((uint8_t*)tb->neg[6])[b/8];
+                uint8_t p7=((uint8_t*)tb->pos[7])[b/8], n7=((uint8_t*)tb->neg[7])[b/8];
+                PROCESS_WORD_AVX2_FUSED(acc0, p0, n0, sc0, av);
+                PROCESS_WORD_AVX2_FUSED(acc1, p1, n1, sc1, av);
+                PROCESS_WORD_AVX2_FUSED(acc2, p2, n2, sc2, av);
+                PROCESS_WORD_AVX2_FUSED(acc3, p3, n3, sc3, av);
+                PROCESS_WORD_AVX2_FUSED(acc4, p4, n4, sc4, av);
+                PROCESS_WORD_AVX2_FUSED(acc5, p5, n5, sc5, av);
+                PROCESS_WORD_AVX2_FUSED(acc6, p6, n6, sc6, av);
+                PROCESS_WORD_AVX2_FUSED(acc7, p7, n7, sc7, av);
+            }
+            for (int b = 0; b < 64; b += 8) {
+                __m256 av = _mm256_loadu_ps(ap + 64 + b);
+                uint8_t p0=((uint8_t*)tb->pos[0])[8+b/8], n0=((uint8_t*)tb->neg[0])[8+b/8];
+                uint8_t p1=((uint8_t*)tb->pos[1])[8+b/8], n1=((uint8_t*)tb->neg[1])[8+b/8];
+                uint8_t p2=((uint8_t*)tb->pos[2])[8+b/8], n2=((uint8_t*)tb->neg[2])[8+b/8];
+                uint8_t p3=((uint8_t*)tb->pos[3])[8+b/8], n3=((uint8_t*)tb->neg[3])[8+b/8];
+                uint8_t p4=((uint8_t*)tb->pos[4])[8+b/8], n4=((uint8_t*)tb->neg[4])[8+b/8];
+                uint8_t p5=((uint8_t*)tb->pos[5])[8+b/8], n5=((uint8_t*)tb->neg[5])[8+b/8];
+                uint8_t p6=((uint8_t*)tb->pos[6])[8+b/8], n6=((uint8_t*)tb->neg[6])[8+b/8];
+                uint8_t p7=((uint8_t*)tb->pos[7])[8+b/8], n7=((uint8_t*)tb->neg[7])[8+b/8];
+                PROCESS_WORD_AVX2_FUSED(acc0, p0, n0, sc0, av);
+                PROCESS_WORD_AVX2_FUSED(acc1, p1, n1, sc1, av);
+                PROCESS_WORD_AVX2_FUSED(acc2, p2, n2, sc2, av);
+                PROCESS_WORD_AVX2_FUSED(acc3, p3, n3, sc3, av);
+                PROCESS_WORD_AVX2_FUSED(acc4, p4, n4, sc4, av);
+                PROCESS_WORD_AVX2_FUSED(acc5, p5, n5, sc5, av);
+                PROCESS_WORD_AVX2_FUSED(acc6, p6, n6, sc6, av);
+                PROCESS_WORD_AVX2_FUSED(acc7, p7, n7, sc7, av);
+            }
+        }
+        C[i*N+j+0]=hsum_avx2(acc0); C[i*N+j+1]=hsum_avx2(acc1);
+        C[i*N+j+2]=hsum_avx2(acc2); C[i*N+j+3]=hsum_avx2(acc3);
+        C[i*N+j+4]=hsum_avx2(acc4); C[i*N+j+5]=hsum_avx2(acc5);
+        C[i*N+j+6]=hsum_avx2(acc6); C[i*N+j+7]=hsum_avx2(acc7);
+    }
+    
+    for (int i = 0; i < M; i++) {
         for (int j = n8; j < N; j++) {
             __m256 acc = _mm256_setzero_ps();
             int rb = j * nkb;

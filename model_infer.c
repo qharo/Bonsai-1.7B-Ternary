@@ -122,6 +122,29 @@ static int load_g128(G128Matrix *m, const char *base) {
 #undef PK16
     }
 
+    // Build 8-row tiled layout for optimized matmul
+    m->num_tile_groups8 = m->num_rows / 8;
+    m->total_tiles8 = (uint32_t)(m->num_tile_groups8 * m->num_blocks_col);
+    if (m->num_tile_groups8 > 0 && m->total_tiles8 > 0) {
+        posix_memalign((void**)&m->tiles8, 64, 
+            m->total_tiles8 * sizeof(TileBlock8));
+        
+        for (uint64_t tg = 0; tg < m->num_tile_groups8; tg++) {
+            for (uint32_t bk = 0; bk < m->num_blocks_col; bk++) {
+                TileBlock8 *tb = &m->tiles8[tg * m->num_blocks_col + bk];
+                for (int r = 0; r < 8; r++) {
+                    uint64_t row = tg * 8 + r;
+                    uint64_t bi = row * m->num_blocks_col + bk;
+                    for (int w = 0; w < 4; w++) {
+                        tb->pos[r][w] = m->packed_pos[bi*4 + w];
+                        tb->neg[r][w] = m->packed_neg[bi*4 + w];
+                    }
+                    tb->scales[r] = m->scales_f32[bi];
+                }
+            }
+        }
+    }
+
     return 0;
 }
 
@@ -382,12 +405,39 @@ int model_load(ModelState *s, const char *dir) {
     }
     s->attn_scale = 1.0f + 0.1f * logf(4.0f);
 
+    // Log tiling status for deployment verification
+    uint64_t total_tiles = 0;
+    size_t tile_memory = 0;
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        total_tiles += s->layers[i].q_proj.total_tiles8;
+        total_tiles += s->layers[i].k_proj.total_tiles8;
+        total_tiles += s->layers[i].v_proj.total_tiles8;
+        total_tiles += s->layers[i].o_proj.total_tiles8;
+        total_tiles += s->layers[i].gate_proj.total_tiles8;
+        total_tiles += s->layers[i].up_proj.total_tiles8;
+        total_tiles += s->layers[i].down_proj.total_tiles8;
+        tile_memory += s->layers[i].q_proj.total_tiles8 * sizeof(TileBlock8);
+        tile_memory += s->layers[i].k_proj.total_tiles8 * sizeof(TileBlock8);
+        tile_memory += s->layers[i].v_proj.total_tiles8 * sizeof(TileBlock8);
+        tile_memory += s->layers[i].o_proj.total_tiles8 * sizeof(TileBlock8);
+        tile_memory += s->layers[i].gate_proj.total_tiles8 * sizeof(TileBlock8);
+        tile_memory += s->layers[i].up_proj.total_tiles8 * sizeof(TileBlock8);
+        tile_memory += s->layers[i].down_proj.total_tiles8 * sizeof(TileBlock8);
+    }
+    fprintf(stderr, "[TILING] 8-row tiles: %llu blocks, %.2f MB\n", 
+            (unsigned long long)total_tiles, tile_memory / (1024.0 * 1024.0));
+    fprintf(stderr, "[TILING] AVX-512 tiled kernel: %s\n", 
+            (total_tiles > 0) ? "ACTIVE" : "FALLBACK");
+
     s->loaded = true;
     return 0;
 }
 
 static void free_g128(G128Matrix *m) {
-    free(m->magnitude); free(m->sign); free(m->packed_pos); free(m->packed_neg); free(m->scales); free(m->scales_f32);
+    free(m->magnitude); free(m->sign); 
+    free(m->packed_pos); free(m->packed_neg); 
+    free(m->scales); free(m->scales_f32);
+    free(m->tiles8);
 }
 
 void model_free(ModelState *s) {
@@ -413,7 +463,7 @@ int model_prefill(ModelState *s, int32_t *tokens, int n, float *logits) {
 
     for (int i = 0; i < n; i++) {
         int tid = tokens[i];
-        if (tid < 0 || tid >= s->embed.num_rows) return -1;
+        if (tid < 0 || (uint32_t)tid >= s->embed.num_rows) return -1;
         embed_lookup(&s->embed, tid, &s->hidden[i*HIDDEN_SIZE]);
     }
 
@@ -435,7 +485,7 @@ int model_prefill(ModelState *s, int32_t *tokens, int n, float *logits) {
 
 int model_decode(ModelState *s, int32_t token, float *logits) {
     if (!s->loaded) return -1;
-    if (token < 0 || token >= s->embed.num_rows) return -1;
+    if (token < 0 || (uint32_t)token >= s->embed.num_rows) return -1;
 
     uint64_t _tstart = now_ns();
     embed_lookup(&s->embed, token, s->hidden);

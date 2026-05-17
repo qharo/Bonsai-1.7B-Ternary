@@ -277,6 +277,17 @@ class StopRequest(BaseModel):
 
 _stop_flags: dict[str, bool] = {}
 
+def _is_tiled_active():
+    if not _model or not _model.loaded:
+        return False
+    try:
+        for i in range(28):
+            if _model.layers[i].q_proj.tiles8 is not None:
+                return True
+    except Exception:
+        pass
+    return False
+
 def np_softmax(x):
     e = np.exp(x - np.max(x))
     return e / e.sum()
@@ -343,17 +354,18 @@ async def generate(req: GenerateRequest):
         full_text = ""
         n_tokens = 0
         start = time.perf_counter()
+        kernel_type = "tiled8" if _is_tiled_active() else "fallback"
         for token in generate_tokens(tokens, req.max_new_tokens, req.temperature, req.top_p, req.top_k, stop_ids):
             if token == STOP_EOS:
                 break
             txt = _tokenizer.decode([token], skip_special_tokens=True)
             full_text += txt
             n_tokens += 1
-            yield f"data: {json.dumps({'token': txt, 'full': full_text})}\n\n"
+            yield f"data: {json.dumps({'token': txt, 'full': full_text, 'kernel_type': kernel_type})}\n\n"
         elapsed = time.perf_counter() - start
         tps = n_tokens / elapsed if elapsed > 0 else 0.0
         log_profile(f"generate: {n_tokens} tokens, {tps:.1f} t/s")
-        yield f"data: {json.dumps({'done': True, 'full': full_text, 'tokens_generated': n_tokens, 'total_time_s': round(elapsed, 3), 'tokens_per_second': round(tps, 2)})}\n\n"
+        yield f"data: {json.dumps({'done': True, 'full': full_text, 'tokens_generated': n_tokens, 'total_time_s': round(elapsed, 3), 'tokens_per_second': round(tps, 2), 'kernel_type': kernel_type})}\n\n"
 
     return StreamingResponse(generate_and_decode(), media_type="text/event-stream")
 
@@ -733,6 +745,17 @@ async def profile_reset():
 
 @app.get("/model/info")
 async def model_info():
+    tiled_active = False
+    if _model and _model.loaded:
+        try:
+            for i in range(28):
+                layer = _model.layers[i]
+                if layer.q_proj.tiles8 is not None:
+                    tiled_active = True
+                    break
+        except Exception:
+            pass
+    
     info = {
         "llm": {
             "vocab_size": _model.embed.num_rows if _model else None,
@@ -748,6 +771,8 @@ async def model_info():
             "frame_rate": _tts.frame_rate,
             "voices": list(_tts.predefined_voices),
         } if _tts else {"error": "TTS not loaded"},
+        "tiled_kernel_active": tiled_active,
+        "matmul_backend": "avx512_tiled8" if tiled_active else "avx512_fallback" if _model else None,
     }
     return info
 

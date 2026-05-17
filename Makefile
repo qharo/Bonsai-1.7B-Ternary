@@ -1,6 +1,12 @@
 CC = clang
-CFLAGS = -O3 -std=c11 -Wall -Wextra -fPIC -march=native -ffast-math -fopenmp
+CFLAGS = -O3 -std=c11 -Wall -Wextra -fPIC -march=native -ffast-math
 FRAMEWORKS = -framework Accelerate
+
+# Add OpenMP on Linux only
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Linux)
+    CFLAGS += -fopenmp
+endif
 
 MATMUL_FILES = matmul_naive.c matmul_bitnet.c matmul_simd.c matmul_swar.c matmul_lut.c
 
