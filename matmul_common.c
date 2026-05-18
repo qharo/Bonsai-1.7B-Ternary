@@ -695,6 +695,7 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
 void lm_head_prefilter(float *A, G128Matrix *B_T, float *C, int N, int max_blocks) {
     int nkb = (int)B_T->num_blocks_col;
     if (max_blocks > nkb) max_blocks = nkb;
+    if (N > (int)B_T->num_rows) N = (int)B_T->num_rows;
     const float *sf = B_T->scales_f32;
     const uint64_t *pos = B_T->packed_pos;
     const uint64_t *neg = B_T->packed_neg;
@@ -768,6 +769,7 @@ void matmul_g128_selected(float *A, G128Matrix *B_T, float *C, int M, int K, int
     const float *sf = B_T->scales_f32;
     const uint64_t *pos = B_T->packed_pos;
     const uint64_t *neg = B_T->packed_neg;
+    int max_row = (int)B_T->num_rows;
     for (int i = 0; i < M; i++) {
         int n8 = (N_sel / 8) * 8;
         #pragma omp parallel for schedule(static) if(n8 >= 128)
@@ -806,6 +808,7 @@ void matmul_g128_selected(float *A, G128Matrix *B_T, float *C, int M, int K, int
         }
         for (int si = n8; si < N_sel; si++) {
             int r = sel_rows[si];
+            if (r < 0 || r >= max_row) continue;
             __m512 acc = _mm512_setzero_ps();
             int rb = r * nkb;
             for (int bk = 0; bk < nkb; bk++) {
@@ -836,11 +839,11 @@ void matmul_g128_selected(float *A, G128Matrix *B_T, float *C, int M, int K, int
     }
 }
 
-void find_top_k(float *scores, int N, int K, int *out_indices) {
+void find_top_k(float *scores, int N, int K, int *out_indices, void *heap_buffer) {
     if (K > N) K = N;
     if (K <= 0) return;
     typedef struct { float score; int idx; } pair_t;
-    pair_t *heap = (pair_t*)malloc((size_t)K * sizeof(pair_t));
+    pair_t *heap = heap_buffer ? (pair_t*)heap_buffer : (pair_t*)malloc((size_t)K * sizeof(pair_t));
     for (int i = 0; i < K; i++) {
         heap[i].score = scores[i];
         heap[i].idx = i;
@@ -876,7 +879,7 @@ void find_top_k(float *scores, int N, int K, int *out_indices) {
         }
     }
     for (int i = 0; i < K; i++) out_indices[i] = heap[i].idx;
-    free(heap);
+    if (!heap_buffer) free(heap);
 }
 
 const int lm_head_prefilter_available = 1;
@@ -1367,8 +1370,8 @@ void lm_head_prefilter(float *A, G128Matrix *B_T, float *C, int N, int max_block
 void matmul_g128_selected(float *A, G128Matrix *B_T, float *C, int M, int K, int N_full, int N_sel, const int *sel_rows) {
     (void)A; (void)B_T; (void)C; (void)M; (void)K; (void)N_full; (void)N_sel; (void)sel_rows;
 }
-void find_top_k(float *scores, int N, int K, int *out_indices) {
-    (void)scores;
+void find_top_k(float *scores, int N, int K, int *out_indices, void *heap_buffer) {
+    (void)scores; (void)heap_buffer;
     for (int i = 0; i < K && i < N; i++) out_indices[i] = i;
 }
 const int lm_head_prefilter_available = 0;

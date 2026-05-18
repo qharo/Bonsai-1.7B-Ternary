@@ -56,6 +56,7 @@ typedef struct {
     float *gate_out, *up_out, *mlp_act;
     float *approx_logits;
     int lm_head_candidates[LM_HEAD_CANDIDATES];
+    void *topk_heap;
     float kv_k[NUM_LAYERS][NUM_KV_HEADS][MAX_SEQ_LEN][HEAD_DIM];
     float kv_v[NUM_LAYERS][NUM_KV_HEADS][MAX_SEQ_LEN][HEAD_DIM];
     float rope_cos[MAX_SEQ_LEN][HEAD_DIM/2];

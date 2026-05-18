@@ -5,6 +5,8 @@ import os
 import json
 import ctypes
 import time
+import signal
+import sys
 import asyncio
 import concurrent.futures
 import numpy as np
@@ -117,6 +119,7 @@ def load_library():
             ("mlp_act", ctypes.c_void_p),
             ("approx_logits", ctypes.c_void_p),
             ("lm_head_candidates", ctypes.c_int * 16384),
+            ("topk_heap", ctypes.c_void_p),
             ("kv_k", ctypes.c_float * (28 * 512 * 8 * 128)),
             ("kv_v", ctypes.c_float * (28 * 512 * 8 * 128)),
             ("rope_cos", ctypes.c_float * (512 * 64)),
@@ -226,6 +229,7 @@ def init_model():
     ret = _lib.model_load(ctypes.byref(_model), MODEL_DIR.encode())
     if ret != 0:
         raise RuntimeError(f"Failed to load model from {MODEL_DIR}")
+    signal.signal(signal.SIGSEGV, _sigsegv_handler)
     if hasattr(_lib, 'avx512_diagnostic'):
         _lib.avx512_diagnostic.argtypes = []
         _lib.avx512_diagnostic.restype = None
@@ -669,16 +673,26 @@ def _format_profile(p):
         },
     }
 
+def _sigsegv_handler(signum, frame):
+    print(f"[FATAL] SIGSEGV received at {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print("[FATAL] This is likely a memory corruption bug in inference.so", flush=True)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(139)
+
 def log_profile(label=""):
     if not _model:
         return
-    p = ProfileStats()
-    _lib.model_get_profile(ctypes.byref(_model), ctypes.byref(p))
-    d = _format_profile(p)
-    d["label"] = label
-    d["prefill_s"] = round(_last_prefill_s, 3)
-    d["prompt_tokens"] = _last_prompt_tokens
-    print(f"[PROFILE] {json.dumps(d)}", flush=True)
+    try:
+        p = ProfileStats()
+        _lib.model_get_profile(ctypes.byref(_model), ctypes.byref(p))
+        d = _format_profile(p)
+        d["label"] = label
+        d["prefill_s"] = round(_last_prefill_s, 3)
+        d["prompt_tokens"] = _last_prompt_tokens
+        print(f"[PROFILE] {json.dumps(d)}", flush=True)
+    except Exception as e:
+        print(f"[PROFILE ERROR] {label}: {e}", flush=True)
 
 def log_startup_diagnostics(load_s, tts_load_s):
     diag = {

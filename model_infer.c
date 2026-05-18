@@ -464,6 +464,7 @@ int model_load(ModelState *s, const char *dir) {
     s->up_out       = aligned_calloc(64, (size_t)MAX_SEQ_LEN * INTERMEDIATE_SIZE * 4);
     s->mlp_act      = aligned_calloc(64, (size_t)MAX_SEQ_LEN * INTERMEDIATE_SIZE * 4);
     s->approx_logits = aligned_calloc(64, (size_t)VOCAB_SIZE * 4);
+    s->topk_heap     = aligned_calloc(64, (size_t)LM_HEAD_CANDIDATES * 8);
 
     // YaRN RoPE: blend interpolated (low-freq) and extrapolated (high-freq) inv_freq
     {
@@ -546,6 +547,7 @@ void model_free(ModelState *s) {
     free(s->attn_weights);
     free(s->gate_out); free(s->up_out); free(s->mlp_act);
     free(s->approx_logits);
+    free(s->topk_heap);
 }
 
 int model_prefill(ModelState *s, int32_t *tokens, int n, float *logits) {
@@ -565,7 +567,7 @@ int model_prefill(ModelState *s, int32_t *tokens, int n, float *logits) {
     int vocab_n = (int)s->embed.num_rows;
     if (lm_head_prefilter_available) {
         lm_head_prefilter(s->normalized, &s->embed, s->approx_logits, vocab_n, LM_HEAD_PREFILTER_BLOCKS);
-        find_top_k(s->approx_logits, vocab_n, LM_HEAD_CANDIDATES, s->lm_head_candidates);
+        find_top_k(s->approx_logits, vocab_n, LM_HEAD_CANDIDATES, s->lm_head_candidates, s->topk_heap);
         for (int i = 0; i < vocab_n; i++) logits[i] = -1e38f;
         matmul_g128_selected(s->normalized, &s->embed, logits, 1, HIDDEN_SIZE, vocab_n,
                             LM_HEAD_CANDIDATES, s->lm_head_candidates);
@@ -595,7 +597,7 @@ int model_decode(ModelState *s, int32_t token, float *logits) {
         // Phase 1: approximate scores from first N blocks of dimensions
         lm_head_prefilter(s->normalized, &s->embed, s->approx_logits, vocab_n, LM_HEAD_PREFILTER_BLOCKS);
         // Phase 2: find top-K candidate rows
-        find_top_k(s->approx_logits, vocab_n, LM_HEAD_CANDIDATES, s->lm_head_candidates);
+        find_top_k(s->approx_logits, vocab_n, LM_HEAD_CANDIDATES, s->lm_head_candidates, s->topk_heap);
         // Phase 3: zero out all logits, then compute exact full-dim scores for candidates
         for (int i = 0; i < vocab_n; i++) logits[i] = -1e38f;
         matmul_g128_selected(s->normalized, &s->embed, logits, 1, HIDDEN_SIZE, vocab_n, LM_HEAD_CANDIDATES, s->lm_head_candidates);

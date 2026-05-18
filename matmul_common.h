@@ -46,5 +46,5 @@ void matmul_lut_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N);
 extern const int lm_head_prefilter_available;
 void lm_head_prefilter(float *A, G128Matrix *B_T, float *C, int N, int max_blocks);
 void matmul_g128_selected(float *A, G128Matrix *B_T, float *C, int M, int K, int N_full, int N_sel, const int *sel_rows);
-void find_top_k(float *scores, int N, int K, int *out_indices);
+void find_top_k(float *scores, int N, int K, int *out_indices, void *heap_buffer);
 void avx512_diagnostic(void);
