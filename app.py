@@ -482,9 +482,10 @@ async def generate_voice(req: GenerateRequest):
         start = time.perf_counter()
         pending = []
         
-        # Incremental phoneme accumulation (spread g2p workload across generation)
-        pending_phones = []  # List of (phone_ids, tone_ids, lang_ids) tuples
-        token_counter = 0
+        # Word-buffered phoneme accumulation (spread g2p workload, but phonemize complete words only)
+        pending_phones = []  # List of (phone_ids, tone_ids, lang_ids) tuples from complete words
+        word_buffer = ""  # Accumulate token fragments until we have complete words
+        last_sentence_end = 0  # Track where we last submitted phonemes
         
         # Profiling counters
         phonemize_count = 0
@@ -503,21 +504,40 @@ async def generate_voice(req: GenerateRequest):
                 txt = _tokenizer.decode([token], skip_special_tokens=True)
                 full_text += txt
                 n_tokens += 1
-                token_counter += 1
                 
-                # Phonemize every 2-3 tokens to spread g2p workload
-                # This is FAST (~1ms) and prevents processing spikes at sentence boundaries
-                if token_counter >= 2 or token == STOP_EOS:
-                    try:
-                        t0 = time.perf_counter()
-                        phone_ids, tone_ids, lang_ids = _tts.phonemize(txt)
-                        t1 = time.perf_counter()
-                        phonemize_count += 1
-                        phonemize_total_ms += (t1 - t0) * 1000
-                        pending_phones.append((phone_ids, tone_ids, lang_ids))
-                    except Exception as e:
-                        print(f"Phonemize error: {e}")
-                    token_counter = 0
+                # Accumulate token fragments in word buffer
+                word_buffer += txt
+                
+                # Check if we have complete word(s) to phonemize
+                # A complete word ends with space or punctuation
+                if word_buffer and (word_buffer[-1] in ' \n\t.,!?;:'):
+                    # Extract complete words from buffer (leave incomplete fragment)
+                    stripped = word_buffer.rstrip()
+                    if stripped:
+                        # Find last word boundary
+                        last_space = max(stripped.rfind(' '), stripped.rfind('\n'), stripped.rfind('\t'))
+                        if last_space >= 0:
+                            complete_words = stripped[:last_space + 1]
+                            remaining = stripped[last_space + 1:]
+                        else:
+                            complete_words = stripped
+                            remaining = ""
+                        
+                        # Phonemize complete words only (no padding - we'll add it once at sentence boundary)
+                        if complete_words:
+                            try:
+                                t0 = time.perf_counter()
+                                phone_ids, tone_ids, lang_ids = _tts.phonemize(complete_words, add_padding=False)
+                                t1 = time.perf_counter()
+                                phonemize_count += 1
+                                phonemize_total_ms += (t1 - t0) * 1000
+                                pending_phones.append((phone_ids, tone_ids, lang_ids))
+                            except Exception as e:
+                                print(f"Phonemize error: {e}")
+                        
+                        word_buffer = remaining
+                    else:
+                        word_buffer = ""
 
                 # Drain completed TTS futures — yield audio events as they finish
                 while pending and pending[0][0].done():
@@ -542,15 +562,31 @@ async def generate_voice(req: GenerateRequest):
                     sentence_end = boundaries[-1]
                     sentence_text = full_text[last_boundary:sentence_end + 1].strip()
                     if sentence_text and len(sentence_text) > 3:
-                        # Flatten accumulated phoneme IDs for this sentence
+                        # Phonemize any remaining word buffer before sentence boundary
+                        if word_buffer.strip():
+                            try:
+                                t0 = time.perf_counter()
+                                phone_ids, tone_ids, lang_ids = _tts.phonemize(word_buffer.strip(), add_padding=False)
+                                t1 = time.perf_counter()
+                                phonemize_count += 1
+                                phonemize_total_ms += (t1 - t0) * 1000
+                                pending_phones.append((phone_ids, tone_ids, lang_ids))
+                            except Exception as e:
+                                print(f"Phonemize error: {e}")
+                            word_buffer = ""
+                        
+                        # Flatten accumulated phoneme IDs and add sentence-level padding
                         if pending_phones:
-                            all_phones = []
-                            all_tones = []
-                            all_langs = []
+                            all_phones = ["_"]  # Start padding
+                            all_tones = [0]
+                            all_langs = [2]
                             for p_ids, t_ids, l_ids in pending_phones:
                                 all_phones.extend(p_ids)
                                 all_tones.extend(t_ids)
                                 all_langs.extend(l_ids)
+                            all_phones.append("_")  # End padding
+                            all_tones.append(0)
+                            all_langs.append(2)
                             future = tts_pool.submit(_tts.generate_from_phones, all_phones, all_tones, all_langs, voice=req.voice)
                         else:
                             # Fallback to text-based generation if no phonemes accumulated
@@ -562,19 +598,34 @@ async def generate_voice(req: GenerateRequest):
                 token_payload = json.dumps({'token': txt, 'full': full_text})
                 yield f"data: {token_payload}\n\n"
 
+            # Phonemize any remaining word buffer
+            if word_buffer.strip():
+                try:
+                    t0 = time.perf_counter()
+                    phone_ids, tone_ids, lang_ids = _tts.phonemize(word_buffer.strip(), add_padding=False)
+                    t1 = time.perf_counter()
+                    phonemize_count += 1
+                    phonemize_total_ms += (t1 - t0) * 1000
+                    pending_phones.append((phone_ids, tone_ids, lang_ids))
+                except Exception as e:
+                    print(f"Phonemize error: {e}")
+            
             # Remaining text after last sentence boundary
             if last_boundary < len(full_text):
                 remaining = full_text[last_boundary:].strip()
                 if remaining:
-                    # Use accumulated phonemes for final segment
+                    # Use accumulated phonemes for final segment with proper padding
                     if pending_phones:
-                        all_phones = []
-                        all_tones = []
-                        all_langs = []
+                        all_phones = ["_"]  # Start padding
+                        all_tones = [0]
+                        all_langs = [2]
                         for p_ids, t_ids, l_ids in pending_phones:
                             all_phones.extend(p_ids)
                             all_tones.extend(t_ids)
                             all_langs.extend(l_ids)
+                        all_phones.append("_")  # End padding
+                        all_tones.append(0)
+                        all_langs.append(2)
                         future = tts_pool.submit(_tts.generate_from_phones, all_phones, all_tones, all_langs, voice=req.voice)
                     else:
                         future = tts_pool.submit(_tts.generate, remaining, voice=req.voice)

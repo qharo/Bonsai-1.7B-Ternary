@@ -162,10 +162,14 @@ class TinyTTSOnnx:
 
         return phone_ids, tone_ids, lang_ids
 
-    def phonemize(self, text: str):
+    def phonemize(self, text: str, add_padding: bool = False):
         """
-        Convert text to phoneme IDs (without padding/blanks).
-        This is FAST (~1ms per token) and can run during LLM generation.
+        Convert text to phoneme IDs.
+        This is FAST (~1ms per word) and can run during LLM generation.
+        Args:
+            text: Text to phonemize
+            add_padding: If True, adds "_" padding at start/end (for single-phrase generation)
+                         If False, returns raw phonemes (for accumulation across multiple calls)
         Returns tuple: (phone_ids, tone_ids, lang_ids) - lists of integers
         """
         text = text.strip().lower()
@@ -200,8 +204,9 @@ class TinyTTSOnnx:
                     phones.append(_map_phoneme(ph))
                     tones.append(0)
 
-        phones = ["_"] + phones + ["_"]
-        tones = [0] + tones + [0]
+        if add_padding:
+            phones = ["_"] + phones + ["_"]
+            tones = [0] + tones + [0]
 
         phone_ids = [_SYM_TO_ID.get(ph, _UNK_ID) for ph in phones]
         tone_ids = [t + _EN_TONE_OFFSET for t in tones]
