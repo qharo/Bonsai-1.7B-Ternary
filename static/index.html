@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Bonsai 1.7B</title>
+<title>Bonsai 1.7B — A 1.58-bit Ternary LLM</title>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -98,7 +98,9 @@ header {
 }
 .welcome-icon { font-size: 44px; }
 .welcome h2   { font-size: 20px; font-weight: 600; color: var(--text); }
-.welcome p    { font-size: 13px; max-width: 300px; line-height: 1.65; }
+.welcome p    { font-size: 13px; max-width: 340px; line-height: 1.65; }
+.welcome a    { color: var(--accent); text-decoration: none; }
+.welcome a:hover { text-decoration: underline; }
 
 /* Message rows */
 .row {
@@ -116,7 +118,6 @@ header {
   line-height: 1.65;
   white-space: pre-wrap;
   word-break: break-word;
-  position: relative;
 }
 
 .row.user .bubble {
@@ -132,58 +133,6 @@ header {
 }
 
 .row.bot .bubble.error { color: var(--error); }
-
-/* Audio controls in bot bubble */
-.audio-controls {
-  position: absolute;
-  top: 6px;
-  right: 6px;
-  display: flex;
-  gap: 4px;
-  opacity: 0;
-  transition: opacity 0.2s;
-}
-
-.row.bot:hover .audio-controls {
-  opacity: 1;
-}
-
-.audio-btn {
-  width: 28px;
-  height: 28px;
-  border-radius: 6px;
-  border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--text);
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 14px;
-  transition: all 0.15s;
-}
-
-.audio-btn:hover {
-  background: var(--surface2);
-  border-color: var(--accent);
-}
-
-.audio-btn.playing {
-  background: var(--accent);
-  color: var(--bg);
-  border-color: var(--accent);
-}
-
-.audio-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-/* Word highlighting */
-.word-spoken {
-  color: var(--accent);
-  font-weight: 600;
-}
 
 /* Blinking cursor */
 .cursor {
@@ -262,37 +211,6 @@ textarea::placeholder { color: var(--muted); }
 .send:hover:not(:disabled), .stop:hover:not(:disabled) {
   opacity: .82;
 }
-
-.test-audio-btn {
-  background: var(--surface2);
-  border: 1px solid var(--border);
-  border-radius: 20px;
-  padding: 4px 11px;
-  font-size: 12px;
-  color: var(--text);
-  cursor: pointer;
-  white-space: nowrap;
-  transition: all 0.15s;
-}
-.test-audio-btn:hover {
-  background: var(--accent);
-  border-color: var(--accent);
-}
-
-.voice-btn {
-  background: var(--surface2);
-  border: 1px solid var(--border);
-  border-radius: var(--r);
-  width: 44px; height: 44px;
-  display: flex; align-items: center; justify-content: center;
-  cursor: pointer;
-  flex-shrink: 0;
-  font-size: 18px;
-  transition: all 0.15s;
-  color: var(--text);
-}
-.voice-btn:hover { background: var(--surface); border-color: var(--accent); }
-.voice-btn.tts-off { opacity: 0.38; }
 </style>
 </head>
 <body>
@@ -301,26 +219,26 @@ textarea::placeholder { color: var(--muted); }
   <span class="h-logo">🌿</span>
   <div>
     <div class="h-title">Bonsai 1.7B</div>
-    <div class="h-sub">A ternary model-based AI assistant.</div>
+    <div class="h-sub">A 1.58-bit ternary LLM</div>
   </div>
   <div class="h-badge">
     <div class="live-dot"></div>
     <span id="badge-text">live</span>
   </div>
-  <button class="test-audio-btn" id="test-audio-btn" title="Test Audio Playback" style="display:none">🔊 Test</button>
 </header>
 
 <div class="messages" id="msgs">
   <div class="welcome" id="welcome">
     <div class="welcome-icon">🌿</div>
     <h2>Bonsai 1.7B</h2>
-    <p>A ternary model-based AI assistant.<br>Model: prism-ml/Ternary-Bonsai-1.7B-gguf</p>
+    <p>A 1.58-bit ternary language model.<br>
+       Model: <a href="https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-mlx-2bit" target="_blank" rel="noopener">prism-ml/Ternary-Bonsai-1.7B-mlx-2bit</a><br>
+       by <a href="https://huggingface.co/PrismML" target="_blank" rel="noopener">PrismML / Caltech</a></p>
   </div>
 </div>
 
 <div class="input-area">
   <textarea id="inp" placeholder="How can I help you today? (Enter to send, Shift+Enter for newline)" rows="1" autofocus></textarea>
-  <button class="voice-btn" id="voice-btn" title="Toggle voice (currently on)">🔊</button>
   <button class="send" id="send-btn" title="Send">↑</button>
 </div>
 
@@ -330,27 +248,9 @@ const welcomeEl= document.getElementById('welcome');
 const inpEl    = document.getElementById('inp');
 const sendBtn  = document.getElementById('send-btn');
 const badgeEl  = document.getElementById('badge-text');
-const testAudioBtn = document.getElementById('test-audio-btn');
-const voiceBtn  = document.getElementById('voice-btn');
 
 let busy = false;
 let generating = false;
-let ttsEnabled = true;
-
-voiceBtn.addEventListener('click', () => {
-  ttsEnabled = !ttsEnabled;
-  voiceBtn.textContent = ttsEnabled ? '🔊' : '🔇';
-  voiceBtn.title = ttsEnabled ? 'Toggle voice (currently on)' : 'Toggle voice (currently off)';
-  voiceBtn.classList.toggle('tts-off', !ttsEnabled);
-});
-let audioContext = null;
-let currentAudioSource = null;
-let isPlaying = false;
-let isPaused = false;
-let audioQueue = [];
-let currentBotRow = null;
-let spokenWords = new Set();
-let allWords = [];
 
 // Auto-resize textarea
 inpEl.addEventListener('input', () => {
@@ -386,206 +286,18 @@ function appendUser(text) {
   scrollBottom();
 }
 
-function appendBot(withAudio = true) {
+function appendBot() {
   const row = document.createElement('div');
   row.className = 'row bot';
   const b = document.createElement('div');
   b.className = 'bubble';
-
-  let playBtn = null;
-  if (withAudio) {
-    const controls = document.createElement('div');
-    controls.className = 'audio-controls';
-    playBtn = document.createElement('button');
-    playBtn.className = 'audio-btn';
-    playBtn.innerHTML = '▶';
-    playBtn.disabled = true;
-    playBtn.title = 'Play audio';
-    playBtn.onclick = () => toggleAudio();
-    controls.appendChild(playBtn);
-    b.appendChild(controls);
-  }
-
   const cur = document.createElement('span');
   cur.className = 'cursor';
   b.appendChild(cur);
   row.appendChild(b);
   msgsEl.appendChild(row);
   scrollBottom();
-  return { row, b, cur, playBtn };
-}
-
-function initAudioContext() {
-  if (!audioContext) {
-    audioContext = new (window.AudioContext || window.webkitAudioContext)();
-  }
-  if (audioContext.state === 'suspended') {
-    audioContext.resume();
-  }
-}
-
-function hexToFloat32Array(hex) {
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < hex.length; i += 2) {
-    bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
-  }
-  const float32 = new Float32Array(bytes.length / 4);
-  for (let i = 0; i < float32.length; i++) {
-    float32[i] = new DataView(bytes.buffer).getFloat32(i * 4, true);
-  }
-  console.log(`[Audio] Hex->Float32: ${hex.length} chars -> ${float32.length} samples`);
-  return float32;
-}
-
-function playAudioChunk(audioHex, sampleRate) {
-  initAudioContext();
-  console.log(`[Audio] Playing chunk: ${audioHex.length} hex chars, ${sampleRate}Hz`);
-  const audioData = hexToFloat32Array(audioHex);
-  const audioBuffer = audioContext.createBuffer(1, audioData.length, sampleRate);
-  audioBuffer.getChannelData(0).set(audioData);
-  
-  const source = audioContext.createBufferSource();
-  source.buffer = audioBuffer;
-  source.connect(audioContext.destination);
-  source.start();
-  
-  source.onended = () => {
-    console.log(`[Audio] Chunk finished: ${audioData.length} samples, ${(audioData.length / sampleRate).toFixed(2)}s`);
-  };
-  
-  return source;
-}
-
-function playTestTone() {
-  initAudioContext();
-  const sampleRate = audioContext.sampleRate;
-  const duration = 1.0;
-  const frequency = 440;
-  
-  const audioBuffer = audioContext.createBuffer(1, sampleRate * duration, sampleRate);
-  const data = audioBuffer.getChannelData(0);
-  
-  for (let i = 0; i < data.length; i++) {
-    data[i] = Math.sin(2 * Math.PI * frequency * i / sampleRate) * 0.3;
-  }
-  
-  const source = audioContext.createBufferSource();
-  source.buffer = audioBuffer;
-  source.connect(audioContext.destination);
-  source.start();
-  
-  testAudioBtn.textContent = '🔊 Playing...';
-  source.onended = () => {
-    testAudioBtn.textContent = '🔊 Test';
-  };
-}
-
-testAudioBtn.addEventListener('click', playTestTone);
-
-function extractWords(text) {
-  const words = [];
-  const regex = /\S+/g;
-  let match;
-  while ((match = regex.exec(text)) !== null) {
-    words.push({ text: match[0], start: match.index, end: match.index + match[0].length });
-  }
-  return words;
-}
-
-function updateWordHighlight(fullText, sentenceStart, sentenceEnd) {
-  allWords = extractWords(fullText);
-  const wordsInSentence = allWords.filter(w => w.start >= sentenceStart && w.end <= sentenceEnd);
-  
-  if (currentBotRow && currentBotRow.playBtn) {
-    currentBotRow.playBtn.disabled = false;
-    currentBotRow.playBtn.innerHTML = '⏸';
-    currentBotRow.playBtn.classList.add('playing');
-  }
-}
-
-function renderTextWithHighlights(fullText) {
-  const words = extractWords(fullText);
-  let html = '';
-  let pos = 0;
-  
-  for (const word of words) {
-    html += fullText.slice(pos, word.start);
-    if (spokenWords.has(word.start)) {
-      html += `<span class="word-spoken">${escapeHtml(word.text)}</span>`;
-    } else {
-      html += escapeHtml(word.text);
-    }
-    pos = word.end;
-  }
-  html += fullText.slice(pos);
-  
-  return html;
-}
-
-function escapeHtml(text) {
-  const div = document.createElement('div');
-  div.textContent = text;
-  return div.innerHTML;
-}
-
-async function playAudioQueue() {
-  if (audioQueue.length === 0 || isPaused) return;
-  
-  const chunk = audioQueue.shift();
-  console.log(`[Audio] Queue: playing chunk, queue size=${audioQueue.length}, sentence=[${chunk.sentenceStart}-${chunk.sentenceEnd}]`);
-  currentAudioSource = playAudioChunk(chunk.audio, chunk.sampleRate);
-  
-  currentAudioSource.onended = () => {
-    if (chunk.sentenceEnd) {
-      for (let i = chunk.sentenceStart; i < chunk.sentenceEnd; i++) {
-        spokenWords.add(i);
-      }
-    }
-    if (currentBotRow && currentBotRow.b) {
-      const displayHtml = renderTextWithHighlights(chunk.full);
-      const controlsHtml = '<div class="audio-controls"><button class="audio-btn" onclick="toggleAudio()">' + 
-        (isPlaying && !isPaused ? '⏸' : '▶') + '</button></div>';
-      currentBotRow.b.innerHTML = displayHtml + controlsHtml + '<span class="cursor"></span>';
-      currentBotRow.playBtn = currentBotRow.b.querySelector('.audio-btn');
-    }
-    if (!isPaused && audioQueue.length > 0) {
-      setTimeout(playAudioQueue, 100);
-    } else if (audioQueue.length === 0) {
-      isPlaying = false;
-      if (currentBotRow && currentBotRow.playBtn) {
-        currentBotRow.playBtn.innerHTML = '▶';
-        currentBotRow.playBtn.classList.remove('playing');
-      }
-    }
-  };
-}
-
-function toggleAudio() {
-  if (!isPlaying && audioQueue.length === 0) return;
-  
-  isPaused = !isPaused;
-  if (currentBotRow && currentBotRow.playBtn) {
-    currentBotRow.playBtn.innerHTML = isPaused ? '▶' : '⏸';
-    currentBotRow.playBtn.classList.toggle('playing', !isPaused);
-  }
-  
-  if (!isPaused) {
-    playAudioQueue();
-  }
-}
-
-function stopAudio() {
-  if (currentAudioSource) {
-    try {
-      currentAudioSource.stop();
-    } catch (e) {}
-    currentAudioSource = null;
-  }
-  audioQueue = [];
-  isPlaying = false;
-  isPaused = false;
-  spokenWords.clear();
-  allWords = [];
+  return { row, b, cur };
 }
 
 async function stopGeneration() {
@@ -596,7 +308,6 @@ async function stopGeneration() {
       body: JSON.stringify({})
     });
   } catch (e) {}
-  stopAudio();
   generating = false;
   busy = false;
   sendBtn.innerHTML = '↑';
@@ -616,22 +327,18 @@ async function send() {
   inpEl.value = '';
   inpEl.style.height = 'auto';
 
-  stopAudio();
   appendUser(prompt);
-  const { row, b, cur, playBtn } = appendBot(ttsEnabled);
-  currentBotRow = { row, b, cur, playBtn };
+  const { row, b, cur } = appendBot();
   let text = '';
   let lastFullText = '';
 
   const SYSTEM_PROMPT = "You are a helpful, concise assistant. Answer questions directly and clearly.";
-  const endpoint = ttsEnabled ? '/generate/voice' : '/generate';
-  const maxTokens = ttsEnabled ? 200 : 512;
 
   try {
-    const res = await fetch(endpoint, {
+    const res = await fetch('/generate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt, max_new_tokens: maxTokens, stream_audio: ttsEnabled, system_prompt: SYSTEM_PROMPT })
+      body: JSON.stringify({ prompt, max_new_tokens: 512, system_prompt: SYSTEM_PROMPT })
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
@@ -671,38 +378,13 @@ async function send() {
             `${d.tokens_per_second.toFixed(1)} t/s · ${d.total_time_s.toFixed(1)}s · ${d.tokens_generated} tokens`;
           row.appendChild(s);
           badgeEl.textContent = `${d.tokens_per_second.toFixed(1)} t/s`;
-          if (currentBotRow && currentBotRow.playBtn) {
-            currentBotRow.playBtn.innerHTML = '▶';
-            currentBotRow.playBtn.classList.remove('playing');
-          }
         }
 
         if (d.token !== undefined) {
           text += d.token;
           if (d.full !== lastFullText) {
-            let displayHtml = renderTextWithHighlights(d.full);
-            const controlsHtml = playBtn
-              ? '<div class="audio-controls"><button class="audio-btn" onclick="toggleAudio()" ' +
-                (playBtn.disabled ? 'disabled' : '') + '>' +
-                (isPlaying && !isPaused ? '⏸' : '▶') + '</button></div>'
-              : '';
-            b.innerHTML = displayHtml + controlsHtml + '<span class="cursor"></span>';
+            b.innerHTML = escapeHtml(d.full) + '<span class="cursor"></span>';
             lastFullText = d.full;
-          }
-        }
-
-        if (d.audio) {
-          const wasPlaying = isPlaying;
-          audioQueue.push({
-            audio: d.audio,
-            sampleRate: d.sample_rate,
-            sentenceStart: d.sentence_start || 0,
-            sentenceEnd: d.sentence_end || 0,
-            full: d.full || lastFullText,
-          });
-          if (!wasPlaying) {
-            isPlaying = true;
-            playAudioQueue();
           }
         }
       }
@@ -719,6 +401,12 @@ async function send() {
     sendBtn.disabled = false;
     inpEl.focus();
   }
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
 }
 </script>
 </body>

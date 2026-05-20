@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FastAPI server for BitNet 1.7B inference with streaming."""
+"""FastAPI server for Bonsai 1.7B inference with streaming."""
 
 import os
 import json
@@ -8,7 +8,6 @@ import time
 import signal
 import sys
 import asyncio
-import concurrent.futures
 import numpy as np
 from contextlib import asynccontextmanager
 
@@ -20,7 +19,6 @@ from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 from transformers import AutoTokenizer
 import uvicorn
-from tiny_tts_onnx import _PAD_ID, _insert_blanks
 
 # Model config
 MODEL_DIR = os.environ.get("MODEL_DIR", "./models/Ternary-Bonsai-1.7B-unpacked")
@@ -37,7 +35,6 @@ _lib = None
 ModelState = None
 ProfileStats = None
 _model = None
-_tts = None
 _tokenizer = None
 G128Matrix = None
 FP32Matrix = None
@@ -164,7 +161,7 @@ def _detect_container_cpus():
 
 
 def init_model():
-    global _model, _tokenizer, _lib, _tts, ModelState, ProfileStats
+    global _model, _tokenizer, _lib, ModelState, ProfileStats
 
     if _model is not None:
         return
@@ -242,20 +239,7 @@ def init_model():
     
     _tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
     
-    # Initialize TTS
-    import nltk
-    for _res in ('cmudict', 'averaged_perceptron_tagger_eng', 'averaged_perceptron_tagger'):
-        try:
-            nltk.data.find(f'corpora/{_res}' if _res == 'cmudict' else f'taggers/{_res}')
-        except LookupError:
-            nltk.download(_res, quiet=True)
-
-    tts_t0 = time.perf_counter()
-    from tiny_tts_onnx import TinyTTSOnnx
-    _tts = TinyTTSOnnx()
-    tts_load_s = time.perf_counter() - tts_t0
-
-    log_startup_diagnostics(load_s, tts_load_s)
+    log_startup_diagnostics(load_s)
     log_pod_info()
 
 @asynccontextmanager
@@ -267,7 +251,7 @@ async def lifespan(app: FastAPI):
     if _model and _lib:
         _lib.model_free(ctypes.byref(_model))
 
-app = FastAPI(title="BitNet 1.7B Inference", lifespan=lifespan)
+app = FastAPI(title="Bonsai 1.7B Inference", lifespan=lifespan)
 
 @app.get("/")
 async def index():
@@ -281,8 +265,6 @@ class GenerateRequest(BaseModel):
     top_p: float = DEFAULT_TOP_P
     top_k: int = DEFAULT_TOP_K
     stop_tokens: list = None
-    stream_audio: bool = False
-    voice: str = "MALE"
 
 
 class StopRequest(BaseModel):
@@ -423,262 +405,6 @@ async def generate_completion(req: GenerateRequest):
     }
 
 
-import re
-
-SENTENCE_END_RE = re.compile(r'([.!?]+)(\s|$)')
-ABBREVIATIONS = {'Mr', 'Mrs', 'Ms', 'Dr', 'Prof', 'Sr', 'Jr', 'vs', 'etc', 'Inc', 'Ltd', 'Co', 'St', 'Ave', 'Blvd', 'Rd'}
-
-def is_sentence_boundary(text: str, pos: int) -> bool:
-    if pos <= 0 or pos >= len(text):
-        return False
-    if text[pos] not in '.!?':
-        return False
-    next_char = text[pos + 1] if pos + 1 < len(text) else ' '
-    valid_next = {' ', '\t', '\n', '\r', '"', "'", ')', ']', '}'}
-    if next_char not in valid_next:
-        return False
-    before = text[:pos]
-    words = before.split()
-    if not words:
-        return True
-    last_word = words[-1].rstrip('.')
-    if last_word in ABBREVIATIONS:
-        return False
-    if last_word.endswith('.') and len(last_word) <= 3:
-        return False
-    if text[pos:pos+3] == '...':
-        return True
-    return True
-
-
-def find_sentence_boundaries(text: str) -> list[int]:
-    boundaries = []
-    for i, char in enumerate(text):
-        if is_sentence_boundary(text, i):
-            boundaries.append(i)
-    return boundaries
-
-
-@app.post("/generate/voice")
-async def generate_voice(req: GenerateRequest):
-    if not _tts:
-        raise HTTPException(status_code=503, detail="TTS not loaded")
-
-    session_id = "default"
-    _stop_flags[session_id] = False
-
-    messages = []
-    if req.system_prompt:
-        messages.append({"role": "system", "content": req.system_prompt})
-    messages.append({"role": "user", "content": req.prompt})
-
-    text = _tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-    tokens = _tokenizer.encode(text, add_special_tokens=False)
-    stop_ids = set(req.stop_tokens) if req.stop_tokens else {STOP_EOS}
-
-    def generate_voice_stream():
-        full_text = ""
-        n_tokens = 0
-        last_boundary = 0
-        start = time.perf_counter()
-        pending = []
-        
-        # Word-buffered phoneme accumulation (spread g2p workload, but phonemize complete words only)
-        pending_phones = []  # List of (phone_ids, tone_ids, lang_ids) tuples from complete words
-        word_buffer = ""  # Accumulate token fragments until we have complete words
-        last_sentence_end = 0  # Track where we last submitted phonemes
-        
-        # Profiling counters
-        phonemize_count = 0
-        phonemize_total_ms = 0.0
-
-        tts_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        try:
-            for token in generate_tokens(tokens, req.max_new_tokens, req.temperature, req.top_p, req.top_k, stop_ids):
-                if _stop_flags.get(session_id, False):
-                    stop_payload = json.dumps({'stopped': True, 'full': full_text})
-                    yield f"data: {stop_payload}\n\n"
-                    return
-
-                if token == STOP_EOS:
-                    break
-                txt = _tokenizer.decode([token], skip_special_tokens=True)
-                full_text += txt
-                n_tokens += 1
-                
-                # Accumulate token fragments in word buffer
-                word_buffer += txt
-                
-                # Check if we have complete word(s) to phonemize
-                # A complete word ends with space or punctuation (but NOT apostrophe - keep contractions together)
-                if word_buffer and (word_buffer[-1] in ' \n\t.,!?;:'):
-                    # Extract complete words from buffer (leave incomplete fragment)
-                    stripped = word_buffer.rstrip()
-                    if stripped:
-                        # Find last whitespace boundary (not apostrophe - preserves contractions like "I'm", "don't", etc.)
-                        last_space = max(stripped.rfind(' '), stripped.rfind('\n'), stripped.rfind('\t'))
-                        if last_space >= 0:
-                            complete_words = stripped[:last_space + 1]
-                            remaining = stripped[last_space + 1:]
-                        else:
-                            complete_words = stripped
-                            remaining = ""
-                        
-                        # Phonemize complete words only (no padding - we'll add it once at sentence boundary)
-                        if complete_words:
-                            try:
-                                t0 = time.perf_counter()
-                                phone_ids, tone_ids, lang_ids = _tts.phonemize(complete_words, add_padding=False)
-                                t1 = time.perf_counter()
-                                phonemize_count += 1
-                                phonemize_total_ms += (t1 - t0) * 1000
-                                pending_phones.append((phone_ids, tone_ids, lang_ids))
-                            except Exception as e:
-                                print(f"Phonemize error: {e}")
-                        
-                        word_buffer = remaining
-                    else:
-                        word_buffer = ""
-
-                # Drain completed TTS futures — yield audio events as they finish
-                while pending and pending[0][0].done():
-                    future, sstart, send, _ = pending.pop(0)
-                    try:
-                        audio = future.result()
-                        audio_bytes = audio.tobytes()
-                        audio_payload = json.dumps({
-                            'audio': audio_bytes.hex(),
-                            'sample_rate': _tts.sample_rate,
-                            'sentence_start': sstart,
-                            'sentence_end': send,
-                            'full': full_text,
-                        })
-                        yield f"data: {audio_payload}\n\n"
-                    except Exception as e:
-                        print(f"TTS error: {e}")
-
-                # Detect sentence boundaries and submit to TTS pool
-                boundaries = find_sentence_boundaries(full_text)
-                if boundaries and boundaries[-1] > last_boundary:
-                    sentence_end = boundaries[-1]
-                    sentence_text = full_text[last_boundary:sentence_end + 1].strip()
-                    if sentence_text and len(sentence_text) > 3:
-                        # Phonemize any remaining word buffer before sentence boundary
-                        if word_buffer.strip():
-                            try:
-                                t0 = time.perf_counter()
-                                phone_ids, tone_ids, lang_ids = _tts.phonemize(word_buffer.strip(), add_padding=False)
-                                t1 = time.perf_counter()
-                                phonemize_count += 1
-                                phonemize_total_ms += (t1 - t0) * 1000
-                                pending_phones.append((phone_ids, tone_ids, lang_ids))
-                            except Exception as e:
-                                print(f"Phonemize error: {e}")
-                            word_buffer = ""
-                        
-                        # Flatten accumulated phoneme IDs (no padding yet)
-                        if pending_phones:
-                            all_phones = []
-                            all_tones = []
-                            all_langs = []
-                            for p_ids, t_ids, l_ids in pending_phones:
-                                all_phones.extend(p_ids)
-                                all_tones.extend(t_ids)
-                                all_langs.extend(l_ids)
-                            
-                            # Add proper blank-separated structure for TTS
-                            # _insert_blanks adds padding between every element + at start/end
-                            all_phones = _insert_blanks(all_phones, _PAD_ID)
-                            all_tones = _insert_blanks(all_tones, 0)
-                            # For langs, just repeat the language ID to match length
-                            all_langs = [2] * len(all_phones)
-                            
-                            future = tts_pool.submit(_tts.generate_from_phones, all_phones, all_tones, all_langs, voice=req.voice)
-                        else:
-                            # Fallback to text-based generation if no phonemes accumulated
-                            future = tts_pool.submit(_tts.generate, sentence_text, voice=req.voice)
-                        pending.append((future, last_boundary, sentence_end + 1, full_text))
-                        last_boundary = sentence_end + 1
-                        pending_phones = []
-
-                token_payload = json.dumps({'token': txt, 'full': full_text})
-                yield f"data: {token_payload}\n\n"
-
-            # Phonemize any remaining word buffer
-            if word_buffer.strip():
-                try:
-                    t0 = time.perf_counter()
-                    phone_ids, tone_ids, lang_ids = _tts.phonemize(word_buffer.strip(), add_padding=False)
-                    t1 = time.perf_counter()
-                    phonemize_count += 1
-                    phonemize_total_ms += (t1 - t0) * 1000
-                    pending_phones.append((phone_ids, tone_ids, lang_ids))
-                except Exception as e:
-                    print(f"Phonemize error: {e}")
-            
-            # Remaining text after last sentence boundary
-            if last_boundary < len(full_text):
-                remaining = full_text[last_boundary:].strip()
-                if remaining:
-                    # Use accumulated phonemes for final segment with proper padding
-                    if pending_phones:
-                        all_phones = []
-                        all_tones = []
-                        for p_ids, t_ids, l_ids in pending_phones:
-                            all_phones.extend(p_ids)
-                            all_tones.extend(t_ids)
-                        
-                        # Add proper blank-separated structure for TTS
-                        all_phones = _insert_blanks(all_phones, _PAD_ID)
-                        all_tones = _insert_blanks(all_tones, 0)
-                        all_langs = [2] * len(all_phones)
-                        
-                        future = tts_pool.submit(_tts.generate_from_phones, all_phones, all_tones, all_langs, voice=req.voice)
-                    else:
-                        future = tts_pool.submit(_tts.generate, remaining, voice=req.voice)
-                    pending.append((future, last_boundary, len(full_text), full_text))
-
-            # Drain all pending TTS futures
-            while pending:
-                future, sstart, send, _ = pending.pop(0)
-                try:
-                    audio = future.result()
-                    audio_bytes = audio.tobytes()
-                    final_payload = json.dumps({
-                        'audio': audio_bytes.hex(),
-                        'sample_rate': _tts.sample_rate,
-                        'sentence_start': sstart,
-                        'sentence_end': send,
-                        'full': full_text,
-                        'final': True,
-                    })
-                    yield f"data: {final_payload}\n\n"
-                except Exception as e:
-                    print(f"TTS error (final): {e}")
-        finally:
-            tts_pool.shutdown(wait=False)
-        
-        # Log phonemization profile
-        elapsed = time.perf_counter() - start
-        tps = n_tokens / elapsed if elapsed > 0 else 0.0
-        avg_phonemize_ms = phonemize_total_ms / phonemize_count if phonemize_count > 0 else 0
-        print(f"[TTS PROFILE] phonemize: {phonemize_count} calls, {phonemize_total_ms:.1f}ms total, {avg_phonemize_ms:.2f}ms avg")
-        print(f"[TTS PROFILE] voice: {n_tokens} tokens, {tps:.1f} t/s, {elapsed:.1f}s total")
-        log_profile(f"voice: {n_tokens} tokens, {tps:.1f} t/s")
-        
-        done_payload = json.dumps({
-            "done": True,
-            "full": full_text,
-            "tokens_generated": n_tokens,
-            "total_time_s": round(elapsed, 3),
-            "tokens_per_second": round(tps, 2)
-        })
-        yield f'data: {done_payload}\n\n'
-        _stop_flags[session_id] = False
-
-    return StreamingResponse(generate_voice_stream(), media_type="text/event-stream")
-
-
 @app.post("/stop")
 async def stop_generation(req: StopRequest = None):
     session_id = req.session_id if req else "default"
@@ -704,7 +430,7 @@ async def health():
     omp_threads = int(os.environ.get("OMP_NUM_THREADS", 0)) or os.cpu_count()
     return {
         "status": "ok",
-        "model": "BitNet-1.7B",
+        "model": "Bonsai 1.7B",
         "vocab_size": VOCAB_SIZE,
         "cpu": model_name,
         "simd": simd,
@@ -804,10 +530,9 @@ def log_profile(label=""):
     except Exception as e:
         print(f"[PROFILE ERROR] {label}: {e}", flush=True)
 
-def log_startup_diagnostics(load_s, tts_load_s):
+def log_startup_diagnostics(load_s):
     diag = {
         "model_load_s": round(load_s, 2),
-        "tts_load_s": round(tts_load_s, 2),
         "inference_so": _lib.model_matmul_path().decode(),
         "compile": _lib.model_compile_info().decode(),
         "vocab_size": VOCAB_SIZE,
@@ -899,64 +624,11 @@ async def model_info():
             "head_dim": 128,
             "max_seq_len": MAX_SEQ_LEN
         } if _model else {"error": "LLM not loaded"},
-        "tts": {
-            "sample_rate": _tts.sample_rate,
-            "frame_rate": _tts.frame_rate,
-            "voices": list(_tts.predefined_voices),
-        } if _tts else {"error": "TTS not loaded"},
         "tiled_kernel_active": tiled_active,
         "matmul_backend": "avx512_tiled8" if tiled_active else "avx512_fallback" if _model else None,
     }
     return info
 
-
-class TTSRequest(BaseModel):
-    text: str
-    voice: str = "MALE"
-
-
-@app.post("/tts/generate")
-async def tts_generate(req: TTSRequest):
-    if not _tts:
-        raise HTTPException(status_code=503, detail="TTS not loaded")
-    
-    start = time.time()
-    audio = _tts.generate(req.text, voice=req.voice)
-    elapsed = time.time() - start
-    
-    duration = len(audio) / _tts.sample_rate
-    
-    import io
-    import scipy.io.wavfile as wavfile
-    buffer = io.BytesIO()
-    wavfile.write(buffer, _tts.sample_rate, audio)
-    buffer.seek(0)
-    
-    return {
-        "audio_base64": buffer.read().hex(),
-        "duration_s": round(duration, 3),
-        "generation_time_s": round(elapsed, 3),
-        "rtf": round(elapsed / duration, 3) if duration > 0 else 0,
-    }
-
-
-@app.post("/tts/stream")
-async def tts_stream(req: TTSRequest):
-    if not _tts:
-        raise HTTPException(status_code=503, detail="TTS not loaded")
-    
-    def generate_audio_chunks():
-        for chunk in _tts.stream(req.text, voice=req.voice):
-            yield chunk.tobytes()
-    
-    return StreamingResponse(
-        generate_audio_chunks(),
-        media_type="audio/pcm",
-        headers={
-            "X-Sample-Rate": str(_tts.sample_rate),
-            "X-Channels": "1",
-        }
-    )
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=7860)

@@ -2,7 +2,7 @@
 
 ## What this is
 
-A from-scratch C inference engine for **Ternary-Bonsai-1.7B**, a 1-bit LLM by PrismML (Dr. Babak Hassibi, Caltech). Weights are ternary ({-scale, 0, +scale} per 128-element block), served via a FastAPI server with a streaming dark-mode chat UI, deployable to HuggingFace Spaces.
+A from-scratch C inference engine for **Ternary-Bonsai-1.7B**, a 1.58-bit LLM by PrismML (Dr. Babak Hassibi, Caltech). Weights are ternary ({-scale, 0, +scale} per 128-element block), served via a FastAPI server with a streaming dark-mode chat UI, deployable to HuggingFace Spaces.
 
 ---
 
