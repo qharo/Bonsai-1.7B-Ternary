@@ -20,7 +20,7 @@ from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 from transformers import AutoTokenizer
 import uvicorn
-from tiny_tts_onnx import _PAD_ID
+from tiny_tts_onnx import _PAD_ID, _insert_blanks
 
 # Model config
 MODEL_DIR = os.environ.get("MODEL_DIR", "./models/Ternary-Bonsai-1.7B-unpacked")
@@ -576,18 +576,23 @@ async def generate_voice(req: GenerateRequest):
                                 print(f"Phonemize error: {e}")
                             word_buffer = ""
                         
-                        # Flatten accumulated phoneme IDs and add sentence-level padding
+                        # Flatten accumulated phoneme IDs (no padding yet)
                         if pending_phones:
-                            all_phones = [_PAD_ID]  # Start padding (integer ID = 0)
-                            all_tones = [0]
-                            all_langs = [2]
+                            all_phones = []
+                            all_tones = []
+                            all_langs = []
                             for p_ids, t_ids, l_ids in pending_phones:
                                 all_phones.extend(p_ids)
                                 all_tones.extend(t_ids)
                                 all_langs.extend(l_ids)
-                            all_phones.append(_PAD_ID)  # End padding (integer ID = 0)
-                            all_tones.append(0)
-                            all_langs.append(2)
+                            
+                            # Add proper blank-separated structure for TTS
+                            # _insert_blanks adds padding between every element + at start/end
+                            all_phones = _insert_blanks(all_phones, _PAD_ID)
+                            all_tones = _insert_blanks(all_tones, 0)
+                            # For langs, just repeat the language ID to match length
+                            all_langs = [2] * len(all_phones)
+                            
                             future = tts_pool.submit(_tts.generate_from_phones, all_phones, all_tones, all_langs, voice=req.voice)
                         else:
                             # Fallback to text-based generation if no phonemes accumulated
@@ -617,16 +622,17 @@ async def generate_voice(req: GenerateRequest):
                 if remaining:
                     # Use accumulated phonemes for final segment with proper padding
                     if pending_phones:
-                        all_phones = [_PAD_ID]  # Start padding (integer ID = 0)
-                        all_tones = [0]
-                        all_langs = [2]
+                        all_phones = []
+                        all_tones = []
                         for p_ids, t_ids, l_ids in pending_phones:
                             all_phones.extend(p_ids)
                             all_tones.extend(t_ids)
-                            all_langs.extend(l_ids)
-                        all_phones.append(_PAD_ID)  # End padding (integer ID = 0)
-                        all_tones.append(0)
-                        all_langs.append(2)
+                        
+                        # Add proper blank-separated structure for TTS
+                        all_phones = _insert_blanks(all_phones, _PAD_ID)
+                        all_tones = _insert_blanks(all_tones, 0)
+                        all_langs = [2] * len(all_phones)
+                        
                         future = tts_pool.submit(_tts.generate_from_phones, all_phones, all_tones, all_langs, voice=req.voice)
                     else:
                         future = tts_pool.submit(_tts.generate, remaining, voice=req.voice)
