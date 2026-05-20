@@ -32,6 +32,9 @@ _UNK_ID = _SYM_TO_ID["UNK"]
 _PAD_ID = _SYM_TO_ID["_"]
 _EN_TONE_OFFSET = 7  # num_zh_tones(6) + num_ja_tones(1)
 
+# Export constants for app.py
+__all__ = ["TinyTTSOnnx", "_PAD_ID", "_UNK_ID"]
+
 # ── ARPAbet → tiny-tts mapping ──
 _ARPA_MAP = {
     "AA": "aa", "AE": "ae", "AH": "ah", "AO": "ao", "AW": "aw", "AY": "ay",

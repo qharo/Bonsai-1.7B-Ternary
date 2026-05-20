@@ -20,6 +20,7 @@ from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 from transformers import AutoTokenizer
 import uvicorn
+from tiny_tts_onnx import _PAD_ID
 
 # Model config
 MODEL_DIR = os.environ.get("MODEL_DIR", "./models/Ternary-Bonsai-1.7B-unpacked")
@@ -577,14 +578,14 @@ async def generate_voice(req: GenerateRequest):
                         
                         # Flatten accumulated phoneme IDs and add sentence-level padding
                         if pending_phones:
-                            all_phones = ["_"]  # Start padding
+                            all_phones = [_PAD_ID]  # Start padding (integer ID = 0)
                             all_tones = [0]
                             all_langs = [2]
                             for p_ids, t_ids, l_ids in pending_phones:
                                 all_phones.extend(p_ids)
                                 all_tones.extend(t_ids)
                                 all_langs.extend(l_ids)
-                            all_phones.append("_")  # End padding
+                            all_phones.append(_PAD_ID)  # End padding (integer ID = 0)
                             all_tones.append(0)
                             all_langs.append(2)
                             future = tts_pool.submit(_tts.generate_from_phones, all_phones, all_tones, all_langs, voice=req.voice)
@@ -616,14 +617,14 @@ async def generate_voice(req: GenerateRequest):
                 if remaining:
                     # Use accumulated phonemes for final segment with proper padding
                     if pending_phones:
-                        all_phones = ["_"]  # Start padding
+                        all_phones = [_PAD_ID]  # Start padding (integer ID = 0)
                         all_tones = [0]
                         all_langs = [2]
                         for p_ids, t_ids, l_ids in pending_phones:
                             all_phones.extend(p_ids)
                             all_tones.extend(t_ids)
                             all_langs.extend(l_ids)
-                        all_phones.append("_")  # End padding
+                        all_phones.append(_PAD_ID)  # End padding (integer ID = 0)
                         all_tones.append(0)
                         all_langs.append(2)
                         future = tts_pool.submit(_tts.generate_from_phones, all_phones, all_tones, all_langs, voice=req.voice)
