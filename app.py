@@ -510,12 +510,12 @@ async def generate_voice(req: GenerateRequest):
                 word_buffer += txt
                 
                 # Check if we have complete word(s) to phonemize
-                # A complete word ends with space or punctuation
+                # A complete word ends with space or punctuation (but NOT apostrophe - keep contractions together)
                 if word_buffer and (word_buffer[-1] in ' \n\t.,!?;:'):
                     # Extract complete words from buffer (leave incomplete fragment)
                     stripped = word_buffer.rstrip()
                     if stripped:
-                        # Find last word boundary
+                        # Find last whitespace boundary (not apostrophe - preserves contractions like "I'm", "don't", etc.)
                         last_space = max(stripped.rfind(' '), stripped.rfind('\n'), stripped.rfind('\t'))
                         if last_space >= 0:
                             complete_words = stripped[:last_space + 1]
