@@ -481,6 +481,14 @@ async def generate_voice(req: GenerateRequest):
         last_boundary = 0
         start = time.perf_counter()
         pending = []
+        
+        # Incremental phoneme accumulation (spread g2p workload across generation)
+        pending_phones = []  # List of (phone_ids, tone_ids, lang_ids) tuples
+        token_counter = 0
+        
+        # Profiling counters
+        phonemize_count = 0
+        phonemize_total_ms = 0.0
 
         tts_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
@@ -495,6 +503,21 @@ async def generate_voice(req: GenerateRequest):
                 txt = _tokenizer.decode([token], skip_special_tokens=True)
                 full_text += txt
                 n_tokens += 1
+                token_counter += 1
+                
+                # Phonemize every 2-3 tokens to spread g2p workload
+                # This is FAST (~1ms) and prevents processing spikes at sentence boundaries
+                if token_counter >= 2 or token == STOP_EOS:
+                    try:
+                        t0 = time.perf_counter()
+                        phone_ids, tone_ids, lang_ids = _tts.phonemize(txt)
+                        t1 = time.perf_counter()
+                        phonemize_count += 1
+                        phonemize_total_ms += (t1 - t0) * 1000
+                        pending_phones.append((phone_ids, tone_ids, lang_ids))
+                    except Exception as e:
+                        print(f"Phonemize error: {e}")
+                    token_counter = 0
 
                 # Drain completed TTS futures — yield audio events as they finish
                 while pending and pending[0][0].done():
@@ -519,9 +542,22 @@ async def generate_voice(req: GenerateRequest):
                     sentence_end = boundaries[-1]
                     sentence_text = full_text[last_boundary:sentence_end + 1].strip()
                     if sentence_text and len(sentence_text) > 3:
-                        future = tts_pool.submit(_tts.generate, sentence_text, voice=req.voice)
+                        # Flatten accumulated phoneme IDs for this sentence
+                        if pending_phones:
+                            all_phones = []
+                            all_tones = []
+                            all_langs = []
+                            for p_ids, t_ids, l_ids in pending_phones:
+                                all_phones.extend(p_ids)
+                                all_tones.extend(t_ids)
+                                all_langs.extend(l_ids)
+                            future = tts_pool.submit(_tts.generate_from_phones, all_phones, all_tones, all_langs, voice=req.voice)
+                        else:
+                            # Fallback to text-based generation if no phonemes accumulated
+                            future = tts_pool.submit(_tts.generate, sentence_text, voice=req.voice)
                         pending.append((future, last_boundary, sentence_end + 1, full_text))
                         last_boundary = sentence_end + 1
+                        pending_phones = []
 
                 token_payload = json.dumps({'token': txt, 'full': full_text})
                 yield f"data: {token_payload}\n\n"
@@ -530,7 +566,18 @@ async def generate_voice(req: GenerateRequest):
             if last_boundary < len(full_text):
                 remaining = full_text[last_boundary:].strip()
                 if remaining:
-                    future = tts_pool.submit(_tts.generate, remaining, voice=req.voice)
+                    # Use accumulated phonemes for final segment
+                    if pending_phones:
+                        all_phones = []
+                        all_tones = []
+                        all_langs = []
+                        for p_ids, t_ids, l_ids in pending_phones:
+                            all_phones.extend(p_ids)
+                            all_tones.extend(t_ids)
+                            all_langs.extend(l_ids)
+                        future = tts_pool.submit(_tts.generate_from_phones, all_phones, all_tones, all_langs, voice=req.voice)
+                    else:
+                        future = tts_pool.submit(_tts.generate, remaining, voice=req.voice)
                     pending.append((future, last_boundary, len(full_text), full_text))
 
             # Drain all pending TTS futures
@@ -552,10 +599,15 @@ async def generate_voice(req: GenerateRequest):
                     print(f"TTS error (final): {e}")
         finally:
             tts_pool.shutdown(wait=False)
-
+        
+        # Log phonemization profile
         elapsed = time.perf_counter() - start
         tps = n_tokens / elapsed if elapsed > 0 else 0.0
+        avg_phonemize_ms = phonemize_total_ms / phonemize_count if phonemize_count > 0 else 0
+        print(f"[TTS PROFILE] phonemize: {phonemize_count} calls, {phonemize_total_ms:.1f}ms total, {avg_phonemize_ms:.2f}ms avg")
+        print(f"[TTS PROFILE] voice: {n_tokens} tokens, {tps:.1f} t/s, {elapsed:.1f}s total")
         log_profile(f"voice: {n_tokens} tokens, {tps:.1f} t/s")
+        
         done_payload = json.dumps({
             "done": True,
             "full": full_text,

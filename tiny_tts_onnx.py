@@ -162,8 +162,62 @@ class TinyTTSOnnx:
 
         return phone_ids, tone_ids, lang_ids
 
-    def generate(self, text: str, voice: str = "MALE"):
-        phone_ids, tone_ids, lang_ids = self._text_to_ids(text)
+    def phonemize(self, text: str):
+        """
+        Convert text to phoneme IDs (without padding/blanks).
+        This is FAST (~1ms per token) and can run during LLM generation.
+        Returns tuple: (phone_ids, tone_ids, lang_ids) - lists of integers
+        """
+        text = text.strip().lower()
+        text = re.sub(r"(\d+)\.(\d+)", r"\1 point \2", text)
+        text = re.sub(r"(\d+)\s*-\s*(\d+)", r"\1 to \2", text)
+
+        words = self._tokenize_words(text)
+        phones = []
+        tones = []
+
+        for word in words:
+            if not word:
+                continue
+            try:
+                arpa_phones = self.g2p(word)
+            except Exception:
+                arpa_phones = []
+
+            for ph in arpa_phones:
+                if ph == " ":
+                    continue
+                if ph in _ARPABET_SET or re.match(r'^[A-Z]+\d$', ph):
+                    arpa_base, tone = _parse_arpabet(ph)
+                    tts_ph = _ARPA_MAP.get(arpa_base, arpa_base.lower())
+                    phones.append(_map_phoneme(tts_ph))
+                    tones.append(tone)
+                elif ph in _PUNCTUATION or ph in _PUNCT_MAP:
+                    tts_ph = _PUNCT_MAP.get(ph, ph)
+                    phones.append(_map_phoneme(tts_ph))
+                    tones.append(0)
+                else:
+                    phones.append(_map_phoneme(ph))
+                    tones.append(0)
+
+        phones = ["_"] + phones + ["_"]
+        tones = [0] + tones + [0]
+
+        phone_ids = [_SYM_TO_ID.get(ph, _UNK_ID) for ph in phones]
+        tone_ids = [t + _EN_TONE_OFFSET for t in tones]
+        lang_ids = [2] * len(phone_ids)
+
+        return phone_ids, tone_ids, lang_ids
+
+    def generate_from_phones(self, phone_ids, tone_ids, lang_ids, voice: str = "MALE"):
+        """
+        Generate audio from pre-computed phoneme IDs.
+        This skips the g2p phonemization step for faster inference.
+        Args:
+            phone_ids: list of phone IDs (already padded with blanks)
+            tone_ids: list of tone IDs (already padded with blanks)
+            lang_ids: list of language IDs (already padded with blanks)
+        """
         T = len(phone_ids)
 
         x = np.array(phone_ids, dtype=np.int64)[None, :]
@@ -187,6 +241,10 @@ class TinyTTSOnnx:
         })[0]
 
         return audio[0, 0].astype(np.float32)
+
+    def generate(self, text: str, voice: str = "MALE"):
+        phone_ids, tone_ids, lang_ids = self._text_to_ids(text)
+        return self.generate_from_phones(phone_ids, tone_ids, lang_ids, voice)
 
     def stream(self, text: str, voice: str = "MALE"):
         yield self.generate(text, voice)
