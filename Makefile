@@ -1,6 +1,13 @@
 CC = clang
-CFLAGS_BASE = -O3 -std=c11 -Wall -fPIC -march=native -ffast-math
-FRAMEWORKS = -framework Accelerate
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+    CFLAGS_BASE = -O3 -std=c11 -Wall -fPIC -march=native -ffast-math
+    FRAMEWORKS = -framework Accelerate
+else
+    # Linux / HF Spaces: cap at x86-64-v2 to avoid AVX-512 SIGILL on runtime nodes
+    CFLAGS_BASE = -O3 -std=c11 -Wall -fPIC -march=x86-64-v2 -ffast-math
+    FRAMEWORKS =
+endif
 
 # Detect if compiler supports OpenMP
 OPENMP_FLAG =
