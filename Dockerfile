@@ -14,8 +14,8 @@ COPY model_infer.c model_infer.h matmul_common.c matmul_common.h Makefile ./
 COPY app.py requirements.txt ./
 COPY static/ ./static/
 
-# Build inference library
-RUN make inference.so CC=clang "CFLAGS=-O3 -std=c11 -Wall -fPIC -march=native -ffast-math -fopenmp"
+# Build inference library — Makefile auto-detects platform & SIMD level
+RUN make inference.so
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
