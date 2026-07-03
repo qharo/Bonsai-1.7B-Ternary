@@ -1248,6 +1248,8 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
     }
 }
 
+#ifdef __AVX512F__
+
 static int _diag_test_f32(const char *name, const float *got, const float *exp, int n) {
     int ok = 1;
     for (int i = 0; i < n; i++) {
@@ -1352,6 +1354,8 @@ void avx512_diagnostic(void) {
     fprintf(stdout, "[DIAG] AVX-512 diagnostic complete\n");
     fflush(stdout);
 }
+
+#endif
 
 #else  // portable scalar fallback
 
