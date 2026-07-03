@@ -1,5 +1,7 @@
 """
 PocketTTS ONNX - bundle-aware ONNX inference for Pocket TTS.
+
+NO LONGER USED  - PHASE 2 MAYBE
 """
 
 import json

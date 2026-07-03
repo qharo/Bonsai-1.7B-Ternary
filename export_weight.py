@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""Export a single weight from the model as a raw binary file."""
+# initial weight export script
 import argparse
 import struct
 import numpy as np
@@ -13,7 +12,7 @@ def sanitize_name(name: str) -> str:
 
 def extract_ternary_g128(arr: np.ndarray) -> tuple:
     """Extract ternary values and scales from G128 quantized weight.
-    
+
     Returns:
         magnitude: packed as uint64_t[2] per block (128 bits, little-endian)
         sign: packed as uint64_t[2] per block (128 bits, little-endian)
@@ -21,19 +20,19 @@ def extract_ternary_g128(arr: np.ndarray) -> tuple:
     """
     total_elements = arr.size
     num_blocks = total_elements // 128
-    
+
     # Reshape into blocks of 128
     arr_flat = arr.flat[:num_blocks * 128].reshape(num_blocks, 128)
-    
+
     # Extract magnitude: 1 if non-zero, 0 otherwise
     magnitude = (np.abs(arr_flat) > 0).astype(np.uint8)
-    
+
     # Extract sign: 1 if negative, 0 otherwise
     sign = (arr_flat < 0).astype(np.uint8)
-    
+
     # Extract scales: max abs value per block as FP16
     scales = np.max(np.abs(arr_flat), axis=1).astype(np.float16)
-    
+
     # Pack into 2x uint64_t per block (128 bits = 16 bytes)
     # Each block: 128 bits packed into 2 × uint64
     def pack_bits(bits: np.ndarray) -> np.ndarray:
@@ -44,10 +43,10 @@ def extract_ternary_g128(arr: np.ndarray) -> tuple:
         # Reinterpret as 2 × uint64 (8 bytes each)
         packed_u64 = packed.view(np.uint64)
         return packed_u64.reshape(num_blocks, 2)
-    
+
     magnitude_packed = pack_bits(magnitude)
     sign_packed = pack_bits(sign)
-    
+
     return magnitude_packed, sign_packed, scales
 
 
@@ -85,14 +84,14 @@ def pack_weight_ternary_g128(name: str, arr_shape: tuple, num_blocks: int,
     name_bytes = name.encode("utf-8")
     name_len = len(name_bytes)
     dtype_code = 3  # 3 = packed ternary G128 (128 bits per block)
-    
+
     shape = arr_shape
     num_dims = len(shape)
     total_elements = num_blocks * 128
     elements_per_block = 128
-    
+
     header_size = 4 + 4 + name_len + 4 + num_dims * 8 + 4 + 4 + 4
-    
+
     with open(out_path_mag, "wb") as f:
         f.write(struct.pack("<I", header_size))
         f.write(struct.pack("<I", name_len))
@@ -104,7 +103,7 @@ def pack_weight_ternary_g128(name: str, arr_shape: tuple, num_blocks: int,
         f.write(struct.pack("<I", total_elements))
         f.write(struct.pack("<I", elements_per_block))
         f.write(magnitude.tobytes())
-    
+
     with open(out_path_sign, "wb") as f:
         f.write(struct.pack("<I", header_size))
         f.write(struct.pack("<I", name_len))
@@ -116,7 +115,7 @@ def pack_weight_ternary_g128(name: str, arr_shape: tuple, num_blocks: int,
         f.write(struct.pack("<I", total_elements))
         f.write(struct.pack("<I", elements_per_block))
         f.write(sign.tobytes())
-    
+
     with open(out_path_scales, "wb") as f:
         f.write(struct.pack("<I", header_size))
         f.write(struct.pack("<I", name_len))
@@ -128,7 +127,7 @@ def pack_weight_ternary_g128(name: str, arr_shape: tuple, num_blocks: int,
         f.write(struct.pack("<I", total_elements))
         f.write(struct.pack("<I", elements_per_block))
         f.write(scales.tobytes())
-    
+
     print(f"Exported: {name}")
     print(f"  Shape: {list(shape)}  numel: {total_elements:,}  blocks: {num_blocks:,}")
     print(f"  Magnitude: {magnitude.nbytes:,} bytes ({magnitude.shape})")
@@ -289,7 +288,7 @@ def main():
 
     arr = tensors[name].astype(np.float32)
     safe_name = sanitize_name(name).replace(".", "_")
-    
+
     if arr.size % 128 != 0:
         raise ValueError(f"Array size {arr.size} is not divisible by 128")
 

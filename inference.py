@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""Simple inference with the local Ternary-Bonsai-1.7B unpacked weights + transformers."""
+# final inference file
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 

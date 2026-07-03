@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# frontend
 """FastAPI server for Bonsai 1.7B inference with streaming."""
 
 import os
@@ -11,7 +12,7 @@ import asyncio
 import numpy as np
 from contextlib import asynccontextmanager
 
-# Suppress transformers PyTorch advisory warnings (tokenizer works without PyTorch)
+# we need only tokenizers
 os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = '1'
 
 from fastapi import FastAPI, HTTPException
@@ -42,12 +43,12 @@ LayerWeights = None
 
 def load_library():
     global _lib, ModelState, ProfileStats, G128Matrix, FP32Matrix, LayerWeights
-    
+
     lib_path = os.path.join(os.path.dirname(__file__), "inference.so")
     if not os.path.exists(lib_path):
         lib_path = "./inference.so"
     _lib = ctypes.CDLL(lib_path)
-    
+
     class G128MatrixStruct(ctypes.Structure):
         _fields_ = [
             ("num_rows", ctypes.c_uint32),
@@ -64,14 +65,14 @@ def load_library():
             ("num_tile_groups8", ctypes.c_uint64),
             ("total_tiles8", ctypes.c_uint32),
         ]
-    
+
     class FP32MatrixStruct(ctypes.Structure):
         _fields_ = [
             ("data", ctypes.c_void_p),
             ("num_rows", ctypes.c_int),
             ("num_cols", ctypes.c_int),
         ]
-    
+
     class LayerWeightsStruct(ctypes.Structure):
         _fields_ = [
             ("ln1", FP32MatrixStruct),
@@ -86,7 +87,7 @@ def load_library():
             ("up_proj", G128MatrixStruct),
             ("down_proj", G128MatrixStruct),
         ]
-    
+
     class ProfileStatsStruct(ctypes.Structure):
         _fields_ = [
             ("decode_count", ctypes.c_uint64),
@@ -128,7 +129,7 @@ def load_library():
             ("loaded", ctypes.c_bool),
             ("profile", ProfileStatsStruct),
         ]
-    
+
     G128Matrix = G128MatrixStruct
     FP32Matrix = FP32MatrixStruct
     LayerWeights = LayerWeightsStruct
@@ -201,8 +202,6 @@ def init_model():
     _lib.model_affinity_cpu_count.argtypes = []
     _lib.model_affinity_cpu_count.restype = ctypes.c_int
 
-    # Double-check: C sched_getaffinity may see a different (tighter) affinity than
-    # Python/cgroup. Use whichever gives the smaller count so we never over-subscribe.
     c_affinity = _lib.model_affinity_cpu_count()
     if c_affinity > 0 and c_affinity < n_cpus:
         n_cpus = c_affinity
@@ -236,9 +235,9 @@ def init_model():
 
     global _logits_buf
     _logits_buf = (ctypes.c_float * VOCAB_SIZE)()
-    
+
     _tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
-    
+
     log_startup_diagnostics(load_s)
     log_pod_info()
 
@@ -325,7 +324,7 @@ def generate_tokens(prompt_tokens, max_new, temp, top_p, top_k, stop_ids):
     _last_prompt_tokens = len(prompt_tokens)
     if ret != 0:
         raise RuntimeError("Prefill failed")
-    
+
     for i in range(max_new):
         next_token = sample_token(_logits_buf, temp, top_p, top_k)
         yield next_token
@@ -341,11 +340,11 @@ async def generate(req: GenerateRequest):
     if req.system_prompt:
         messages.append({"role": "system", "content": req.system_prompt})
     messages.append({"role": "user", "content": req.prompt})
-    
+
     text = _tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
     tokens = _tokenizer.encode(text, add_special_tokens=False)
     stop_ids = set(req.stop_tokens) if req.stop_tokens else {STOP_EOS}
-    
+
     def generate_and_decode():
         full_text = ""
         n_tokens = 0
@@ -613,7 +612,7 @@ async def model_info():
                     break
         except Exception:
             pass
-    
+
     info = {
         "llm": {
             "vocab_size": _model.embed.num_rows if _model else None,

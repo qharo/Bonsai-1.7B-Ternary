@@ -1,6 +1,9 @@
 """
 TinyTTS ONNX — CPU inference, no PyTorch/transformers/numba.
 Model and tokenizer loaded from models/tinytts/ (local, not HF Hub).
+
+NO LONGER USED, PHASE 2
+
 """
 import os, re
 import numpy as np
