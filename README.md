@@ -1,20 +1,3 @@
----
-title: Bonsai 1.7B
-emoji: 🌿
-colorFrom: green
-colorTo: green
-sdk: docker
-pinned: false
-app_port: 7860
-models:
-- prism-ml/Ternary-Bonsai-1.7B-mlx-2bit
-tags:
-- text-generation
-- 1-58-bit
-- bonsai
-license: mit
----
-
 # Bonsai 1.7B — A 1.58-bit LLM
 [![Model](https://img.shields.io/badge/Model-PrismML%2FTernary--Bonsai--1.7B-blue)](https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-mlx-2bit)
 [![Space](https://img.shields.io/badge/Space-Demo-green)](https://huggingface.co/spaces/qhar0h/Bonsai-1.7B)
