@@ -190,7 +190,7 @@ def export_batch(model_dir: Path, layers: list, packed: bool = False):
 def main():
     parser = argparse.ArgumentParser(description="Export a model weight to binary float32.")
     parser.add_argument("weight_name", nargs="?", help="Full weight name (e.g. model.layers.0.mlp.up_proj.weight)")
-    parser.add_argument("--model-dir", default="models/Ternary-Bonsai-1.7B-unpacked",
+    parser.add_argument("--model-dir", default="model_weights_repacked",
                         help="Path to model directory")
     parser.add_argument("--packed", action="store_true",
                         help="Export as packed ternary G128 (magnitude + sign + scales)")

@@ -22,7 +22,7 @@ from transformers import AutoTokenizer
 import uvicorn
 
 # Model config
-MODEL_DIR = os.environ.get("MODEL_DIR", "./models/Ternary-Bonsai-1.7B-unpacked")
+MODEL_DIR = os.environ.get("MODEL_DIR", "./model_weights_repacked")
 MAX_SEQ_LEN = 512
 DEFAULT_TEMP = 0.7
 DEFAULT_TOP_P = 0.85
@@ -254,7 +254,7 @@ app = FastAPI(title="Bonsai 1.7B Inference", lifespan=lifespan)
 
 @app.get("/")
 async def index():
-    return FileResponse("static/index.html")
+    return FileResponse("index.html")
 
 class GenerateRequest(BaseModel):
     prompt: str
