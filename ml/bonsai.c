@@ -1,3 +1,7 @@
+// Expose POSIX clock_gettime even under -std=c11 — must precede ALL system includes
+#ifndef __MACH__
+#define _GNU_SOURCE
+#endif
 #include "bonsai.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -1464,10 +1468,6 @@ void matmul_lut_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) {
         }
     }
 }
-// Expose POSIX clock_gettime even under -std=c11 — must precede ALL system includes
-#ifndef __MACH__
-#define _GNU_SOURCE
-#endif
 #include <math.h>
 #ifdef __MACH__
 #include <mach/mach_time.h>
