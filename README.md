@@ -1,10 +1,9 @@
 # Bonsai 1.7B — A 1.58-bit LLM
 
 <div align="center">
-
+  
 [![Hugging Face](https://img.shields.io/static/v1?label=%F0%9F%A4%97%20Model&message=HuggingFace&color=orange)](https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-mlx-2bit)
 [![Space](https://img.shields.io/static/v1?label=%F0%9F%9A%80%20Space&message=Live%20Demo&color=green)](https://huggingface.co/spaces/qhar0h/Bonsai-1.7B)
-[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 </div>
 
