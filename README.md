@@ -19,7 +19,7 @@ license: mit
 [![Model](https://img.shields.io/badge/Model-PrismML%2FTernary--Bonsai--1.7B-blue)](https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-mlx-2bit)
 [![Space](https://img.shields.io/badge/Space-Demo-green)](https://huggingface.co/spaces/qhar0h/Bonsai-1.7B)
 
-A from-scratch, highly optimized C inference engine for **Ternary-Bonsai-1.7B**, served via a FastAPI server with a streaming dark-mode chat UI. 
+An optimized C inference engine for **Ternary-Bonsai-1.7B**, served via a FastAPI server with a streaming dark-mode chat UI. 
 
 **Model by:** [PrismML / Caltech](https://huggingface.co/PrismML)
 
@@ -27,12 +27,12 @@ A from-scratch, highly optimized C inference engine for **Ternary-Bonsai-1.7B**,
 
 ## Optimizations
 
-LLM inference is almost entirely memory-bandwidth bound. To get the most out of the CPU, I built this engine from scratch, bypassing standard PyTorch paradigms in favor of bare-metal systems optimization:
+LLM inference is almost entirely memory-bandwidth bound. To get the most out of the CPU, I focused on moving as little data as possible:
 
 *   **1.58-bit G128 Ternary Packing:** Instead of standard quantization, I packed the weights into 1.58 bits (magnitude, sign, and block scale). This reduces the memory footprint by ~16x
 *   **Load-Time Precomputation:** Precompute FP32 scales and pre-separate positive/negative bitmaps at startup
 *   **SIMD Kernels:** I used lookup tables (LUTs) and masked fused-multiply-adds (FMA) to process up to 512 elements per clock cycle.
-*   **Two-Phase `lm_head` Prefilter:** 
+*   **Two-Phase `lm_head` Prefilter** 
 ---
 
 ## 📦 Model Weights
