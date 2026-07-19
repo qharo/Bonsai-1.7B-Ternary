@@ -25,17 +25,14 @@ A from-scratch, highly optimized C inference engine for **Ternary-Bonsai-1.7B**,
 
 ---
 
-## 🧠 Core Engineering Philosophies
+## Optimizations
 
 LLM inference is almost entirely memory-bandwidth bound. To get the most out of the CPU, I built this engine from scratch, bypassing standard PyTorch paradigms in favor of bare-metal systems optimization:
 
-*   **1.58-bit G128 Ternary Packing:** Instead of standard quantization, I packed the weights into 1.58 bits (magnitude, sign, and block scale). This reduces the memory footprint by ~16x, turning a memory-bound monster into a bitwise puzzle.
-*   **Load-Time Precomputation:** I avoid doing the same math twice. I precompute FP32 scales and pre-separate positive/negative bitmaps at startup, ensuring the hot decode loop executes zero branching and zero type-conversions.
-*   **Hand-Tuned SIMD Kernels:** Because compilers can't auto-vectorize custom bit-packed math, I wrote bare-metal AVX-512, AVX2, and NEON kernels. They utilize lookup tables (LUTs) and masked fused-multiply-adds (FMA) to process up to 512 elements per clock cycle.
-*   **Zero-Allocation & Head-Major Memory:** Dynamic allocation kills latency, so I allocate all intermediate tensors once at boot. I also lay out the KV cache head-major to guarantee perfectly sequential, cache-line-friendly memory reads during attention.
-*   **Two-Phase `lm_head` Prefilter:** Computing 151,000 exact dot products per token is wasteful. I use a cheap, approximate block-sum to instantly eliminate 89% of the vocabulary, reserving heavy math only for the true candidates.
-*   **Container-Aware Runtime Tuning:** Cloud schedulers often report the wrong CPU counts. I read cgroup quotas directly to prevent thread over-subscription, pairing it with passive OpenMP policies so idle threads sleep instead of burning CPU quota.
-
+*   **1.58-bit G128 Ternary Packing:** Instead of standard quantization, I packed the weights into 1.58 bits (magnitude, sign, and block scale). This reduces the memory footprint by ~16x
+*   **Load-Time Precomputation:** Precompute FP32 scales and pre-separate positive/negative bitmaps at startup
+*   **SIMD Kernels:** I used lookup tables (LUTs) and masked fused-multiply-adds (FMA) to process up to 512 elements per clock cycle.
+*   **Two-Phase `lm_head` Prefilter:** 
 ---
 
 ## 📦 Model Weights
