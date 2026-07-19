@@ -22,11 +22,12 @@ ifeq ($(UNAME_S),Linux)
 endif
 
 CFLAGS = $(CFLAGS_BASE) $(OPENMP_FLAG)
-LDFLAGS = -shared $(OPENMP_FLAG) -lm $(LDFLAGS_EXTRA)
+LDFLAGS = -shared $(OPENMP_FLAG)
+LDLIBS = -lm $(LDFLAGS_EXTRA)
 
 # Single compilation target
 inference.so: ml/bonsai.c ml/bonsai.h
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ ml/bonsai.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ ml/bonsai.c $(LDLIBS)
 
 clean:
 	rm -f inference.so
