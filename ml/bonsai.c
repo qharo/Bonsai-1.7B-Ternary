@@ -18,7 +18,6 @@ void g128_matrix_init(G128Matrix *m, uint32_t num_rows, uint32_t num_cols) {
     m->num_blocks_row = (num_rows + G128_BLOCK_SIZE - 1) / G128_BLOCK_SIZE;
     m->num_blocks_col = (num_cols + G128_BLOCK_SIZE - 1) / G128_BLOCK_SIZE;
 
-    // Total blocks = N * K / 128 (one block per 128 consecutive K-elements per output row)
     uint64_t num_blocks = (uint64_t)num_rows * num_cols / G128_BLOCK_SIZE;
     m->magnitude  = calloc(num_blocks * 2, sizeof(uint64_t));
     m->sign       = calloc(num_blocks * 2, sizeof(uint64_t));
@@ -44,9 +43,9 @@ static inline float half_to_float(uint16_t h) {
     uint32_t exp  = (h >> 10) & 0x1Fu;
     uint32_t mant = (uint32_t)(h & 0x3FFu);
     if (exp == 0) {
-        v.u = sign; // zero (denormals treated as zero)
+        v.u = sign;
     } else if (exp == 31) {
-        v.u = sign | 0x7F800000u | (mant << 13); // inf/NaN
+        v.u = sign | 0x7F800000u | (mant << 13);
     } else {
         // exp_f32 = exp_f16 + (127 - 15) = exp_f16 + 112
         v.u = sign | ((exp + 112u) << 23) | (mant << 13);
@@ -149,7 +148,6 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
     const float *sf = B_T->scales_f32;
     for (int i = 0; i < M; i++) {
         int n4 = (N / 4) * 4;
-        // 4-output parallel: A block loaded once, reused across 4 weight rows
         #pragma omp parallel for schedule(static) if(n4 >= 512)
         for (int j = 0; j < n4; j += 4) {
             float32x4_t acc0 = vdupq_n_f32(0.0f);
@@ -194,7 +192,6 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
             C[i*N+j+2] = vaddvq_f32(acc2);
             C[i*N+j+3] = vaddvq_f32(acc3);
         }
-        // Tail for N not divisible by 4
         for (int j = n4; j < N; j++) {
             float32x4_t acc = vdupq_n_f32(0.0f);
             int rb = j * nkb;
@@ -904,7 +901,6 @@ static void init_avx2_lut_once(void) {
     avx2_lut_init = 1;
 }
 
-// Horitzontal sum across 8-wide YMM → single float
 static inline float hsum_avx2(__m256 v) {
     __m128 lo = _mm256_castps256_ps128(v);
     __m128 hi = _mm256_extractf128_ps(v, 1);
@@ -1258,104 +1254,36 @@ static int _diag_test_f32(const char *name, const float *got, const float *exp, 
     for (int i = 0; i < n; i++) {
         float d = fabsf(got[i] - exp[i]);
         if (d > 1e-5f && d > 1e-5f * fabsf(exp[i])) {
-            fprintf(stdout, "  %-40s FAIL lane %d: got %8.4f exp %8.4f\n", name, i, got[i], exp[i]);
-            fflush(stdout);
+            fprintf(stdout, "  %s FAIL lane %d: got %.4f exp %.4f\n", name, i, got[i], exp[i]);
             ok = 0;
         }
     }
-    if (ok) { fprintf(stdout, "  %-40s PASS\n", name); fflush(stdout); }
+    if (ok) fprintf(stdout, "  %s PASS\n", name);
     return ok;
 }
 
 void avx512_diagnostic(void) {
     static int done = 0;
     if (done) return; done = 1;
-    fprintf(stdout, "[DIAG] AVX-512 instruction diagnostic\n");
-    fflush(stdout);
+    fprintf(stdout, "[DIAG] AVX-512 mask kernel check\n");
     float av_in[16], exp[16], got[16];
     for (int i = 0; i < 16; i++) av_in[i] = (float)(i + 1);
     float sc_val = 3.0f;
     __m512 av = _mm512_loadu_ps(av_in);
     __m512 sc = _mm512_set1_ps(sc_val);
-    __m512 zero = _mm512_setzero_ps();
-    __m512i one = _mm512_set1_epi32(1);
 
-    // 1. Unmasked FMADD (control)
-    __m512 acc = _mm512_fmadd_ps(av, sc, zero);
+    __mmask16 k = 0x0005;
+    __m512 acc = _mm512_mask3_fmadd_ps(av, sc, _mm512_setzero_ps(), k);
     _mm512_storeu_ps(got, acc);
-    for (int i = 0; i < 16; i++) exp[i] = av_in[i] * sc_val;
-    _diag_test_f32("VFMADD (unmasked)", got, exp, 16);
+    for (int i = 0; i < 16; i++) exp[i] = (i == 0 || i == 2) ? av_in[i] * sc_val : 0.0f;
+    _diag_test_f32("mask3_fmadd", got, exp, 16);
 
-    // 2. Merge-masked VFMADD (odd lanes)
-    __mmask16 k_odd = 0xAAAA;
-    acc = zero;
-    acc = _mm512_mask_fmadd_ps(acc, k_odd, sc, av);
+    acc = _mm512_mask3_fnmadd_ps(av, sc, _mm512_setzero_ps(), k);
     _mm512_storeu_ps(got, acc);
-    for (int i = 0; i < 16; i++) exp[i] = (i & 1) ? av_in[i] * sc_val : 0.0f;
-    _diag_test_f32("VFMADD (merge-mask, odd lanes)", got, exp, 16);
-
-    // 3. Merge-masked VFNMADD (odd lanes)
-    acc = zero;
-    acc = _mm512_mask_fnmadd_ps(acc, k_odd, sc, av);
-    _mm512_storeu_ps(got, acc);
-    for (int i = 0; i < 16; i++) exp[i] = (i & 1) ? -(av_in[i] * sc_val) : 0.0f;
-    _diag_test_f32("VFNMADD (merge-mask, odd lanes)", got, exp, 16);
-
-    // 4. Sequential merge-masked VFMADD + VFMADD(nsc) (mask kernel pattern)
-    __mmask16 k_pos = 0x0005;  // lanes 0,2
-    __mmask16 k_neg = 0x0050;  // lanes 4,6
-    acc = zero;
-    acc = _mm512_mask_fmadd_ps(acc, k_pos, sc, av);
-    __m512 nsc = _mm512_xor_ps(sc, _mm512_set1_ps(-0.0f));
-    acc = _mm512_mask_fmadd_ps(acc, k_neg, nsc, av);
-    _mm512_storeu_ps(got, acc);
-    for (int i = 0; i < 16; i++) {
-        if (i == 0 || i == 2) exp[i] = sc_val * av_in[i];
-        else if (i == 4 || i == 6) exp[i] = -sc_val * av_in[i];
-        else exp[i] = 0.0f;
-    }
-    _diag_test_f32("mask kernel (VFMADD+VFMADD-nsc)", got, exp, 16);
-
-    // 5. Zero-masked VMOVAPS
-    acc = _mm512_maskz_mov_ps(k_odd, av);
-    _mm512_storeu_ps(got, acc);
-    for (int i = 0; i < 16; i++) exp[i] = (i & 1) ? av_in[i] : 0.0f;
-    _diag_test_f32("VMOVAPS (zero-mask)", got, exp, 16);
-
-    // 6. Zero-masked VPBROADCASTD (0x80000000)
-    __m512i sgn_bits = _mm512_maskz_set1_epi32(k_odd, 0x80000000);
-    _mm512_storeu_ps(got, _mm512_castsi512_ps(sgn_bits));
-    for (int i = 0; i < 16; i++) exp[i] = (i & 1) ? -0.0f : 0.0f;
-    _diag_test_f32("VPBROADCASTD zero 0x80000000", got, exp, 16);
-
-    // 7. Zero-masked VPSLLD (1 << 31)
-    sgn_bits = _mm512_maskz_slli_epi32(k_odd, one, 31);
-    _mm512_storeu_ps(got, _mm512_castsi512_ps(sgn_bits));
-    _diag_test_f32("VPSLLD zero 1<<31", got, exp, 16);
-
-    // 8. Merge-masked VPBLENDMD (±av)
-    __m512 neg_av = _mm512_xor_ps(av, _mm512_set1_ps(-0.0f));
-    acc = _mm512_mask_blend_ps(k_odd, av, neg_av);
-    _mm512_storeu_ps(got, acc);
-    for (int i = 0; i < 16; i++) exp[i] = (i & 1) ? -av_in[i] : av_in[i];
-    _diag_test_f32("VPBLENDMD merge ±av", got, exp, 16);
-
-    // 9. Zero-masked blend via AND+XOR (mask-to-vector)
-    __m512i mag_bits = _mm512_maskz_set1_epi32(k_odd, -1);
-    sgn_bits = _mm512_maskz_slli_epi32(k_neg, one, 31);
-    __m512 sf = _mm512_castsi512_ps(sgn_bits);
-    __m512 w = _mm512_and_ps(_mm512_xor_ps(sc, sf), _mm512_castsi512_ps(mag_bits));
-    acc = _mm512_fmadd_ps(w, av, zero);
-    _mm512_storeu_ps(got, acc);
-    for (int i = 0; i < 16; i++) {
-        if (i == 0 || i == 2) exp[i] = sc_val * av_in[i];
-        else if (i == 4 || i == 6) exp[i] = -sc_val * av_in[i];
-        else exp[i] = 0.0f;
-    }
-    _diag_test_f32("mask-to-vector (zero-mask + AND+XOR+FMADD)", got, exp, 16);
+    for (int i = 0; i < 16; i++) exp[i] = (i == 0 || i == 2) ? -(av_in[i] * sc_val) : 0.0f;
+    _diag_test_f32("mask3_fnmadd", got, exp, 16);
 
     fprintf(stdout, "[DIAG] AVX-512 diagnostic complete\n");
-    fflush(stdout);
 }
 
 #endif
@@ -1368,8 +1296,6 @@ void matmul_simd_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
 
 #endif
 
-// Stubs for platforms without AVX-512 (lm_head_prefilter_available = 0)
-// model_infer.c checks the flag before calling these.
 #ifndef __AVX512F__
 void lm_head_prefilter(float *A, G128Matrix *B_T, float *C, int N, int max_blocks) {
     (void)A; (void)B_T; (void)C; (void)N; (void)max_blocks;
@@ -1399,8 +1325,6 @@ void matmul_swar_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) 
                 float scale = half_to_float(B_T->scales[bidx]);
                 int k_base = bk * G128_BLOCK_SIZE;
 
-                // Separate positive (mag=1, sign=0) and negative (mag=1, sign=1) bits
-                // to allow independent aggregation with a single scale multiply.
                 float sum_pos = 0.0f, sum_neg = 0.0f;
 
                 uint64_t pos0 = mag0 & ~sgn0;
@@ -1438,7 +1362,6 @@ void matmul_lut_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) {
                 float scale = half_to_float(B_T->scales[bidx]);
                 int k_base = bk * G128_BLOCK_SIZE;
 
-                // Process 8 bits at a time using byte-level LUT approach
                 for (int byte = 0; byte < 8; byte++) {
                     uint8_t mb = (mag0 >> (byte * 8)) & 0xFF;
                     uint8_t sb = (sgn0 >> (byte * 8)) & 0xFF;
@@ -1475,7 +1398,6 @@ void matmul_lut_g128(float *A, G128Matrix *B_T, float *C, int M, int K, int N) {
 #include <time.h>
 #endif
 #include <sched.h>
-// 64-byte aligned calloc for AVX-512 (safe on all POSIX platforms)
 static inline void *aligned_calloc(size_t alignment, size_t size) {
     void *ptr = NULL;
     if (posix_memalign(&ptr, alignment, size) != 0) return NULL;
@@ -1568,7 +1490,6 @@ static int load_g128(G128Matrix *m, const char *base) {
 #undef PK16
     }
 
-    // Build 8-row tiled layout for optimized matmul
     m->num_tile_groups8 = m->num_rows / 8;
     m->total_tiles8 = (uint32_t)(m->num_tile_groups8 * m->num_blocks_col);
     if (m->num_tile_groups8 > 0 && m->total_tiles8 > 0) {
@@ -1734,7 +1655,6 @@ static void apply_rope(float *q, int seqlen, int nh, int hd, float rope_cos[][HE
     }
 }
 
-// Profile helper: accumulate timing + element count for a single matmul
 static inline void profile_matmul(ModelState *s, int type, uint64_t t0, int seqlen, int K, int N) {
     uint64_t t1 = now_ns();
     double dt = (double)(t1 - t0);
@@ -1946,7 +1866,6 @@ int model_load(ModelState *s, const char *dir) {
         }
     }
 
-    // Log tiling status for deployment verification
     uint64_t total_tiles = 0;
     size_t tile_memory = 0;
     for (int i = 0; i < NUM_LAYERS; i++) {
@@ -2106,7 +2025,6 @@ int model_omp_max_threads(void) {
 #endif
 }
 
-// Debug: return offset of `loaded` field within ModelState
 #include <stddef.h>
 long model_struct_size(void) {
     return (long)sizeof(ModelState);

@@ -9,10 +9,10 @@
 #define G128_BLOCK_SIZE 128
 
 typedef struct __attribute__((aligned(64))) {
-    uint64_t pos[8][4];   // 256 bytes: pos bitmaps for 8 rows
-    uint64_t neg[8][4];   // 256 bytes: neg bitmaps
-    float    scales[8];   // 32 bytes: one scale per row
-    float    _pad[7];     // 28 bytes pad → 576 bytes total
+    uint64_t pos[8][4];
+    uint64_t neg[8][4];
+    float    scales[8];
+    float    _pad[7];
 } TileBlock8;
 
 typedef struct {
@@ -22,13 +22,13 @@ typedef struct {
     uint32_t num_blocks_col;
     uint64_t *magnitude;
     uint64_t *sign;
-    uint64_t *packed_pos;   // weight==+scale bitmap: 4 × uint64 per block (AVX-512)
-    uint64_t *packed_neg;   // weight==-scale bitmap: 4 × uint64 per block (AVX-512)
+    uint64_t *packed_pos;
+    uint64_t *packed_neg;
     uint16_t *scales;
     float    *scales_f32;
-    TileBlock8 *tiles8;     // 8-row tiled layout for optimized matmul
-    uint64_t num_tile_groups8;  // N/8
-    uint32_t total_tiles8;      // num_tile_groups8 * num_blocks_col
+    TileBlock8 *tiles8;
+    uint64_t num_tile_groups8;
+    uint32_t total_tiles8;
 } G128Matrix;
 
 void g128_matrix_init(G128Matrix *m, uint32_t num_rows, uint32_t num_cols);
@@ -86,14 +86,14 @@ typedef struct {
 } LayerWeights;
 
 typedef struct {
-    uint64_t decode_count;           // number of decode steps profiled
-    double   matmul_ns;              // cumulative ns in G128 matmuls (decode only)
-    double   attn_ns;                // cumulative ns in attention core (decode only)
-    double   logits_ns;              // cumulative ns in final embed projection (decode only)
-    double   total_ns;               // cumulative ns across entire model_decode
-    double   per_matmul_ns[MATMUL_COUNT];   // per-matmul-type ns
-    uint64_t per_matmul_calls[MATMUL_COUNT];   // per-type call count
-    uint64_t per_matmul_elements[MATMUL_COUNT]; // per-type ternary elements processed
+    uint64_t decode_count;
+    double   matmul_ns;
+    double   attn_ns;
+    double   logits_ns;
+    double   total_ns;
+    double   per_matmul_ns[MATMUL_COUNT];
+    uint64_t per_matmul_calls[MATMUL_COUNT];
+    uint64_t per_matmul_elements[MATMUL_COUNT];
 } ProfileStats;
 
 typedef struct {
