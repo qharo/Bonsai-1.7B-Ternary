@@ -6,7 +6,7 @@ ifeq ($(UNAME_S),Darwin)
 else
     # Linux / HF Spaces: cap at x86-64-v2 to avoid AVX-512 SIGILL on runtime nodes
     CFLAGS_BASE = -O3 -std=c11 -Wall -fPIC -march=x86-64-v2 -ffast-math
-    LDFLAGS_EXTRA =
+    LDFLAGS_EXTRA = -lmvec
 endif
 
 # OpenMP detection
