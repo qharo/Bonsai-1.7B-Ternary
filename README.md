@@ -2,7 +2,7 @@
 
 <div align="center">
   
-[![Hugging Face](https://img.shields.io/static/v1?label=%F0%9F%A4%97%20Model&message=HuggingFace&color=orange)](https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-mlx-2bit)
+[![Hugging Face](https://img.shields.io/static/v1?label=%F0%9F%A4%97%20Space&message=HuggingFace&color=orange)](https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-mlx-2bit)
 [![Space](https://img.shields.io/static/v1?label=%F0%9F%9A%80%20Space&message=Live%20Demo&color=green)](https://huggingface.co/spaces/qhar0h/Bonsai-1.7B)
 
 [![🚀 Space](https://img.shields.io/badge/🚀_Space-Live_Demo-green)](https://huggingface.co/spaces/qhar0h/Bonsai-1.7B)
