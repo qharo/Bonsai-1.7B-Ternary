@@ -2,7 +2,7 @@
 [![Model](https://img.shields.io/badge/Model-PrismML%2FTernary--Bonsai--1.7B-blue)](https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-mlx-2bit)
 [![Space](https://img.shields.io/badge/Space-Demo-green)](https://huggingface.co/spaces/qhar0h/Bonsai-1.7B)
 
-An optimized C inference engine for **Ternary-Bonsai-1.7B**, served via a FastAPI server with a streaming dark-mode chat UI. 
+An optimized C inference engine for **Ternary-Bonsai-1.7B**, served via a FastAPI server
 
 **Model by:** [PrismML / Caltech](https://huggingface.co/PrismML)
 
@@ -20,7 +20,7 @@ LLM inference is almost entirely memory-bandwidth bound. To get the most out of 
 
 ## 📦 Model Weights
 
-The `model_weights_repacked/` directory contains the pre-converted G128 ternary format weights tracked via Git LFS. The folder is flattened for direct, zero-nesting access by the C engine:
+The `model_weights_repacked/` directory contains the pre-converted G128 ternary format weights tracked via Git LFS. 
 
 ```text
 model_weights_repacked/
