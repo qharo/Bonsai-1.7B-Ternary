@@ -1935,11 +1935,14 @@ int model_load(ModelState *s, const char *dir) {
     }
     s->attn_scale = 1.0f + 0.1f * logf(4.0f);
 
+    // Function pointers prevent GCC vectorization builtins from pulling in libmvec symbols
+    float (*fp_sinf)(float) = sinf;
+    float (*fp_cosf)(float) = cosf;
     for (int pos = 0; pos < MAX_SEQ_LEN; pos++) {
         for (int i = 0; i < HEAD_DIM / 2; i++) {
             float a = (float)pos * s->inv_freq[i];
-            s->rope_cos[pos][i] = cosf(a) * s->attn_scale;
-            s->rope_sin[pos][i] = sinf(a) * s->attn_scale;
+            s->rope_cos[pos][i] = fp_cosf(a) * s->attn_scale;
+            s->rope_sin[pos][i] = fp_sinf(a) * s->attn_scale;
         }
     }
 
