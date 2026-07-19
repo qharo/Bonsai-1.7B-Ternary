@@ -1,6 +1,6 @@
 # Bonsai 1.7B — A 1.58-bit LLM
-[![Model](https://img.shields.io/badge/Model-PrismML%2FTernary--Bonsai--1.7B-blue)](https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-mlx-2bit)
-[![Space](https://img.shields.io/badge/Space-Demo-green)](https://huggingface.co/spaces/qhar0h/Bonsai-1.7B)
+[![🤗 Model](https://img.shields.io/badge/🤗_Model-Ternary_Bonsai_1.7B-yellow)](https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-mlx-2bit)
+[![🚀 Space](https://img.shields.io/badge/🚀_Space-Live_Demo-green)](https://huggingface.co/spaces/qhar0h/Bonsai-1.7B)
 
 An optimized C inference engine for **Ternary-Bonsai-1.7B**, served via a FastAPI server
 
