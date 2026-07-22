@@ -71,4 +71,5 @@ docker run -p 7860:7860 -v $(pwd)/model_weights_repacked:/app/model_weights_repa
 
 - **Official Model:** [prism-ml/Ternary-Bonsai-1.7B-mlx-2bit](https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-mlx-2bit)
 - **Organization:** [PrismML](https://huggingface.co/PrismML)
-- **Paper:** [1.58-bit LLMs](https://arxiv.org/abs/2402.17764)
+- **Paper:** [PrismML Whitepaper]([https://arxiv.org/abs/2402.17764](https://github.com/PrismML-Eng/Bonsai-demo/blob/main/bonsai-27b-whitepaper.pdf)),
+[1.58-bit LLMs](https://arxiv.org/abs/2402.17764)
