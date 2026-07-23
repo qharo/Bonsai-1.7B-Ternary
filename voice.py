@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import wave
 from collections import deque
@@ -535,6 +536,8 @@ class VoiceOrchestrator:
     async def process_utterance(self, pcm_bytes: bytes) -> AsyncIterator[dict]:
         """
         Process a complete audio utterance through the full pipeline.
+        Interleaved: LLM generates tokens in background, TTS runs on complete sentences
+        as soon as they're detected, while LLM continues generating.
         
         Yields dicts with keys:
             type: "transcription" | "llm_text" | "audio" | "status" | "error"
@@ -542,7 +545,7 @@ class VoiceOrchestrator:
         """
         pipeline_t0 = time.perf_counter()
         logger.info(
-            f"Pipeline: Starting processing of {len(pcm_bytes)} bytes "
+            f"Pipeline: Starting interleaved processing of {len(pcm_bytes)} bytes "
             f"(STT_available={self.stt.available if self.stt else False}, "
             f"TTS_available={self.tts.available if self.tts else False})"
         )
@@ -562,67 +565,138 @@ class VoiceOrchestrator:
             logger.info("Pipeline: No speech detected, ending")
             return
         
-        # 2. LLM (streaming generation)
-        yield {"type": "status", "message": "Generating response..."}
+        # 2+3. Interleaved LLM + TTS
+        yield {"type": "status", "message": "Generating and synthesizing..."}
         
-        llm_t0 = time.perf_counter()
-        
-        # Run LLM generation in executor (since it's CPU-bound and blocking)
         loop = asyncio.get_event_loop()
+        token_queue = asyncio.Queue()
+        llm_done = threading.Event()
         
-        def _generate():
-            return list(self.llm_generate(text))
+        # Start LLM generation in background thread
+        def _generate_tokens():
+            try:
+                for token in self.llm_generate(text):
+                    token_queue.put_nowait(token)
+            except Exception as e:
+                logger.error(f"Pipeline: LLM generation error: {e}")
+            finally:
+                llm_done.set()
         
-        try:
-            tokens = await loop.run_in_executor(None, _generate)
-        except Exception as e:
-            logger.error(f"Pipeline: LLM generation failed: {type(e).__name__}: {e}", exc_info=True)
-            yield {"type": "error", "message": f"LLM generation failed: {e}"}
-            return
+        llm_thread = threading.Thread(target=_generate_tokens, daemon=True)
+        llm_thread.start()
         
-        llm_s = time.perf_counter() - llm_t0
-        tps = len(tokens) / llm_s if llm_s > 0 else 0
-        full_text = "".join(tokens)
-        logger.info(
-            f"Pipeline: LLM generated {len(tokens)} tokens in {llm_s:.2f}s "
-            f"({tps:.1f} t/s), text='{full_text[:120]}...'"
-        )
-        
-        # 3. TTS (sentence-by-sentence, stream audio immediately)
-        yield {"type": "status", "message": "Synthesizing speech..."}
-        
-        sentences = split_sentences(full_text)
-        tts_t0 = time.perf_counter()
-        
-        logger.info(f"Pipeline: TTS streaming {len(sentences)} sentences")
-        
+        # Accumulate tokens and detect sentences for interleaved TTS
+        accumulated_text = ""
+        sentence_index = 0
         audio_count = 0
         fail_count = 0
+        llm_token_count = 0
+        llm_t0 = time.perf_counter()
         
-        for i, sentence in enumerate(sentences):
-            if not sentence.strip():
-                continue
+        def _extract_sentences(text):
+            """Extract complete sentences from text, return (sentences, remaining_text)."""
+            parts = _SENTENCE_RE.split(text)
+            if len(parts) <= 1:
+                return [], text
             
-            # Stream text to client for display
-            yield {"type": "llm_text", "text": sentence + " ", "index": i}
+            # Check if text ends with sentence terminator (allowing trailing space)
+            # A sentence is "complete" if it's followed by another non-empty part
+            sentences = []
+            remaining = ""
+            
+            for i, part in enumerate(parts):
+                part = part.strip()
+                if not part:
+                    continue
+                    
+                # Check if this part is followed by whitespace in original text
+                # (indicating it was split by the regex)
+                if i < len(parts) - 1:
+                    # This is a complete sentence
+                    sentences.append(part)
+                else:
+                    # Last part — might be incomplete
+                    remaining = part
+            
+            return sentences, remaining
+        
+        # Consume tokens and process sentences
+        while not (llm_done.is_set() and token_queue.empty()):
+            try:
+                # Wait for tokens with timeout
+                token = await asyncio.wait_for(token_queue.get(), timeout=0.1)
+                accumulated_text += token
+                llm_token_count += 1
+                
+                # Try to extract complete sentences
+                sentences, remaining = _extract_sentences(accumulated_text)
+                
+                if sentences:
+                    accumulated_text = remaining  # Keep incomplete part
+                    
+                    for sentence in sentences:
+                        if not sentence.strip():
+                            continue
+                        
+                        # Stream text to client
+                        yield {"type": "llm_text", "text": sentence + " ", "index": sentence_index}
+                        
+                        # Run TTS in parallel executor
+                        if self.tts.available:
+                            def _synthesize(sent):
+                                return self.tts.synthesize(sent)
+                            
+                            try:
+                                audio = await loop.run_in_executor(None, _synthesize, sentence)
+                                if audio and len(audio) > 100:
+                                    audio_count += 1
+                                    logger.info(
+                                        f"Pipeline: Interleaved TTS sentence {sentence_index} "
+                                        f"({len(audio)} bytes, LLM still running={not llm_done.is_set()})"
+                                    )
+                                    yield {"type": "audio", "data": audio, "index": sentence_index}
+                                else:
+                                    fail_count += 1
+                                    logger.warning(
+                                        f"Pipeline: TTS failed for sentence {sentence_index} "
+                                        f"(audio={len(audio) if audio else 0} bytes)"
+                                    )
+                            except Exception as e:
+                                fail_count += 1
+                                logger.error(f"Pipeline: TTS error for sentence {sentence_index}: {e}")
+                        else:
+                            logger.debug(f"Pipeline: TTS unavailable, skipping sentence {sentence_index}")
+                        
+                        sentence_index += 1
+                        
+            except asyncio.TimeoutError:
+                # No tokens available, check if LLM is done
+                if llm_done.is_set() and token_queue.empty():
+                    break
+                continue
+        
+        llm_thread.join(timeout=1.0)
+        llm_s = time.perf_counter() - llm_t0
+        tps = llm_token_count / llm_s if llm_s > 0 else 0
+        
+        # Process any remaining accumulated text
+        if accumulated_text.strip():
+            yield {"type": "llm_text", "text": accumulated_text.strip() + " ", "index": sentence_index}
             
             if self.tts.available:
-                logger.debug(f"Pipeline: TTS sentence {i}: '{sentence[:60]}...'")
-                audio = self.tts.synthesize(sentence)
-                if audio and len(audio) > 100:  # Valid audio > 100 bytes
-                    audio_count += 1
-                    logger.info(f"Pipeline: Yielding audio for sentence {i} ({len(audio)} bytes)")
-                    yield {"type": "audio", "data": audio, "index": i}
-                else:
-                    fail_count += 1
-                    if audio:
-                        logger.warning(f"Pipeline: TTS sentence {i} produced only {len(audio)} bytes")
+                try:
+                    audio = await loop.run_in_executor(None, self.tts.synthesize, accumulated_text.strip())
+                    if audio and len(audio) > 100:
+                        audio_count += 1
+                        yield {"type": "audio", "data": audio, "index": sentence_index}
                     else:
-                        logger.warning(f"Pipeline: TTS failed for sentence {i}")
-            else:
-                logger.debug(f"Pipeline: TTS unavailable, skipping sentence {i}")
+                        fail_count += 1
+                except Exception as e:
+                    fail_count += 1
+                    logger.error(f"Pipeline: TTS error for final text: {e}")
+            sentence_index += 1
         
-        tts_s = time.perf_counter() - tts_t0
+        tts_s = time.perf_counter() - llm_t0 - llm_s if llm_t0 else 0
         total_s = time.perf_counter() - pipeline_t0
         
         if fail_count > 0 and audio_count == 0:
@@ -633,9 +707,9 @@ class VoiceOrchestrator:
             }
         
         logger.info(
-            f"Pipeline: COMPLETE. Total={total_s:.1f}s "
-            f"(STT={stt_s:.1f}s, LLM={llm_s:.1f}s [{tps:.1f} t/s], TTS={tts_s:.1f}s, "
-            f"sentences={len(sentences)}, audio_sentences={audio_count}, tts_fails={fail_count})"
+            f"Pipeline: COMPLETE (interleaved). Total={total_s:.1f}s "
+            f"(STT={stt_s:.1f}s, LLM={llm_s:.1f}s [{tps:.1f} t/s], "
+            f"sentences={sentence_index}, audio_sentences={audio_count}, tts_fails={fail_count})"
         )
         
         yield {
@@ -646,9 +720,9 @@ class VoiceOrchestrator:
             "stt_time_s": round(stt_s, 2),
             "llm_time_s": round(llm_s, 2),
             "tts_time_s": round(tts_s, 2),
-            "tokens_generated": len(tokens),
+            "tokens_generated": llm_token_count,
             "tokens_per_second": round(tps, 1),
-            "sentences": len(sentences),
+            "sentences": sentence_index,
             "audio_sentences": audio_count,
             "tts_fails": fail_count,
         }
