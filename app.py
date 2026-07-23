@@ -536,10 +536,31 @@ async def health():
 async def voice_health():
     """Detailed voice pipeline health check."""
     voice_ready = VOICE_AVAILABLE and _voice_orchestrator is not None
+    
+    # TTS diagnostic: try a quick synthesis
+    tts_diagnostic = None
+    if _tts and _tts.available:
+        try:
+            import time
+            t0 = time.perf_counter()
+            test_audio = _tts.synthesize("hello")
+            diag_s = time.perf_counter() - t0
+            tts_diagnostic = {
+                "test_synthesis": "ok" if test_audio else "failed",
+                "test_audio_bytes": len(test_audio) if test_audio else 0,
+                "test_duration_s": round(diag_s, 3),
+            }
+        except Exception as e:
+            tts_diagnostic = {
+                "test_synthesis": "error",
+                "error": f"{type(e).__name__}: {e}",
+            }
+    
     return {
         "voice_available": VOICE_AVAILABLE,
         "stt_loaded": _stt is not None and _stt.available,
         "tts_loaded": _tts is not None and _tts.available,
+        "tts_diagnostic": tts_diagnostic,
         "active_connections": len(_voice_connections),
         "models": {
             "stt": "faster-whisper tiny (int8)",
@@ -612,6 +633,19 @@ async def voice_websocket(websocket: WebSocket):
                 audio_bytes = message["bytes"]
                 blob_size = len(audio_bytes)
                 print(f"[VOICE] Client {client_id}: Received audio blob ({blob_size} bytes)", flush=True)
+                
+                # Filter tiny blobs (incomplete recordings, accidental clicks)
+                if blob_size < 5120:  # 5KB minimum
+                    print(f"[VOICE] Client {client_id}: Blob too small ({blob_size} bytes < 5KB), ignoring", flush=True)
+                    try:
+                        await websocket.send_json({
+                            "type": "status",
+                            "message": "Recording too short, please try again",
+                            "done": True,
+                        })
+                    except Exception:
+                        pass
+                    continue
                 
                 # Convert WebM/Opus blob to 16kHz PCM using ffmpeg
                 print(f"[VOICE] Client {client_id}: Converting to PCM with ffmpeg...", flush=True)

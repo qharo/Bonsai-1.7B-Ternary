@@ -295,9 +295,75 @@ class TTS:
             self.available = True
             load_s = time.perf_counter() - t0
             logger.info(f"TTS: Voice loaded in {load_s:.1f}s (sample_rate={self.sample_rate}, api={self._api_type})")
+            
+            # Run diagnostic to determine chunk format
+            self._diagnostic_synthesize()
+            
         except Exception as e:
             logger.error(f"TTS: Failed to load piper voice: {type(e).__name__}: {e}", exc_info=True)
     
+    @staticmethod
+    def _extract_chunk_bytes(chunk):
+        """Extract raw bytes from a TTS chunk (handles AudioChunk, bytes, numpy, etc.)."""
+        if isinstance(chunk, bytes):
+            return chunk
+        if isinstance(chunk, bytearray):
+            return bytes(chunk)
+        # Try common attributes
+        for attr in ('data', 'bytes', 'raw', 'buffer', 'pcm'):
+            if hasattr(chunk, attr):
+                val = getattr(chunk, attr)
+                if isinstance(val, (bytes, bytearray)):
+                    return bytes(val)
+                if hasattr(val, 'tobytes'):
+                    return val.tobytes()
+        # Try numpy-like
+        if hasattr(chunk, 'tobytes'):
+            return chunk.tobytes()
+        if hasattr(chunk, 'numpy'):
+            return chunk.numpy().tobytes()
+        # Try buffer protocol
+        try:
+            return bytes(memoryview(chunk))
+        except Exception:
+            pass
+        # Try np.array
+        try:
+            import numpy as np
+            return np.array(chunk).tobytes()
+        except Exception:
+            pass
+        # Last resort: log what we got
+        chunk_type = type(chunk).__name__
+        attrs = [a for a in dir(chunk) if not a.startswith('_') and not callable(getattr(chunk, a, None))]
+        logger.warning(f"TTS: Cannot extract bytes from chunk type={chunk_type}, attrs={attrs[:20]}")
+        return None
+
+    def _diagnostic_synthesize(self):
+        """Run a quick test synthesis to determine chunk format."""
+        try:
+            logger.info("TTS: Running diagnostic synthesis to determine chunk format...")
+            chunks = list(self.voice.synthesize("hi"))
+            if not chunks:
+                logger.warning("TTS: Diagnostic synthesis returned no chunks")
+                return
+            
+            chunk = chunks[0]
+            chunk_type = type(chunk).__name__
+            logger.info(f"TTS: Diagnostic chunk type={chunk_type}")
+            
+            # Try to extract bytes
+            extracted = self._extract_chunk_bytes(chunk)
+            if extracted is not None:
+                logger.info(f"TTS: Diagnostic success — extracted {len(extracted)} bytes from {chunk_type}")
+            else:
+                logger.error(f"TTS: Diagnostic failed — cannot extract bytes from {chunk_type}")
+                # Log all available attributes
+                attrs = [a for a in dir(chunk) if not a.startswith('_')]
+                logger.info(f"TTS: Available attributes on chunk: {attrs}")
+        except Exception as e:
+            logger.error(f"TTS: Diagnostic synthesis failed: {type(e).__name__}: {e}")
+
     def synthesize(self, text: str) -> Optional[bytes]:
         """Synthesize text to WAV bytes."""
         if not self.available or not self.voice:
@@ -312,26 +378,40 @@ class TTS:
         try:
             wav_io = io.BytesIO()
             audio_data = b''
+            chunk_count = 0
             
             if self._api_type == "synthesize_stream_raw":
-                # Newer API: returns iterator of raw audio bytes
                 logger.debug(f"TTS: Using synthesize_stream_raw for '{text[:60]}...'")
                 for chunk in self.voice.synthesize_stream_raw(text):
-                    audio_data += chunk
-                    
+                    raw = self._extract_chunk_bytes(chunk)
+                    if raw:
+                        audio_data += raw
+                        chunk_count += 1
+                    else:
+                        logger.warning(f"TTS: Skipping unextractable chunk in synthesize_stream_raw")
+                        
             elif self._api_type == "synthesize":
-                # Standard API: returns iterable of audio data
                 logger.debug(f"TTS: Using synthesize for '{text[:60]}...'")
                 
-                # Try different calling conventions
+                # Try: voice.synthesize(text) returns iterator of chunks
                 try:
-                    # Try: voice.synthesize(text) returns iterator
                     for chunk in self.voice.synthesize(text):
-                        audio_data += chunk
-                except TypeError as te:
-                    logger.warning(f"TTS: synthesize(text) failed: {te}, trying positional args")
+                        raw = self._extract_chunk_bytes(chunk)
+                        if raw:
+                            audio_data += raw
+                            chunk_count += 1
+                        else:
+                            logger.warning(f"TTS: Skipping unextractable chunk in synthesize")
+                    
+                    if audio_data:
+                        logger.debug(f"TTS: synthesize(text) succeeded with {chunk_count} chunks")
+                    else:
+                        logger.warning("TTS: synthesize(text) returned chunks but no extractable bytes")
+                        
+                except Exception as e:
+                    logger.warning(f"TTS: synthesize(text) failed: {type(e).__name__}: {e}, trying wav_file fallback")
                     try:
-                        # Try: voice.synthesize(text, wav_file) with positional
+                        # Fallback: voice.synthesize(text, wav_file) writes directly to file
                         with wave.open(wav_io, 'wb') as wf:
                             wf.setnchannels(1)
                             wf.setsampwidth(2)
@@ -339,16 +419,21 @@ class TTS:
                             self.voice.synthesize(text, wf)
                             audio_data = wav_io.getvalue()
                             proc_s = time.perf_counter() - t0
-                            logger.info(f"TTS: '{text[:60]}...' → {len(audio_data)} bytes WAV ({proc_s:.2f}s)")
+                            logger.info(f"TTS: '{text[:60]}...' → {len(audio_data)} bytes WAV via wav_file ({proc_s:.2f}s)")
                             return audio_data
                     except Exception as e2:
-                        logger.error(f"TTS: synthesize(text, wav_file) also failed: {type(e2).__name__}: {e2}")
+                        logger.error(f"TTS: wav_file fallback also failed: {type(e2).__name__}: {e2}")
                         return None
             else:
                 logger.error(f"TTS: Unknown API type '{self._api_type}'")
                 return None
             
+            if not audio_data:
+                logger.error(f"TTS: No audio data extracted for '{text[:60]}...'")
+                return None
+            
             # Wrap raw PCM in WAV container
+            wav_io = io.BytesIO()
             with wave.open(wav_io, 'wb') as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
@@ -360,7 +445,7 @@ class TTS:
             logger.info(
                 f"TTS: '{text[:60]}...' → "
                 f"{len(audio)} bytes WAV ({proc_s:.2f}s, "
-                f"raw_audio={len(audio_data)} bytes)"
+                f"chunks={chunk_count}, raw_audio={len(audio_data)} bytes)"
             )
             return audio
             
