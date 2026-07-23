@@ -31,7 +31,6 @@ body {
   overflow: hidden;
 }
 
-/* ── Header ─────────────────────────────────────────────── */
 header {
   background: var(--surface);
   border-bottom: 1px solid var(--border);
@@ -43,7 +42,6 @@ header {
 }
 
 .h-logo { font-size: 20px; line-height: 1; }
-
 .h-title { font-weight: 600; font-size: 15px; }
 .h-sub   { font-size: 11px; color: var(--muted); margin-top: 1px; }
 
@@ -61,14 +59,6 @@ header {
   white-space: nowrap;
 }
 
-.live-dot {
-  width: 7px; height: 7px;
-  border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 5px var(--accent);
-  flex-shrink: 0;
-}
-
 .status-dot {
   width: 7px; height: 7px;
   border-radius: 50%;
@@ -80,7 +70,6 @@ header {
 .status-dot.processing { background: #f0883e; box-shadow: 0 0 5px #f0883e; }
 .status-dot.ready { background: var(--accent); box-shadow: 0 0 5px var(--accent); }
 
-/* ── Main content ───────────────────────────────────────── */
 main {
   flex: 1;
   display: flex;
@@ -92,9 +81,13 @@ main {
   overflow-y: auto;
 }
 
-/* ── Mic button ─────────────────────────────────────────── */
+/* Mic button */
 .mic-wrap {
   position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
 }
 
 .mic-btn {
@@ -128,22 +121,26 @@ main {
   50% { transform: scale(1.05); box-shadow: 0 0 20px 10px rgba(248,81,73,0); }
 }
 
-.mic-ring {
-  position: absolute;
-  top: -8px; left: -8px; right: -8px; bottom: -8px;
-  border-radius: 50%;
-  border: 2px solid var(--error);
+/* Audio level bar */
+.level-bar {
+  width: 120px;
+  height: 6px;
+  background: var(--surface2);
+  border-radius: 3px;
+  overflow: hidden;
   opacity: 0;
   transition: opacity .2s;
 }
-.mic-btn.recording + .mic-ring { opacity: 1; animation: ring-pulse 2s ease-out infinite; }
-
-@keyframes ring-pulse {
-  0% { transform: scale(0.95); opacity: 1; }
-  100% { transform: scale(1.3); opacity: 0; }
+.level-bar.active { opacity: 1; }
+.level-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width .05s linear;
 }
 
-/* ── Status text ────────────────────────────────────────── */
+/* Status */
 .status-text {
   font-size: 15px;
   color: var(--muted);
@@ -151,7 +148,7 @@ main {
   min-height: 22px;
 }
 
-/* ── Transcript area ──────────────────────────────────────── */
+/* Transcript */
 .transcript-area {
   width: 100%;
   max-width: 600px;
@@ -168,7 +165,6 @@ main {
   border-radius: var(--r);
   padding: 14px 18px;
 }
-
 .transcript-block .label {
   font-size: 11px;
   text-transform: uppercase;
@@ -176,18 +172,16 @@ main {
   color: var(--muted);
   margin-bottom: 6px;
 }
-
 .transcript-block .text {
   font-size: 15px;
   line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
 }
-
 .transcript-block.user .label { color: var(--user-bg); }
 .transcript-block.bot .label { color: var(--accent); }
 
-/* ── Timing stats ─────────────────────────────────────────── */
+/* Stats */
 .stats-line {
   font-size: 11px;
   color: var(--muted);
@@ -196,7 +190,7 @@ main {
   min-height: 16px;
 }
 
-/* ── Error toast ──────────────────────────────────────────── */
+/* Toast */
 .error-toast {
   position: fixed;
   top: 20px;
@@ -214,7 +208,6 @@ main {
 }
 .error-toast.show { opacity: 1; }
 
-/* ── Link back ──────────────────────────────────────────── */
 .back-link {
   position: fixed;
   bottom: 16px;
@@ -236,27 +229,25 @@ main {
   </div>
   <div class="h-badge">
     <div class="status-dot" id="status-dot"></div>
-    <span id="badge-text">Initializing...</span>
+    <span id="badge-text">Connecting...</span>
   </div>
 </header>
 
 <main>
   <div class="mic-wrap">
-    <button class="mic-btn" id="mic-btn" title="Hold to speak">🎙</button>
-    <div class="mic-ring"></div>
+    <button class="mic-btn" id="mic-btn" title="Hold to speak" disabled>🎙</button>
+    <div class="level-bar" id="level-bar">
+      <div class="level-fill" id="level-fill"></div>
+    </div>
   </div>
   
-  <div class="status-text" id="status-text">Connect to start voice chat</div>
+  <div class="status-text" id="status-text">Connecting to voice server...</div>
   
-  <div class="transcript-area" id="transcript-area">
-    <!-- Transcript blocks will appear here -->
-  </div>
-  
+  <div class="transcript-area" id="transcript-area"></div>
   <div class="stats-line" id="stats-line"></div>
 </main>
 
 <div class="error-toast" id="error-toast"></div>
-
 <a href="/" class="back-link">← Text chat</a>
 
 <script>
@@ -267,22 +258,25 @@ const badgeText    = document.getElementById('badge-text');
 const transcriptEl = document.getElementById('transcript-area');
 const statsLine    = document.getElementById('stats-line');
 const errorToast   = document.getElementById('error-toast');
+const levelBar     = document.getElementById('level-bar');
+const levelFill    = document.getElementById('level-fill');
 
 let ws = null;
-let audioContext = null;
-let mediaStream = null;
-let processor = null;
-let source = null;
+let mediaRecorder = null;
+let audioChunks = [];
 let isRecording = false;
 let isProcessing = false;
 let reconnectAttempts = 0;
 const MAX_RECONNECT = 3;
+let processingTimeout = null;
+let analyser = null;
+let animationId = null;
 
 // Audio queue for playback
 const audioQueue = [];
 let isPlaying = false;
+let audioContext = null;
 
-// Debug logging
 function log(label, ...args) {
   console.log(`[${label}]`, ...args);
 }
@@ -301,16 +295,15 @@ function connectWebSocket() {
   ws.onopen = () => {
     log('WS', 'Connected');
     reconnectAttempts = 0;
-    setStatus('ready', 'Connected — hold mic to speak');
+    micBtn.disabled = false;
+    setStatus('ready', 'Ready');
     statusText.textContent = 'Hold the microphone button to speak';
-    // Send config
-    ws.send(JSON.stringify({type: 'config', format: 'pcm'}));
   };
   
   ws.onmessage = (event) => {
     try {
       const data = JSON.parse(event.data);
-      log('WS', 'Received:', data.type, data);
+      log('WS', '←', data.type, data);
       handleMessage(data);
     } catch (e) {
       log('WS', 'Parse error:', e);
@@ -319,23 +312,19 @@ function connectWebSocket() {
   
   ws.onerror = (err) => {
     log('WS', 'Error:', err);
-    showError('Connection error — check console');
+    showError('Connection error');
     setStatus('error', 'Connection error');
   };
   
   ws.onclose = (event) => {
-    log('WS', 'Closed. Code:', event.code, 'Reason:', event.reason, 'Clean:', event.wasClean);
+    log('WS', 'Closed. Code:', event.code, 'Reason:', event.reason);
     setStatus('error', 'Disconnected');
     micBtn.disabled = true;
     
-    // Auto-reconnect
     if (reconnectAttempts < MAX_RECONNECT) {
       reconnectAttempts++;
       log('WS', `Reconnecting in 2s (attempt ${reconnectAttempts}/${MAX_RECONNECT})`);
-      setTimeout(() => {
-        setStatus('ready', 'Reconnecting...');
-        connectWebSocket();
-      }, 2000);
+      setTimeout(connectWebSocket, 2000);
     } else {
       setStatus('error', 'Disconnected — refresh to reconnect');
       statusText.textContent = 'Connection lost. Please refresh the page.';
@@ -348,6 +337,7 @@ function handleMessage(data) {
     case 'status':
       statusText.textContent = data.message;
       if (data.done) {
+        clearProcessingTimeout();
         isProcessing = false;
         setStatus('ready', 'Ready');
         micBtn.classList.remove('processing');
@@ -370,11 +360,12 @@ function handleMessage(data) {
       break;
       
     case 'audio':
-      log('AUDIO', 'Received audio chunk, length:', data.data ? data.data.length : 0);
+      log('AUDIO', 'Received chunk, base64 length:', data.data ? data.data.length : 0);
       playAudio(data.data);
       break;
       
     case 'error':
+      clearProcessingTimeout();
       showError(data.message);
       isProcessing = false;
       setStatus('ready', 'Ready');
@@ -390,19 +381,15 @@ function handleMessage(data) {
   }
 }
 
-// ── Audio Capture ──────────────────────────────────────────
+// ── Audio Capture (MediaRecorder) ──────────────────────────
 
 async function ensureAudioContext() {
   if (!audioContext) {
-    log('AUDIO', 'Creating AudioContext');
-    audioContext = new AudioContext({ sampleRate: 16000 });
+    audioContext = new AudioContext();
   }
-  
   if (audioContext.state === 'suspended') {
-    log('AUDIO', 'Resuming suspended AudioContext');
     await audioContext.resume();
   }
-  
   return audioContext;
 }
 
@@ -413,51 +400,109 @@ async function startRecording() {
   }
   
   if (!ws || ws.readyState !== WebSocket.OPEN) {
-    showError('Not connected — wait for connection');
+    showError('Not connected');
     return;
   }
   
   try {
+    log('MIC', 'Requesting microphone...');
+    const stream = await navigator.mediaDevices.getUserMedia({ 
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      }
+    });
+    
+    log('MIC', 'Microphone access granted');
+    
+    // Setup audio analysis for level meter
     await ensureAudioContext();
+    const audioSource = audioContext.createMediaStreamSource(stream);
+    analyser = audioContext.createAnalyser();
+    analyser.fftSize = 256;
+    audioSource.connect(analyser);
     
-    if (!mediaStream) {
-      log('MIC', 'Requesting microphone access...');
-      mediaStream = await navigator.mediaDevices.getUserMedia({ 
-        audio: {
-          sampleRate: 16000,
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-        }
-      });
-      log('MIC', 'Microphone access granted');
-    }
+    // Start level meter animation
+    levelBar.classList.add('active');
+    animateLevel();
     
-    source = audioContext.createMediaStreamSource(mediaStream);
-    processor = audioContext.createScriptProcessor(4096, 1, 1);
+    // Setup MediaRecorder
+    const mimeType = getSupportedMimeType();
+    log('MIC', 'Using MIME type:', mimeType);
     
-    let chunkCount = 0;
-    processor.onaudioprocess = (e) => {
-      if (!isRecording || !ws || ws.readyState !== WebSocket.OPEN) return;
-      
-      const inputData = e.inputBuffer.getChannelData(0);
-      // Convert float32 to int16
-      const int16Data = new Int16Array(inputData.length);
-      for (let i = 0; i < inputData.length; i++) {
-        int16Data[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
+    mediaRecorder = new MediaRecorder(stream, { mimeType });
+    audioChunks = [];
+    
+    mediaRecorder.ondataavailable = (event) => {
+      if (event.data.size > 0) {
+        audioChunks.push(event.data);
+        log('MIC', 'Chunk received:', event.data.size, 'bytes');
       }
-      
-      chunkCount++;
-      if (chunkCount % 10 === 0) {
-        log('AUDIO', `Sent ${chunkCount} chunks (${int16Data.length} samples)`);
-      }
-      
-      ws.send(int16Data.buffer);
     };
     
-    source.connect(processor);
-    processor.connect(audioContext.destination);
+    mediaRecorder.onstop = async () => {
+      log('MIC', 'Recording stopped, chunks:', audioChunks.length);
+      
+      // Stop level meter
+      if (animationId) {
+        cancelAnimationFrame(animationId);
+        animationId = null;
+      }
+      levelBar.classList.remove('active');
+      levelFill.style.width = '0%';
+      
+      // Stop all tracks
+      stream.getTracks().forEach(t => t.stop());
+      
+      if (audioChunks.length === 0) {
+        log('MIC', 'No audio captured');
+        isProcessing = false;
+        setStatus('ready', 'Ready');
+        micBtn.classList.remove('processing');
+        micBtn.disabled = false;
+        statusText.textContent = 'No audio captured. Try again.';
+        return;
+      }
+      
+      // Combine chunks into blob
+      const audioBlob = new Blob(audioChunks, { type: mimeType });
+      log('MIC', 'Total blob size:', audioBlob.size, 'bytes');
+      
+      // Convert to ArrayBuffer and send
+      const arrayBuffer = await audioBlob.arrayBuffer();
+      log('MIC', 'Sending', arrayBuffer.byteLength, 'bytes to server');
+      
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(arrayBuffer);
+        log('MIC', 'Audio sent');
+        
+        // Set processing state
+        isProcessing = true;
+        micBtn.classList.add('processing');
+        micBtn.disabled = true;
+        setStatus('processing', 'Processing...');
+        statusText.textContent = 'Processing your speech...';
+        
+        // Set timeout to reset UI if server doesn't respond
+        setProcessingTimeout();
+      } else {
+        showError('Connection lost during recording');
+        isProcessing = false;
+        setStatus('error', 'Disconnected');
+        micBtn.disabled = false;
+      }
+    };
     
+    mediaRecorder.onerror = (e) => {
+      log('MIC', 'MediaRecorder error:', e);
+      showError('Recording error: ' + e.message);
+      stopRecording();
+    };
+    
+    // Start recording with 100ms timeslice to get chunks
+    mediaRecorder.start(100);
     isRecording = true;
     micBtn.classList.add('recording');
     setStatus('recording', 'Listening...');
@@ -466,41 +511,87 @@ async function startRecording() {
     
   } catch (err) {
     log('MIC', 'Error:', err.name, err.message);
-    showError('Microphone access denied or not available');
     
     if (err.name === 'NotAllowedError') {
-      statusText.textContent = 'Microphone permission denied. Please allow mic access.';
+      showError('Microphone permission denied');
+      statusText.textContent = 'Please allow microphone access in your browser.';
     } else if (err.name === 'NotFoundError') {
-      statusText.textContent = 'No microphone found. Please connect one.';
+      showError('No microphone found');
+      statusText.textContent = 'No microphone detected. Please connect one.';
     } else {
+      showError('Error: ' + err.message);
       statusText.textContent = 'Error: ' + err.message;
     }
   }
 }
 
 function stopRecording() {
-  if (!isRecording) return;
+  if (!isRecording || !mediaRecorder) return;
   
-  log('MIC', 'Stopping recording');
+  log('MIC', 'Stopping recording...');
   isRecording = false;
   micBtn.classList.remove('recording');
   
-  if (processor) {
-    processor.disconnect();
-    processor.onaudioprocess = null;
-    processor = null;
+  if (mediaRecorder.state !== 'inactive') {
+    mediaRecorder.stop();
   }
-  if (source) {
-    source.disconnect();
-    source = null;
+}
+
+function getSupportedMimeType() {
+  const types = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/ogg;codecs=opus',
+    'audio/ogg',
+    'audio/mp4',
+  ];
+  for (const type of types) {
+    if (MediaRecorder.isTypeSupported(type)) {
+      return type;
+    }
   }
+  return ''; // Let browser choose default
+}
+
+function animateLevel() {
+  if (!analyser) return;
   
-  isProcessing = true;
-  micBtn.classList.add('processing');
-  micBtn.disabled = true;
-  setStatus('processing', 'Processing...');
-  statusText.textContent = 'Processing your speech...';
-  log('MIC', 'Processing started');
+  const dataArray = new Uint8Array(analyser.frequencyBinCount);
+  analyser.getByteFrequencyData(dataArray);
+  
+  // Calculate average volume
+  let sum = 0;
+  for (let i = 0; i < dataArray.length; i++) {
+    sum += dataArray[i];
+  }
+  const average = sum / dataArray.length;
+  const percentage = Math.min(100, (average / 128) * 100);
+  
+  levelFill.style.width = percentage + '%';
+  
+  animationId = requestAnimationFrame(animateLevel);
+}
+
+// ── Processing timeout ─────────────────────────────────────
+
+function setProcessingTimeout() {
+  clearProcessingTimeout();
+  processingTimeout = setTimeout(() => {
+    log('TIMEOUT', 'No response from server after 15s');
+    showError('Server response timeout — please try again');
+    isProcessing = false;
+    setStatus('ready', 'Ready');
+    micBtn.classList.remove('processing');
+    micBtn.disabled = false;
+    statusText.textContent = 'Timed out. Hold mic to speak again.';
+  }, 15000);
+}
+
+function clearProcessingTimeout() {
+  if (processingTimeout) {
+    clearTimeout(processingTimeout);
+    processingTimeout = null;
+  }
 }
 
 // ── Audio Playback ─────────────────────────────────────────
@@ -537,7 +628,6 @@ async function playNext() {
   try {
     await ensureAudioContext();
     
-    // Decode WAV data
     log('PLAY', 'Decoding audio...');
     const audioBuffer = await audioContext.decodeAudioData(audioBytes);
     log('PLAY', 'Audio decoded:', audioBuffer.duration.toFixed(2), 's');
@@ -573,7 +663,7 @@ function setStatus(state, text) {
 }
 
 function addTranscript(role, text) {
-  currentBotBlock = null;  // Reset bot block for new turn
+  currentBotBlock = null;
   const block = document.createElement('div');
   block.className = 'transcript-block ' + role;
   block.innerHTML = `
@@ -632,16 +722,19 @@ micBtn.addEventListener('touchend', (e) => {
   stopRecording();
 });
 
-// Keyboard shortcut (spacebar)
+// Keyboard shortcut
+let spacePressed = false;
 document.addEventListener('keydown', (e) => {
-  if (e.code === 'Space' && !isRecording && !isProcessing && e.target === document.body) {
+  if (e.code === 'Space' && !spacePressed && !isRecording && !isProcessing && e.target === document.body) {
     e.preventDefault();
+    spacePressed = true;
     startRecording();
   }
 });
 document.addEventListener('keyup', (e) => {
-  if (e.code === 'Space' && isRecording) {
+  if (e.code === 'Space' && spacePressed) {
     e.preventDefault();
+    spacePressed = false;
     stopRecording();
   }
 });
