@@ -673,17 +673,17 @@ async def voice_websocket(websocket: WebSocket):
                     async for result in _voice_orchestrator.process_utterance(pcm_bytes):
                         result_type = result.get("type", "unknown")
                         
-                        if result["type"] == "audio":
+                        if result["type"] == "audio_complete":
                             audio_b64 = base64.b64encode(result["data"]).decode('utf-8')
-                            print(f"[VOICE] Client {client_id}: Sending audio ({len(audio_b64)} chars base64)", flush=True)
+                            print(f"[VOICE] Client {client_id}: Sending audio_complete ({len(audio_b64)} chars base64, {len(result['data'])} bytes)", flush=True)
                             try:
                                 await websocket.send_json({
-                                    "type": "audio",
+                                    "type": "audio_complete",
                                     "data": audio_b64,
-                                    "index": result.get("index", 0),
+                                    "audio_bytes": len(result["data"]),
                                 })
                             except Exception as e:
-                                print(f"[VOICE] Client {client_id}: Error sending audio: {e}", flush=True)
+                                print(f"[VOICE] Client {client_id}: Error sending audio_complete: {e}", flush=True)
                                 break
                                 
                         elif result["type"] == "transcription":
