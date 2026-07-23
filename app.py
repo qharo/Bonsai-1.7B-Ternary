@@ -15,11 +15,21 @@ from contextlib import asynccontextmanager
 # we need only tokenizers
 os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = '1'
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 from transformers import AutoTokenizer
 import uvicorn
+
+import base64
+
+# Voice imports (optional — voice chat disabled if deps missing)
+try:
+    from voice import VADBuffer, STT, TTS, VoiceOrchestrator, convert_audio_to_pcm
+    VOICE_AVAILABLE = True
+except Exception as _voice_err:
+    print(f"[WARN] Voice modules not available: {_voice_err}", flush=True)
+    VOICE_AVAILABLE = False
 
 # Model config
 MODEL_DIR = os.environ.get("MODEL_DIR", "./model_weights_repacked")
@@ -40,6 +50,16 @@ _tokenizer = None
 G128Matrix = None
 FP32Matrix = None
 LayerWeights = None
+
+# Voice state
+_stt = None
+_tts = None
+_voice_orchestrator = None
+_voice_connections: set = set()
+
+# TTS model paths (downloaded during Docker build or at runtime)
+PIPER_MODEL_PATH = os.environ.get("PIPER_MODEL_PATH", "./piper_voice/model.onnx")
+PIPER_CONFIG_PATH = os.environ.get("PIPER_CONFIG_PATH", "./piper_voice/model.json")
 
 def load_library():
     global _lib, ModelState, ProfileStats, G128Matrix, FP32Matrix, LayerWeights
@@ -241,6 +261,9 @@ def init_model():
     log_startup_diagnostics(load_s)
     log_pod_info()
 
+    # Initialize voice pipeline
+    init_voice()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
@@ -250,11 +273,83 @@ async def lifespan(app: FastAPI):
     if _model and _lib:
         _lib.model_free(ctypes.byref(_model))
 
+
+def init_voice():
+    """Initialize voice pipeline components (STT, TTS)."""
+    global _stt, _tts, _voice_orchestrator
+    
+    if not VOICE_AVAILABLE:
+        print("[VOICE] Voice dependencies not available, voice chat disabled", flush=True)
+        return
+    
+    print("[VOICE] Initializing voice pipeline...", flush=True)
+    t0 = time.perf_counter()
+    
+    # STT
+    try:
+        _stt = STT(model_size="tiny", device="cpu", compute_type="int8")
+    except Exception as e:
+        print(f"[VOICE ERROR] STT init failed: {e}", flush=True)
+    
+    # TTS
+    try:
+        _tts = TTS(model_path=PIPER_MODEL_PATH, config_path=PIPER_CONFIG_PATH)
+    except Exception as e:
+        print(f"[VOICE ERROR] TTS init failed: {e}", flush=True)
+    
+    # Orchestrator
+    if _stt and _stt.available:
+        _voice_orchestrator = VoiceOrchestrator(
+            stt=_stt,
+            tts=_tts,
+            llm_generate_fn=generate_text_for_voice
+        )
+        init_s = time.perf_counter() - t0
+        print(f"[VOICE] Pipeline ready in {init_s:.1f}s", flush=True)
+    else:
+        print("[VOICE] Pipeline partially unavailable (STT failed)", flush=True)
+
+
+def generate_text_for_voice(prompt_text: str):
+    """Sync generator that yields text tokens for the voice orchestrator."""
+    if not _model or not _lib:
+        yield "[Model not loaded]"
+        return
+    
+    messages = [
+        {"role": "system", "content": "You are a helpful, concise assistant. Answer questions directly and clearly. Keep responses brief."},
+        {"role": "user", "content": prompt_text}
+    ]
+    
+    text = _tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    tokens = _tokenizer.encode(text, add_special_tokens=False)
+    stop_ids = {STOP_EOS}
+    
+    token_array = (ctypes.c_int32 * len(tokens))(*tokens)
+    ret = _lib.model_prefill(ctypes.byref(_model), token_array, len(tokens), _logits_buf)
+    if ret != 0:
+        yield "[Prefill failed]"
+        return
+    
+    for i in range(128):  # Shorter max for voice (faster responses)
+        next_token = sample_token(_logits_buf, DEFAULT_TEMP, DEFAULT_TOP_P, DEFAULT_TOP_K)
+        if next_token in stop_ids:
+            break
+        txt = _tokenizer.decode([next_token], skip_special_tokens=True)
+        yield txt
+        ret = _lib.model_decode(ctypes.byref(_model), ctypes.c_int32(next_token), _logits_buf)
+        if ret != 0:
+            break
+
 app = FastAPI(title="Bonsai 1.7B Inference", lifespan=lifespan)
 
 @app.get("/")
 async def index():
     return FileResponse("index.html")
+
+@app.get("/voice")
+async def voice_page():
+    return FileResponse("voice.html")
 
 class GenerateRequest(BaseModel):
     prompt: str
@@ -434,7 +529,157 @@ async def health():
         "cpu": model_name,
         "simd": simd,
         "omp_threads": omp_threads,
+        "voice_available": VOICE_AVAILABLE and _stt is not None and _stt.available,
     }
+
+@app.get("/health/voice")
+async def voice_health():
+    """Detailed voice pipeline health check."""
+    voice_ready = VOICE_AVAILABLE and _voice_orchestrator is not None
+    return {
+        "voice_available": VOICE_AVAILABLE,
+        "stt_loaded": _stt is not None and _stt.available,
+        "tts_loaded": _tts is not None and _tts.available,
+        "active_connections": len(_voice_connections),
+        "models": {
+            "stt": "faster-whisper tiny (int8)",
+            "tts": "piper-tts",
+        }
+    }
+
+@app.websocket("/ws/voice")
+async def voice_websocket(websocket: WebSocket):
+    """WebSocket endpoint for real-time voice chat."""
+    await websocket.accept()
+    _voice_connections.add(websocket)
+    client_id = id(websocket)
+    print(f"[VOICE] Client {client_id} connected (total: {len(_voice_connections)})", flush=True)
+    
+    if not VOICE_AVAILABLE or _voice_orchestrator is None:
+        await websocket.send_json({
+            "type": "error",
+            "message": "Voice pipeline not available. Check server logs."
+        })
+        await websocket.close()
+        _voice_connections.discard(websocket)
+        return
+    
+    vad = VADBuffer(aggressiveness=3, frame_ms=30)
+    audio_format = "webm"  # Default, can be negotiated
+    
+    try:
+        while True:
+            # Receive message (binary audio or JSON control)
+            message = await websocket.receive()
+            
+            if "text" in message:
+                # JSON control message
+                try:
+                    data = json.loads(message["text"])
+                    msg_type = data.get("type", "")
+                    
+                    if msg_type == "config":
+                        audio_format = data.get("format", "webm")
+                        print(f"[VOICE] Client {client_id} format set to {audio_format}", flush=True)
+                        await websocket.send_json({"type": "status", "message": f"Ready ({audio_format})"})
+                        continue
+                    
+                    elif msg_type == "ping":
+                        await websocket.send_json({"type": "pong"})
+                        continue
+                        
+                except json.JSONDecodeError:
+                    pass
+            
+            elif "bytes" in message:
+                # Audio data
+                audio_bytes = message["bytes"]
+                
+                # Convert to PCM if needed
+                pcm_bytes = audio_bytes
+                if audio_format == "webm":
+                    pcm_bytes = convert_audio_to_pcm(audio_bytes, input_format="webm")
+                elif audio_format == "wav":
+                    # WAV has headers, extract raw PCM
+                    try:
+                        import io, wave
+                        with wave.open(io.BytesIO(audio_bytes), 'rb') as wf:
+                            pcm_bytes = wf.readframes(wf.getnframes())
+                    except Exception as e:
+                        print(f"[VOICE] WAV parse error: {e}", flush=True)
+                        continue
+                
+                if not pcm_bytes:
+                    continue
+                
+                # Feed to VAD
+                utterance = vad.process(pcm_bytes)
+                
+                if utterance:
+                    # Got a complete utterance - process it
+                    print(f"[VOICE] Client {client_id}: Utterance detected ({len(utterance)} bytes)", flush=True)
+                    
+                    try:
+                        async for result in _voice_orchestrator.process_utterance(utterance):
+                            if result["type"] == "audio":
+                                # Send audio as base64-encoded WAV
+                                audio_b64 = base64.b64encode(result["data"]).decode('utf-8')
+                                await websocket.send_json({
+                                    "type": "audio",
+                                    "data": audio_b64,
+                                    "index": result.get("index", 0),
+                                })
+                            elif result["type"] == "transcription":
+                                await websocket.send_json({
+                                    "type": "transcription",
+                                    "text": result["text"],
+                                    "stt_time_s": result.get("stt_time_s", 0),
+                                })
+                            elif result["type"] == "llm_text":
+                                await websocket.send_json({
+                                    "type": "llm_text",
+                                    "text": result["text"],
+                                    "index": result.get("index", 0),
+                                })
+                            elif result["type"] == "status":
+                                await websocket.send_json({
+                                    "type": "status",
+                                    "message": result["message"],
+                                    "done": result.get("done", False),
+                                    "total_time_s": result.get("total_time_s"),
+                                    "tokens_per_second": result.get("tokens_per_second"),
+                                })
+                            elif result["type"] == "error":
+                                await websocket.send_json({
+                                    "type": "error",
+                                    "message": result["message"],
+                                })
+                    except Exception as e:
+                        print(f"[VOICE] Pipeline error for client {client_id}: {e}", flush=True)
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": f"Pipeline error: {str(e)}"
+                        })
+    
+    except WebSocketDisconnect:
+        print(f"[VOICE] Client {client_id} disconnected", flush=True)
+    except Exception as e:
+        print(f"[VOICE] Client {client_id} error: {type(e).__name__}: {e}", flush=True)
+    finally:
+        # Flush any pending audio
+        pending = vad.flush()
+        if pending and _voice_orchestrator:
+            try:
+                async for result in _voice_orchestrator.process_utterance(pending):
+                    if result["type"] == "audio":
+                        audio_b64 = base64.b64encode(result["data"]).decode('utf-8')
+                        await websocket.send_json({"type": "audio", "data": audio_b64})
+            except Exception:
+                pass
+        
+        _voice_connections.discard(websocket)
+        print(f"[VOICE] Client {client_id} removed (total: {len(_voice_connections)})", flush=True)
+
 
 @app.get("/profile")
 async def profile():

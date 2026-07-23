@@ -8,3 +8,9 @@ onnxruntime>=1.17.0
 g2p-en>=2.0.0
 huggingface_hub
 scipy>=1.10.0
+
+# Voice chat dependencies
+faster-whisper>=1.0.0
+piper-tts>=1.2.0
+webrtcvad-wheels>=2.0.11
+ffmpeg-python>=0.2.0
