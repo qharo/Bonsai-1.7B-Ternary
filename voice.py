@@ -34,17 +34,32 @@ def pcm_to_wav(pcm_bytes: bytes, sample_rate: int = 16000, channels: int = 1) ->
     return wav_io.getvalue()
 
 
-def convert_audio_to_pcm(input_bytes: bytes, input_format: str = "webm", sample_rate: int = 16000) -> bytes:
-    """Convert audio (WebM/Opus/etc) to 16kHz mono PCM s16le using ffmpeg."""
+def convert_audio_to_pcm(input_bytes: bytes, input_format: str = "auto", sample_rate: int = 16000) -> bytes:
+    """Convert audio (WebM/Opus/OGG/etc) to 16kHz mono PCM s16le using ffmpeg.
+    
+    input_format: 'auto' lets ffmpeg detect from magic bytes, or specify 'webm', 'ogg', etc.
+    """
     t0 = time.perf_counter()
+    
+    # Log first 8 bytes as hex for debugging
+    header_hex = input_bytes[:8].hex()
+    logger.info(f"ffmpeg: input blob {len(input_bytes)} bytes, header={header_hex}")
+    
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-f", input_format,
+    ]
+    
+    # Only force format if explicitly specified (not 'auto')
+    if input_format and input_format != "auto":
+        cmd.extend(["-f", input_format])
+    
+    cmd.extend([
         "-i", "pipe:0",
         "-ar", str(sample_rate), "-ac", "1",
         "-f", "s16le", "-acodec", "pcm_s16le",
         "pipe:1"
-    ]
+    ])
+    
     try:
         result = subprocess.run(cmd, input=input_bytes, capture_output=True, timeout=30)
         if result.returncode != 0:
@@ -52,7 +67,7 @@ def convert_audio_to_pcm(input_bytes: bytes, input_format: str = "webm", sample_
             logger.error(f"ffmpeg conversion failed: {err}")
             return b''
         proc_s = time.perf_counter() - t0
-        logger.debug(f"ffmpeg: converted {len(input_bytes)} bytes → {len(result.stdout)} bytes PCM in {proc_s:.2f}s")
+        logger.info(f"ffmpeg: converted {len(input_bytes)} bytes → {len(result.stdout)} bytes PCM in {proc_s:.2f}s")
         return result.stdout
     except subprocess.TimeoutExpired:
         logger.error("ffmpeg conversion timed out after 30s")

@@ -650,7 +650,7 @@ async def voice_websocket(websocket: WebSocket):
                 # Convert WebM/Opus blob to 16kHz PCM using ffmpeg
                 print(f"[VOICE] Client {client_id}: Converting to PCM with ffmpeg...", flush=True)
                 t0 = time.perf_counter()
-                pcm_bytes = convert_audio_to_pcm(audio_bytes, input_format="webm", sample_rate=16000)
+                pcm_bytes = convert_audio_to_pcm(audio_bytes, input_format="auto", sample_rate=16000)
                 conv_s = time.perf_counter() - t0
                 
                 if not pcm_bytes:

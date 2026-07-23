@@ -280,7 +280,6 @@ const levelFill    = document.getElementById('level-fill');
 
 let ws = null;
 let mediaRecorder = null;
-let audioChunks = [];
 let isRecording = false;
 let isProcessing = false;
 let reconnectAttempts = 0;
@@ -454,7 +453,7 @@ async function startRecording() {
     log('MIC', 'Using MIME type:', mimeType);
     
     mediaRecorder = new MediaRecorder(stream, { mimeType });
-    audioChunks = [];
+    const audioChunks = [];  // Scoped to this recording session
     
     mediaRecorder.ondataavailable = (event) => {
       if (event.data.size > 0) {
@@ -490,6 +489,12 @@ async function startRecording() {
       // Combine chunks into blob
       const audioBlob = new Blob(audioChunks, { type: mimeType });
       log('MIC', 'Total blob size:', audioBlob.size, 'bytes');
+      
+      // Peek at first 8 bytes for debugging
+      const peekBuffer = await audioBlob.slice(0, 8).arrayBuffer();
+      const peekBytes = new Uint8Array(peekBuffer);
+      const peekHex = Array.from(peekBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+      log('MIC', 'Blob header hex:', peekHex, 'ascii:', String.fromCharCode(...peekBytes));
       
       // Convert to ArrayBuffer and send
       const arrayBuffer = await audioBlob.arrayBuffer();
