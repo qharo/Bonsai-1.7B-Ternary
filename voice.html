@@ -89,6 +89,7 @@ main {
   justify-content: center;
   gap: 24px;
   padding: 40px 20px;
+  overflow-y: auto;
 }
 
 /* ── Mic button ─────────────────────────────────────────── */
@@ -127,7 +128,6 @@ main {
   50% { transform: scale(1.05); box-shadow: 0 0 20px 10px rgba(248,81,73,0); }
 }
 
-/* Ring animation when listening */
 .mic-ring {
   position: absolute;
   top: -8px; left: -8px; right: -8px; bottom: -8px;
@@ -158,6 +158,8 @@ main {
   display: flex;
   flex-direction: column;
   gap: 16px;
+  overflow-y: auto;
+  max-height: 50vh;
 }
 
 .transcript-block {
@@ -178,6 +180,8 @@ main {
 .transcript-block .text {
   font-size: 15px;
   line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .transcript-block.user .label { color: var(--user-bg); }
@@ -189,6 +193,7 @@ main {
   color: var(--muted);
   text-align: center;
   margin-top: 4px;
+  min-height: 16px;
 }
 
 /* ── Error toast ──────────────────────────────────────────── */
@@ -270,10 +275,17 @@ let processor = null;
 let source = null;
 let isRecording = false;
 let isProcessing = false;
+let reconnectAttempts = 0;
+const MAX_RECONNECT = 3;
 
 // Audio queue for playback
 const audioQueue = [];
 let isPlaying = false;
+
+// Debug logging
+function log(label, ...args) {
+  console.log(`[${label}]`, ...args);
+}
 
 // ── WebSocket ──────────────────────────────────────────────
 
@@ -281,31 +293,53 @@ function connectWebSocket() {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const wsUrl = `${protocol}//${window.location.host}/ws/voice`;
   
+  log('WS', 'Connecting to', wsUrl);
+  
   ws = new WebSocket(wsUrl);
   ws.binaryType = 'arraybuffer';
   
   ws.onopen = () => {
-    console.log('[WS] Connected');
+    log('WS', 'Connected');
+    reconnectAttempts = 0;
     setStatus('ready', 'Connected — hold mic to speak');
+    statusText.textContent = 'Hold the microphone button to speak';
     // Send config
     ws.send(JSON.stringify({type: 'config', format: 'pcm'}));
   };
   
   ws.onmessage = (event) => {
-    const data = JSON.parse(event.data);
-    handleMessage(data);
+    try {
+      const data = JSON.parse(event.data);
+      log('WS', 'Received:', data.type, data);
+      handleMessage(data);
+    } catch (e) {
+      log('WS', 'Parse error:', e);
+    }
   };
   
   ws.onerror = (err) => {
-    console.error('[WS] Error:', err);
-    showError('Connection error');
+    log('WS', 'Error:', err);
+    showError('Connection error — check console');
     setStatus('error', 'Connection error');
   };
   
-  ws.onclose = () => {
-    console.log('[WS] Closed');
-    setStatus('error', 'Disconnected — refresh to reconnect');
+  ws.onclose = (event) => {
+    log('WS', 'Closed. Code:', event.code, 'Reason:', event.reason, 'Clean:', event.wasClean);
+    setStatus('error', 'Disconnected');
     micBtn.disabled = true;
+    
+    // Auto-reconnect
+    if (reconnectAttempts < MAX_RECONNECT) {
+      reconnectAttempts++;
+      log('WS', `Reconnecting in 2s (attempt ${reconnectAttempts}/${MAX_RECONNECT})`);
+      setTimeout(() => {
+        setStatus('ready', 'Reconnecting...');
+        connectWebSocket();
+      }, 2000);
+    } else {
+      setStatus('error', 'Disconnected — refresh to reconnect');
+      statusText.textContent = 'Connection lost. Please refresh the page.';
+    }
   };
 }
 
@@ -317,11 +351,13 @@ function handleMessage(data) {
         isProcessing = false;
         setStatus('ready', 'Ready');
         micBtn.classList.remove('processing');
+        micBtn.disabled = false;
         
         if (data.total_time_s) {
           statsLine.textContent = 
             `Total: ${data.total_time_s}s · LLM: ${data.llm_time_s}s · TTS: ${data.tts_time_s}s · ${data.tokens_per_second} t/s`;
         }
+        currentBotBlock = null;
       }
       break;
       
@@ -334,6 +370,7 @@ function handleMessage(data) {
       break;
       
     case 'audio':
+      log('AUDIO', 'Received audio chunk, length:', data.data ? data.data.length : 0);
       playAudio(data.data);
       break;
       
@@ -342,24 +379,49 @@ function handleMessage(data) {
       isProcessing = false;
       setStatus('ready', 'Ready');
       micBtn.classList.remove('processing');
+      micBtn.disabled = false;
       break;
       
     case 'pong':
       break;
+      
+    default:
+      log('WS', 'Unknown message type:', data.type);
   }
 }
 
 // ── Audio Capture ──────────────────────────────────────────
 
+async function ensureAudioContext() {
+  if (!audioContext) {
+    log('AUDIO', 'Creating AudioContext');
+    audioContext = new AudioContext({ sampleRate: 16000 });
+  }
+  
+  if (audioContext.state === 'suspended') {
+    log('AUDIO', 'Resuming suspended AudioContext');
+    await audioContext.resume();
+  }
+  
+  return audioContext;
+}
+
 async function startRecording() {
-  if (isProcessing) return;
+  if (isProcessing) {
+    log('MIC', 'Cannot start — still processing');
+    return;
+  }
+  
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    showError('Not connected — wait for connection');
+    return;
+  }
   
   try {
-    if (!audioContext) {
-      audioContext = new AudioContext({ sampleRate: 16000 });
-    }
+    await ensureAudioContext();
     
     if (!mediaStream) {
+      log('MIC', 'Requesting microphone access...');
       mediaStream = await navigator.mediaDevices.getUserMedia({ 
         audio: {
           sampleRate: 16000,
@@ -368,11 +430,13 @@ async function startRecording() {
           noiseSuppression: true,
         }
       });
+      log('MIC', 'Microphone access granted');
     }
     
     source = audioContext.createMediaStreamSource(mediaStream);
     processor = audioContext.createScriptProcessor(4096, 1, 1);
     
+    let chunkCount = 0;
     processor.onaudioprocess = (e) => {
       if (!isRecording || !ws || ws.readyState !== WebSocket.OPEN) return;
       
@@ -381,6 +445,11 @@ async function startRecording() {
       const int16Data = new Int16Array(inputData.length);
       for (let i = 0; i < inputData.length; i++) {
         int16Data[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
+      }
+      
+      chunkCount++;
+      if (chunkCount % 10 === 0) {
+        log('AUDIO', `Sent ${chunkCount} chunks (${int16Data.length} samples)`);
       }
       
       ws.send(int16Data.buffer);
@@ -392,20 +461,33 @@ async function startRecording() {
     isRecording = true;
     micBtn.classList.add('recording');
     setStatus('recording', 'Listening...');
-    statusText.textContent = 'Speak now...';
+    statusText.textContent = 'Speak now... release to stop';
+    log('MIC', 'Recording started');
     
   } catch (err) {
-    console.error('Mic error:', err);
+    log('MIC', 'Error:', err.name, err.message);
     showError('Microphone access denied or not available');
+    
+    if (err.name === 'NotAllowedError') {
+      statusText.textContent = 'Microphone permission denied. Please allow mic access.';
+    } else if (err.name === 'NotFoundError') {
+      statusText.textContent = 'No microphone found. Please connect one.';
+    } else {
+      statusText.textContent = 'Error: ' + err.message;
+    }
   }
 }
 
 function stopRecording() {
+  if (!isRecording) return;
+  
+  log('MIC', 'Stopping recording');
   isRecording = false;
   micBtn.classList.remove('recording');
   
   if (processor) {
     processor.disconnect();
+    processor.onaudioprocess = null;
     processor = null;
   }
   if (source) {
@@ -415,24 +497,37 @@ function stopRecording() {
   
   isProcessing = true;
   micBtn.classList.add('processing');
+  micBtn.disabled = true;
   setStatus('processing', 'Processing...');
   statusText.textContent = 'Processing your speech...';
+  log('MIC', 'Processing started');
 }
 
 // ── Audio Playback ─────────────────────────────────────────
 
 async function playAudio(base64Data) {
-  const audioBytes = base64ToArrayBuffer(base64Data);
-  audioQueue.push(audioBytes);
+  if (!base64Data) {
+    log('PLAY', 'Empty audio data');
+    return;
+  }
   
-  if (!isPlaying) {
-    playNext();
+  try {
+    const audioBytes = base64ToArrayBuffer(base64Data);
+    log('PLAY', 'Queueing audio:', audioBytes.byteLength, 'bytes');
+    audioQueue.push(audioBytes);
+    
+    if (!isPlaying) {
+      playNext();
+    }
+  } catch (e) {
+    log('PLAY', 'Error queueing audio:', e);
   }
 }
 
 async function playNext() {
   if (audioQueue.length === 0) {
     isPlaying = false;
+    log('PLAY', 'Queue empty');
     return;
   }
   
@@ -440,19 +535,23 @@ async function playNext() {
   const audioBytes = audioQueue.shift();
   
   try {
-    if (!audioContext) {
-      audioContext = new AudioContext({ sampleRate: 22050 });
-    }
+    await ensureAudioContext();
     
     // Decode WAV data
+    log('PLAY', 'Decoding audio...');
     const audioBuffer = await audioContext.decodeAudioData(audioBytes);
-    const source = audioContext.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(audioContext.destination);
-    source.onended = playNext;
-    source.start();
+    log('PLAY', 'Audio decoded:', audioBuffer.duration.toFixed(2), 's');
+    
+    const bufSource = audioContext.createBufferSource();
+    bufSource.buffer = audioBuffer;
+    bufSource.connect(audioContext.destination);
+    bufSource.onended = () => {
+      log('PLAY', 'Audio finished');
+      playNext();
+    };
+    bufSource.start();
   } catch (err) {
-    console.error('Audio playback error:', err);
+    log('PLAY', 'Playback error:', err.name, err.message);
     playNext();  // Skip and continue
   }
 }
@@ -474,6 +573,7 @@ function setStatus(state, text) {
 }
 
 function addTranscript(role, text) {
+  currentBotBlock = null;  // Reset bot block for new turn
   const block = document.createElement('div');
   block.className = 'transcript-block ' + role;
   block.innerHTML = `
@@ -548,6 +648,7 @@ document.addEventListener('keyup', (e) => {
 
 // ── Init ───────────────────────────────────────────────────
 
+log('INIT', 'Voice chat initializing...');
 connectWebSocket();
 </script>
 

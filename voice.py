@@ -69,6 +69,7 @@ class VADBuffer:
             import webrtcvad
             self.vad = webrtcvad.Vad(aggressiveness)
             self.available = True
+            logger.info(f"VAD: Initialized (aggressiveness={aggressiveness}, frame_ms={frame_ms})")
         except Exception as e:
             logger.error(f"VAD: Failed to import webrtcvad: {e}")
             self.vad = None
@@ -85,6 +86,7 @@ class VADBuffer:
         self.silence_count = 0
         self.speech_count = 0
         self.total_frames = 0
+        self.total_audio_bytes = 0
         
         # Thresholds
         self.min_speech_frames = 10       # 300ms minimum speech
@@ -97,14 +99,17 @@ class VADBuffer:
         """
         if not self.available:
             return None
-            
+        
+        self.total_audio_bytes += len(pcm_chunk)
         self.ring_buffer.extend(pcm_chunk)
         utterance = None
+        frames_processed = 0
         
         while len(self.ring_buffer) >= self.frame_bytes:
             frame = bytes(self.ring_buffer[:self.frame_bytes])
             self.ring_buffer = self.ring_buffer[self.frame_bytes:]
             self.total_frames += 1
+            frames_processed += 1
             
             try:
                 is_speech = self.vad.is_speech(frame, self.sample_rate)
@@ -118,7 +123,7 @@ class VADBuffer:
                 if not self.speech_active and self.speech_count >= self.min_speech_frames:
                     self.speech_active = True
                     self.speech_buffer = bytearray()
-                    logger.debug(f"VAD: Speech started (frame {self.total_frames})")
+                    logger.info(f"VAD: Speech started (frame {self.total_frames}, speech_count={self.speech_count})")
             else:
                 self.silence_count += 1
                 self.speech_count = max(0, self.speech_count - 1)
@@ -130,7 +135,12 @@ class VADBuffer:
                 if self.silence_count >= self.max_silence_frames:
                     utterance = bytes(self.speech_buffer)
                     duration_s = len(utterance) / (self.sample_rate * 2)
-                    logger.info(f"VAD: Speech ended by silence ({duration_s:.1f}s, {self.total_frames} frames)")
+                    logger.info(
+                        f"VAD: Speech ended by silence "
+                        f"({duration_s:.1f}s, {self.total_frames} total frames, "
+                        f"{len(self.speech_buffer)} bytes, "
+                        f"silence_count={self.silence_count})"
+                    )
                     self._reset()
                     break
                 
@@ -139,9 +149,20 @@ class VADBuffer:
                 if speech_frames >= self.max_duration_frames:
                     utterance = bytes(self.speech_buffer)
                     duration_s = len(utterance) / (self.sample_rate * 2)
-                    logger.info(f"VAD: Speech ended by max duration ({duration_s:.1f}s)")
+                    logger.info(
+                        f"VAD: Speech ended by max duration "
+                        f"({duration_s:.1f}s, {speech_frames} frames)"
+                    )
                     self._reset()
                     break
+        
+        if frames_processed > 0 and not self.speech_active:
+            logger.debug(
+                f"VAD: Processed {frames_processed} frames, "
+                f"total_audio={self.total_audio_bytes} bytes, "
+                f"ring_buffer={len(self.ring_buffer)} bytes, "
+                f"speech_count={self.speech_count}, silence_count={self.silence_count}"
+            )
         
         return utterance
     
@@ -180,7 +201,7 @@ class STT:
             self.available = True
             logger.info(f"STT: Model loaded in {load_s:.1f}s")
         except Exception as e:
-            logger.error(f"STT: Failed to load model: {type(e).__name__}: {e}")
+            logger.error(f"STT: Failed to load model: {type(e).__name__}: {e}", exc_info=True)
     
     def transcribe(self, pcm_bytes: bytes) -> str:
         """Transcribe 16kHz mono PCM audio to text."""
@@ -197,6 +218,8 @@ class STT:
         
         t0 = time.perf_counter()
         try:
+            logger.info(f"STT: Starting transcription of {len(audio_np)/16000:.1f}s audio ({len(pcm_bytes)} bytes)")
+            
             segments, info = self.model.transcribe(
                 audio_np, 
                 beam_size=5, 
@@ -206,13 +229,19 @@ class STT:
                 vad_parameters=dict(min_silence_duration_ms=500)
             )
             texts = []
+            segment_count = 0
             for segment in segments:
                 texts.append(segment.text.strip())
+                segment_count += 1
             text = " ".join(texts).strip()
             proc_s = time.perf_counter() - t0
             duration_s = len(audio_np) / 16000
             
-            logger.info(f"STT: {duration_s:.1f}s audio → '{text[:100]}...' ({proc_s:.2f}s)")
+            logger.info(
+                f"STT: Transcription complete in {proc_s:.2f}s "
+                f"(duration={duration_s:.1f}s, segments={segment_count}, "
+                f"text='{text[:120]}')"
+            )
             return text
         except Exception as e:
             logger.error(f"STT: Transcription failed: {type(e).__name__}: {e}", exc_info=True)
@@ -228,10 +257,13 @@ class TTS:
         self.available = False
         self.voice = None
         self.sample_rate = 22050
+        self._api_type = "unknown"
         
         if not model_path or not config_path:
             logger.warning("TTS: No model/config paths provided, TTS disabled")
             return
+        
+        logger.info(f"TTS: Checking paths - model={model_path}, config={config_path}")
         
         if not os.path.exists(model_path):
             logger.error(f"TTS: Model file not found: {model_path}")
@@ -246,11 +278,25 @@ class TTS:
             t0 = time.perf_counter()
             self.voice = PiperVoice.load(model_path, config_path)
             self.sample_rate = getattr(self.voice.config, 'sample_rate', 22050)
+            
+            # Log available methods for debugging
+            methods = [m for m in dir(self.voice) if not m.startswith('_')]
+            logger.info(f"TTS: PiperVoice methods available: {methods}")
+            
+            # Determine API type
+            if hasattr(self.voice, 'synthesize_stream_raw'):
+                self._api_type = "synthesize_stream_raw"
+            elif hasattr(self.voice, 'synthesize'):
+                self._api_type = "synthesize"
+            else:
+                logger.error(f"TTS: No suitable synthesize method found on PiperVoice")
+                return
+            
             self.available = True
             load_s = time.perf_counter() - t0
-            logger.info(f"TTS: Voice loaded in {load_s:.1f}s (sample_rate={self.sample_rate})")
+            logger.info(f"TTS: Voice loaded in {load_s:.1f}s (sample_rate={self.sample_rate}, api={self._api_type})")
         except Exception as e:
-            logger.error(f"TTS: Failed to load piper voice: {type(e).__name__}: {e}")
+            logger.error(f"TTS: Failed to load piper voice: {type(e).__name__}: {e}", exc_info=True)
     
     def synthesize(self, text: str) -> Optional[bytes]:
         """Synthesize text to WAV bytes."""
@@ -262,37 +308,68 @@ class TTS:
             return None
         
         t0 = time.perf_counter()
+        
         try:
             wav_io = io.BytesIO()
+            audio_data = b''
+            
+            if self._api_type == "synthesize_stream_raw":
+                # Newer API: returns iterator of raw audio bytes
+                logger.debug(f"TTS: Using synthesize_stream_raw for '{text[:60]}...'")
+                for chunk in self.voice.synthesize_stream_raw(text):
+                    audio_data += chunk
+                    
+            elif self._api_type == "synthesize":
+                # Standard API: returns iterable of audio data
+                logger.debug(f"TTS: Using synthesize for '{text[:60]}...'")
+                
+                # Try different calling conventions
+                try:
+                    # Try: voice.synthesize(text) returns iterator
+                    for chunk in self.voice.synthesize(text):
+                        audio_data += chunk
+                except TypeError as te:
+                    logger.warning(f"TTS: synthesize(text) failed: {te}, trying positional args")
+                    try:
+                        # Try: voice.synthesize(text, wav_file) with positional
+                        with wave.open(wav_io, 'wb') as wf:
+                            wf.setnchannels(1)
+                            wf.setsampwidth(2)
+                            wf.setframerate(self.sample_rate)
+                            self.voice.synthesize(text, wf)
+                            audio_data = wav_io.getvalue()
+                            proc_s = time.perf_counter() - t0
+                            logger.info(f"TTS: '{text[:60]}...' → {len(audio_data)} bytes WAV ({proc_s:.2f}s)")
+                            return audio_data
+                    except Exception as e2:
+                        logger.error(f"TTS: synthesize(text, wav_file) also failed: {type(e2).__name__}: {e2}")
+                        return None
+            else:
+                logger.error(f"TTS: Unknown API type '{self._api_type}'")
+                return None
+            
+            # Wrap raw PCM in WAV container
             with wave.open(wav_io, 'wb') as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
                 wf.setframerate(self.sample_rate)
-                
-                # Try different piper APIs
-                audio_data = b''
-                if hasattr(self.voice, 'synthesize_stream_raw'):
-                    # Newer API: returns iterator of raw audio bytes
-                    for chunk in self.voice.synthesize_stream_raw(text):
-                        audio_data += chunk
-                elif hasattr(self.voice, 'synthesize_raw'):
-                    audio_data = self.voice.synthesize_raw(text)
-                else:
-                    # Fallback: synthesize to file-like object
-                    self.voice.synthesize(text, wav_file=wf)
-                    audio_data = wav_io.getvalue()
-                    proc_s = time.perf_counter() - t0
-                    logger.info(f"TTS: '{text[:60]}...' → {len(audio_data)} bytes WAV ({proc_s:.2f}s)")
-                    return audio_data
-                
                 wf.writeframes(audio_data)
             
             audio = wav_io.getvalue()
             proc_s = time.perf_counter() - t0
-            logger.info(f"TTS: '{text[:60]}...' → {len(audio)} bytes WAV ({proc_s:.2f}s)")
+            logger.info(
+                f"TTS: '{text[:60]}...' → "
+                f"{len(audio)} bytes WAV ({proc_s:.2f}s, "
+                f"raw_audio={len(audio_data)} bytes)"
+            )
             return audio
+            
         except Exception as e:
-            logger.error(f"TTS: Synthesis failed for '{text[:60]}...': {type(e).__name__}: {e}", exc_info=True)
+            logger.error(
+                f"TTS: Synthesis failed for '{text[:60]}...': "
+                f"{type(e).__name__}: {e}",
+                exc_info=True
+            )
             return None
 
 
@@ -325,7 +402,11 @@ class VoiceOrchestrator:
             Additional fields depend on type.
         """
         pipeline_t0 = time.perf_counter()
-        logger.info(f"Pipeline: Starting processing of {len(pcm_bytes)} bytes")
+        logger.info(
+            f"Pipeline: Starting processing of {len(pcm_bytes)} bytes "
+            f"(STT_available={self.stt.available if self.stt else False}, "
+            f"TTS_available={self.tts.available if self.tts else False})"
+        )
         
         # 1. STT
         yield {"type": "status", "message": "Transcribing speech..."}
@@ -335,7 +416,7 @@ class VoiceOrchestrator:
         stt_s = time.perf_counter() - stt_t0
         
         yield {"type": "transcription", "text": text, "stt_time_s": round(stt_s, 2)}
-        logger.info(f"Pipeline: STT complete in {stt_s:.2f}s → '{text[:100]}...'")
+        logger.info(f"Pipeline: STT complete in {stt_s:.2f}s → '{text[:120]}'")
         
         if not text:
             yield {"type": "status", "message": "No speech detected", "done": True}
@@ -363,13 +444,21 @@ class VoiceOrchestrator:
         llm_s = time.perf_counter() - llm_t0
         tps = len(tokens) / llm_s if llm_s > 0 else 0
         full_text = "".join(tokens)
-        logger.info(f"Pipeline: LLM generated {len(tokens)} tokens in {llm_s:.2f}s ({tps:.1f} t/s)")
+        logger.info(
+            f"Pipeline: LLM generated {len(tokens)} tokens in {llm_s:.2f}s "
+            f"({tps:.1f} t/s), text='{full_text[:120]}...'"
+        )
         
         # 3. TTS (sentence-by-sentence)
         yield {"type": "status", "message": "Synthesizing speech..."}
         
         sentences = split_sentences(full_text)
         tts_t0 = time.perf_counter()
+        
+        logger.info(f"Pipeline: TTS processing {len(sentences)} sentences")
+        
+        audio_count = 0
+        fail_count = 0
         
         for i, sentence in enumerate(sentences):
             if not sentence.strip():
@@ -378,9 +467,14 @@ class VoiceOrchestrator:
             yield {"type": "llm_text", "text": sentence + " ", "index": i}
             
             if self.tts.available:
+                logger.debug(f"Pipeline: TTS sentence {i}: '{sentence[:60]}...'")
                 audio = self.tts.synthesize(sentence)
                 if audio:
+                    audio_count += 1
                     yield {"type": "audio", "data": audio, "index": i}
+                else:
+                    fail_count += 1
+                    logger.warning(f"Pipeline: TTS failed for sentence {i}")
             else:
                 logger.debug(f"Pipeline: TTS unavailable, skipping sentence {i}")
         
@@ -388,8 +482,9 @@ class VoiceOrchestrator:
         total_s = time.perf_counter() - pipeline_t0
         
         logger.info(
-            f"Pipeline: Complete. Total={total_s:.1f}s "
-            f"(STT={stt_s:.1f}s, LLM={llm_s:.1f}s [{tps:.1f} t/s], TTS={tts_s:.1f}s)"
+            f"Pipeline: COMPLETE. Total={total_s:.1f}s "
+            f"(STT={stt_s:.1f}s, LLM={llm_s:.1f}s [{tps:.1f} t/s], TTS={tts_s:.1f}s, "
+            f"sentences={len(sentences)}, audio_sentences={audio_count}, tts_fails={fail_count})"
         )
         
         yield {
@@ -403,4 +498,6 @@ class VoiceOrchestrator:
             "tokens_generated": len(tokens),
             "tokens_per_second": round(tps, 1),
             "sentences": len(sentences),
+            "audio_sentences": audio_count,
+            "tts_fails": fail_count,
         }
