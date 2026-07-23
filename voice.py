@@ -507,47 +507,6 @@ def split_sentences(text: str) -> List[str]:
     return [s.strip() for s in sentences if s.strip()]
 
 
-# ── Audio utilities ─────────────────────────────────────────
-
-def combine_wavs(wav_bytes_list: List[bytes]) -> bytes:
-    """Combine multiple WAV files into a single WAV file."""
-    if not wav_bytes_list:
-        return b''
-    
-    if len(wav_bytes_list) == 1:
-        return wav_bytes_list[0]
-    
-    # Extract raw PCM from each WAV and combine
-    combined_pcm = b''
-    sample_rate = 22050
-    sample_width = 2
-    channels = 1
-    
-    for wav_bytes in wav_bytes_list:
-        try:
-            with io.BytesIO(wav_bytes) as wf_io:
-                with wave.open(wf_io, 'rb') as wf:
-                    sample_rate = wf.getframerate()
-                    sample_width = wf.getsampwidth()
-                    channels = wf.getnchannels()
-                    combined_pcm += wf.readframes(wf.getnframes())
-        except Exception as e:
-            logger.warning(f"TTS: Error extracting PCM from WAV: {e}")
-    
-    if not combined_pcm:
-        return b''
-    
-    # Write combined WAV
-    out = io.BytesIO()
-    with wave.open(out, 'wb') as wf:
-        wf.setnchannels(channels)
-        wf.setsampwidth(sample_width)
-        wf.setframerate(sample_rate)
-        wf.writeframes(combined_pcm)
-    
-    return out.getvalue()
-
-
 # ── Orchestrator ────────────────────────────────────────────
 
 class VoiceOrchestrator:
@@ -614,15 +573,14 @@ class VoiceOrchestrator:
             f"({tps:.1f} t/s), text='{full_text[:120]}...'"
         )
         
-        # 3. TTS (sentence-by-sentence, collect all audio)
+        # 3. TTS (sentence-by-sentence, stream audio immediately)
         yield {"type": "status", "message": "Synthesizing speech..."}
         
         sentences = split_sentences(full_text)
         tts_t0 = time.perf_counter()
         
-        logger.info(f"Pipeline: TTS processing {len(sentences)} sentences")
+        logger.info(f"Pipeline: TTS streaming {len(sentences)} sentences")
         
-        sentence_audio_list = []  # Collect all sentence WAVs
         audio_count = 0
         fail_count = 0
         
@@ -637,8 +595,9 @@ class VoiceOrchestrator:
                 logger.debug(f"Pipeline: TTS sentence {i}: '{sentence[:60]}...'")
                 audio = self.tts.synthesize(sentence)
                 if audio and len(audio) > 100:  # Valid audio > 100 bytes
-                    sentence_audio_list.append(audio)
                     audio_count += 1
+                    logger.info(f"Pipeline: Yielding audio for sentence {i} ({len(audio)} bytes)")
+                    yield {"type": "audio", "data": audio, "index": i}
                 else:
                     fail_count += 1
                     if audio:
@@ -649,32 +608,19 @@ class VoiceOrchestrator:
                 logger.debug(f"Pipeline: TTS unavailable, skipping sentence {i}")
         
         tts_s = time.perf_counter() - tts_t0
+        total_s = time.perf_counter() - pipeline_t0
         
-        # Combine all sentence audio into one WAV
-        combined_audio = None
-        if sentence_audio_list:
-            combined_audio = combine_wavs(sentence_audio_list)
-            logger.info(
-                f"Pipeline: Combined {len(sentence_audio_list)} sentence WAVs → "
-                f"{len(combined_audio)} bytes total audio"
-            )
-            if combined_audio:
-                yield {"type": "audio_complete", "data": combined_audio}
-        elif fail_count > 0:
-            # All TTS attempts failed — notify client
+        if fail_count > 0 and audio_count == 0:
             logger.error(f"Pipeline: ALL {fail_count} TTS sentences failed")
             yield {
                 "type": "error",
                 "message": f"TTS failed for all {fail_count} sentences. Check server logs."
             }
         
-        total_s = time.perf_counter() - pipeline_t0
-        
         logger.info(
             f"Pipeline: COMPLETE. Total={total_s:.1f}s "
             f"(STT={stt_s:.1f}s, LLM={llm_s:.1f}s [{tps:.1f} t/s], TTS={tts_s:.1f}s, "
-            f"sentences={len(sentences)}, audio_sentences={audio_count}, tts_fails={fail_count}, "
-            f"combined_audio={len(combined_audio) if combined_audio else 0} bytes)"
+            f"sentences={len(sentences)}, audio_sentences={audio_count}, tts_fails={fail_count})"
         )
         
         yield {
@@ -690,5 +636,4 @@ class VoiceOrchestrator:
             "sentences": len(sentences),
             "audio_sentences": audio_count,
             "tts_fails": fail_count,
-            "combined_audio_bytes": len(combined_audio) if combined_audio else 0,
         }

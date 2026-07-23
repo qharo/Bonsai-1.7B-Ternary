@@ -376,14 +376,12 @@ function handleMessage(data) {
       appendBotText(data.text);
       break;
       
-    case 'audio_complete':
-      log('AUDIO', 'Received complete audio, base64 length:', data.data ? data.data.length : 0, 'audio_bytes:', data.audio_bytes);
+    case 'audio':
+      log('AUDIO', 'Received sentence', data.index, 'base64 length:', data.data ? data.data.length : 0, 'audio_bytes:', data.audio_bytes);
       if (data.audio_bytes && data.audio_bytes > 100) {
-        playAudio(data.data);
-        addAudioPlayer(data.data);
+        queueAudio(data.data);
       } else {
-        log('AUDIO', 'Audio too small, not playing:', data.audio_bytes);
-        showError('TTS produced no audio — check server logs');
+        log('AUDIO', 'Audio too small, not queuing:', data.audio_bytes);
       }
       break;
       
@@ -619,22 +617,17 @@ function clearProcessingTimeout() {
 
 // ── Audio Playback ─────────────────────────────────────────
 
-async function playAudio(base64Data) {
+function queueAudio(base64Data) {
   if (!base64Data) {
     log('PLAY', 'Empty audio data');
     return;
   }
   
-  try {
-    const audioBytes = base64ToArrayBuffer(base64Data);
-    log('PLAY', 'Queueing audio:', audioBytes.byteLength, 'bytes');
-    audioQueue.push(audioBytes);
-    
-    if (!isPlaying) {
-      playNext();
-    }
-  } catch (e) {
-    log('PLAY', 'Error queueing audio:', e);
+  log('PLAY', 'Queueing audio base64, length:', base64Data.length);
+  audioQueue.push(base64Data);
+  
+  if (!isPlaying) {
+    playNext();
   }
 }
 
@@ -646,14 +639,18 @@ async function playNext() {
   }
   
   isPlaying = true;
-  const audioBytes = audioQueue.shift();
+  const base64Data = audioQueue.shift();
   
   try {
     await ensureAudioContext();
     
-    log('PLAY', 'Decoding audio...');
+    const audioBytes = base64ToArrayBuffer(base64Data);
+    log('PLAY', 'Decoding audio:', audioBytes.byteLength, 'bytes');
     const audioBuffer = await audioContext.decodeAudioData(audioBytes);
     log('PLAY', 'Audio decoded:', audioBuffer.duration.toFixed(2), 's');
+    
+    // Add/update audio player for replay
+    addAudioPlayer(base64Data);
     
     const bufSource = audioContext.createBufferSource();
     bufSource.buffer = audioBuffer;
