@@ -1,3 +1,13 @@
+---
+title: Bonsai 1.7B
+emoji: 🌿
+colorFrom: green
+colorTo: blue
+sdk: docker
+app_file: app.py
+pinned: false
+---
+
 # Bonsai 1.7B — A 1.58-bit LLM
 
 <div align="center">
