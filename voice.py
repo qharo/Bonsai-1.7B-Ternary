@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import wave
 from collections import deque
@@ -16,6 +17,8 @@ from typing import AsyncIterator, Callable, List, Optional, Tuple
 
 import numpy as np
 
+# Ensure logging shows INFO messages (HF Spaces suppresses them by default)
+logging.basicConfig(level=logging.INFO, format='%(name)s: %(message)s')
 logger = logging.getLogger("voice")
 
 # ── Audio utilities ─────────────────────────────────────────
@@ -251,13 +254,15 @@ class STT:
 # ── TTS ─────────────────────────────────────────────────────
 
 class TTS:
-    """Text-to-Speech using piper-tts."""
+    """Text-to-Speech using piper-tts via subprocess CLI (primary) or Python API (fallback)."""
     
     def __init__(self, model_path: Optional[str] = None, config_path: Optional[str] = None):
         self.available = False
         self.voice = None
         self.sample_rate = 22050
-        self._api_type = "unknown"
+        self.model_path = model_path
+        self.config_path = config_path
+        self._cli_available = False
         
         if not model_path or not config_path:
             logger.warning("TTS: No model/config paths provided, TTS disabled")
@@ -272,166 +277,107 @@ class TTS:
             logger.error(f"TTS: Config file not found: {config_path}")
             return
         
+        # Check if piper CLI is available
+        try:
+            result = subprocess.run(
+                ["piper", "--help"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                self._cli_available = True
+                logger.info("TTS: piper CLI is available")
+            else:
+                logger.warning(f"TTS: piper CLI returned {result.returncode}: {result.stderr[:200]}")
+        except Exception as e:
+            logger.warning(f"TTS: piper CLI not found: {type(e).__name__}: {e}")
+        
+        # Try loading Python API voice as fallback
         try:
             from piper import PiperVoice
             logger.info(f"TTS: Loading piper voice from {model_path}...")
             t0 = time.perf_counter()
             self.voice = PiperVoice.load(model_path, config_path)
             self.sample_rate = getattr(self.voice.config, 'sample_rate', 22050)
-            
-            # Log available methods for debugging
-            methods = [m for m in dir(self.voice) if not m.startswith('_')]
-            logger.info(f"TTS: PiperVoice methods available: {methods}")
-            
-            # Determine API type
-            if hasattr(self.voice, 'synthesize_stream_raw'):
-                self._api_type = "synthesize_stream_raw"
-            elif hasattr(self.voice, 'synthesize'):
-                self._api_type = "synthesize"
-            else:
-                logger.error(f"TTS: No suitable synthesize method found on PiperVoice")
-                return
-            
             self.available = True
             load_s = time.perf_counter() - t0
-            logger.info(f"TTS: Voice loaded in {load_s:.1f}s (sample_rate={self.sample_rate}, api={self._api_type})")
+            logger.info(f"TTS: Voice loaded in {load_s:.1f}s (sample_rate={self.sample_rate})")
             
-            # Run diagnostic to determine chunk format
+            # Diagnostic using print() so it always shows in HF Spaces logs
+            print(f"[TTS] === DIAGNOSTIC START ===", flush=True)
             self._diagnostic_synthesize()
+            print(f"[TTS] === DIAGNOSTIC END ===", flush=True)
             
         except Exception as e:
             logger.error(f"TTS: Failed to load piper voice: {type(e).__name__}: {e}", exc_info=True)
+            # If CLI is available, we can still function without Python API
+            if self._cli_available:
+                self.available = True
+                logger.info("TTS: Using CLI-only mode (Python API failed)")
     
-    @staticmethod
-    def _extract_chunk_bytes(chunk, context=""):
-        """Extract raw bytes from a TTS chunk with detailed logging."""
-        chunk_type = type(chunk).__name__
-        
-        if isinstance(chunk, bytes):
-            logger.debug(f"TTS: {context} chunk is bytes, len={len(chunk)}")
-            return chunk
-        if isinstance(chunk, bytearray):
-            logger.debug(f"TTS: {context} chunk is bytearray, len={len(chunk)}")
-            return bytes(chunk)
-        
-        # Try common attributes with logging
-        for attr in ('data', 'bytes', 'raw', 'buffer', 'pcm', 'audio'):
-            if hasattr(chunk, attr):
-                val = getattr(chunk, attr)
-                val_type = type(val).__name__
-                if isinstance(val, (bytes, bytearray)):
-                    logger.debug(f"TTS: {context} chunk.{attr} is {val_type}, len={len(val)}")
-                    return bytes(val)
-                if hasattr(val, 'tobytes'):
-                    logger.debug(f"TTS: {context} chunk.{attr} has tobytes()")
-                    return val.tobytes()
-                if hasattr(val, '__len__'):
-                    logger.debug(f"TTS: {context} chunk.{attr} is {val_type}, len={len(val)}")
-        
-        # Try numpy-like
-        if hasattr(chunk, 'tobytes'):
-            logger.debug(f"TTS: {context} chunk has tobytes()")
-            return chunk.tobytes()
-        if hasattr(chunk, 'numpy'):
-            logger.debug(f"TTS: {context} chunk has numpy()")
-            return chunk.numpy().tobytes()
-        
-        # Try buffer protocol
-        try:
-            result = bytes(memoryview(chunk))
-            logger.debug(f"TTS: {context} chunk via memoryview, len={len(result)}")
-            return result
-        except Exception as e:
-            logger.debug(f"TTS: {context} memoryview failed: {e}")
-        
-        # Try np.array
-        try:
-            import numpy as np
-            arr = np.array(chunk)
-            result = arr.tobytes()
-            logger.debug(f"TTS: {context} chunk via np.array, dtype={arr.dtype}, shape={arr.shape}, len={len(result)}")
-            return result
-        except Exception as e:
-            logger.debug(f"TTS: {context} np.array failed: {e}")
-        
-        # Log what we got
-        attrs = [a for a in dir(chunk) if not a.startswith('_') and not callable(getattr(chunk, a, None))]
-        logger.warning(f"TTS: Cannot extract bytes from chunk type={chunk_type} (context={context}), attrs={attrs[:20]}")
-        return None
-
     def _diagnostic_synthesize(self):
-        """Run a quick test synthesis to determine chunk format with aggressive logging."""
-        try:
-            logger.info("TTS: === DIAGNOSTIC SYNTHESIS START ===")
-            
-            # First, try file-based approach
+        """Run quick tests with print() so logs always show."""
+        test_text = "hello"
+        
+        # Test 1: CLI subprocess
+        if self._cli_available:
             try:
-                import tempfile
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tf:
                     tmp_path = tf.name
-                logger.info(f"TTS: DIAGNOSTIC trying file-based synthesis to {tmp_path}")
-                t0 = time.perf_counter()
-                self.voice.synthesize("hello", open(tmp_path, 'wb'))
-                file_s = time.perf_counter() - t0
-                file_size = os.path.getsize(tmp_path)
-                logger.info(f"TTS: DIAGNOSTIC file-based SUCCESS — {file_size} bytes in {file_s:.2f}s")
+                print(f"[TTS] DIAG: Testing CLI subprocess...", flush=True)
+                result = subprocess.run(
+                    ["piper", "--model", self.model_path, "--config", self.config_path, "--output_file", tmp_path],
+                    input=test_text,
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+                if result.returncode == 0 and os.path.exists(tmp_path):
+                    size = os.path.getsize(tmp_path)
+                    print(f"[TTS] DIAG: CLI SUCCESS — {size} bytes", flush=True)
+                    with open(tmp_path, 'rb') as f:
+                        data = f.read()
+                    os.unlink(tmp_path)
+                    print(f"[TTS] DIAG: CLI header={data[:4]}", flush=True)
+                else:
+                    print(f"[TTS] DIAG: CLI FAILED rc={result.returncode} stderr={result.stderr[:200]}", flush=True)
+            except Exception as e:
+                print(f"[TTS] DIAG: CLI ERROR {type(e).__name__}: {e}", flush=True)
+        
+        # Test 2: Python file-based
+        if self.voice:
+            try:
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tf:
+                    tmp_path = tf.name
+                print(f"[TTS] DIAG: Testing Python file-based...", flush=True)
+                self.voice.synthesize(test_text, open(tmp_path, 'wb'))
+                size = os.path.getsize(tmp_path)
+                print(f"[TTS] DIAG: Python file SUCCESS — {size} bytes", flush=True)
                 with open(tmp_path, 'rb') as f:
                     data = f.read()
                 os.unlink(tmp_path)
-                logger.info(f"TTS: DIAGNOSTIC file audio bytes={len(data)}, header_valid={data[:4]==b'RIFF'}")
-                return  # File approach works, we're done
+                print(f"[TTS] DIAG: Python header={data[:4]}", flush=True)
             except Exception as e:
-                logger.warning(f"TTS: DIAGNOSTIC file-based failed: {type(e).__name__}: {e}")
+                print(f"[TTS] DIAG: Python file FAILED {type(e).__name__}: {e}", flush=True)
             
-            # Fall back to chunk inspection
-            logger.info("TTS: DIAGNOSTIC trying chunk iteration...")
-            chunks = list(self.voice.synthesize("hi"))
-            logger.info(f"TTS: DIAGNOSTIC got {len(chunks)} chunks")
-            
-            if not chunks:
-                logger.warning("TTS: DIAGNOSTIC synthesis returned no chunks")
-                return
-            
-            chunk = chunks[0]
-            chunk_type = type(chunk).__name__
-            module = type(chunk).__module__
-            logger.info(f"TTS: DIAGNOSTIC chunk type={chunk_type}, module={module}")
-            
-            # Log all public attributes and their types
-            attrs = []
-            for attr in dir(chunk):
-                if attr.startswith('_'):
-                    continue
-                try:
-                    val = getattr(chunk, attr)
-                    if callable(val):
-                        continue
-                    val_type = type(val).__name__
-                    val_info = str(val)[:60]
-                    attrs.append(f"{attr}={val_type}:{val_info}")
-                except Exception:
-                    attrs.append(f"{attr}=ERROR")
-            logger.info(f"TTS: DIAGNOSTIC chunk attrs: {attrs}")
-            
-            # Try __dict__ if available
-            if hasattr(chunk, '__dict__'):
-                logger.info(f"TTS: DIAGNOSTIC chunk __dict__={chunk.__dict__}")
-            
-            # Try to extract bytes with detailed logging
-            extracted = self._extract_chunk_bytes(chunk)
-            if extracted is not None:
-                logger.info(f"TTS: DIAGNOSTIC extracted {len(extracted)} bytes from {chunk_type}")
-            else:
-                logger.error(f"TTS: DIAGNOSTIC cannot extract bytes from {chunk_type}")
-                
-            logger.info("TTS: === DIAGNOSTIC SYNTHESIS END ===")
-        except Exception as e:
-            logger.error(f"TTS: DIAGNOSTIC synthesis failed: {type(e).__name__}: {e}", exc_info=True)
+            # Test 3: Python chunks
+            try:
+                print(f"[TTS] DIAG: Testing Python chunks...", flush=True)
+                chunks = list(self.voice.synthesize(test_text))
+                print(f"[TTS] DIAG: Got {len(chunks)} chunks", flush=True)
+                if chunks:
+                    chunk = chunks[0]
+                    print(f"[TTS] DIAG: chunk type={type(chunk).__name__}", flush=True)
+                    attrs = [a for a in dir(chunk) if not a.startswith('_') and not callable(getattr(chunk, a, None))]
+                    print(f"[TTS] DIAG: chunk attrs={attrs[:10]}", flush=True)
+            except Exception as e:
+                print(f"[TTS] DIAG: Python chunks FAILED {type(e).__name__}: {e}", flush=True)
 
     def synthesize(self, text: str) -> Optional[bytes]:
-        """Synthesize text to WAV bytes."""
-        if not self.available or not self.voice:
-            logger.warning("TTS: Voice not available, skipping synthesis")
+        """Synthesize text to WAV bytes using CLI (primary) or Python API (fallback)."""
+        if not self.available:
+            logger.warning("TTS: Not available, skipping synthesis")
             return None
         
         if not text or not text.strip():
@@ -439,88 +385,116 @@ class TTS:
         
         t0 = time.perf_counter()
         
-        # Strategy 1: File-based synthesis (most reliable)
-        try:
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tf:
-                tmp_path = tf.name
-            
-            logger.debug(f"TTS: Trying file-based synthesis to {tmp_path}")
-            file_obj = open(tmp_path, 'wb')
+        # Strategy 1: Subprocess CLI (most reliable)
+        if self._cli_available and self.model_path and self.config_path:
             try:
-                self.voice.synthesize(text, file_obj)
-            finally:
-                file_obj.close()
-            
-            with open(tmp_path, 'rb') as f:
-                audio_data = f.read()
-            os.unlink(tmp_path)
-            
-            proc_s = time.perf_counter() - t0
-            header_valid = audio_data[:4] == b'RIFF' if len(audio_data) >= 4 else False
-            logger.info(
-                f"TTS: '{text[:60]}...' → "
-                f"{len(audio_data)} bytes WAV via file ({proc_s:.2f}s, "
-                f"header_valid={header_valid})"
-            )
-            return audio_data
-            
-        except Exception as e:
-            logger.warning(f"TTS: File-based synthesis failed: {type(e).__name__}: {e}")
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tf:
+                    tmp_path = tf.name
+                
+                logger.debug(f"TTS: Using CLI subprocess for '{text[:60]}...'")
+                result = subprocess.run(
+                    [
+                        "piper",
+                        "--model", self.model_path,
+                        "--config", self.config_path,
+                        "--output_file", tmp_path
+                    ],
+                    input=text,
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+                
+                if result.returncode != 0:
+                    logger.warning(f"TTS: CLI failed rc={result.returncode} stderr={result.stderr[:200]}")
+                    # Clean up and fall through
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                elif os.path.exists(tmp_path):
+                    with open(tmp_path, 'rb') as f:
+                        audio_data = f.read()
+                    os.unlink(tmp_path)
+                    
+                    proc_s = time.perf_counter() - t0
+                    header_valid = audio_data[:4] == b'RIFF' if len(audio_data) >= 4 else False
+                    logger.info(
+                        f"TTS: '{text[:60]}...' → "
+                        f"{len(audio_data)} bytes WAV via CLI ({proc_s:.2f}s, "
+                        f"header_valid={header_valid})"
+                    )
+                    return audio_data
+                    
+            except Exception as e:
+                logger.warning(f"TTS: CLI subprocess failed: {type(e).__name__}: {e}")
         
-        # Strategy 2: Chunk-based iteration with byte extraction
-        try:
-            logger.debug(f"TTS: Falling back to chunk-based synthesis for '{text[:60]}...'")
-            audio_data = b''
-            chunk_count = 0
-            
-            if self._api_type == "synthesize_stream_raw":
-                logger.debug("TTS: Using synthesize_stream_raw")
-                for chunk in self.voice.synthesize_stream_raw(text):
-                    raw = self._extract_chunk_bytes(chunk, "stream_raw")
-                    if raw:
-                        audio_data += raw
-                        chunk_count += 1
-                        
-            elif self._api_type == "synthesize":
-                logger.debug("TTS: Using synthesize iterator")
+        # Strategy 2: Python file-based synthesis
+        if self.voice:
+            try:
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tf:
+                    tmp_path = tf.name
+                
+                logger.debug(f"TTS: Using Python file-based for '{text[:60]}...'")
+                file_obj = open(tmp_path, 'wb')
+                try:
+                    self.voice.synthesize(text, file_obj)
+                finally:
+                    file_obj.close()
+                
+                with open(tmp_path, 'rb') as f:
+                    audio_data = f.read()
+                os.unlink(tmp_path)
+                
+                proc_s = time.perf_counter() - t0
+                header_valid = audio_data[:4] == b'RIFF' if len(audio_data) >= 4 else False
+                logger.info(
+                    f"TTS: '{text[:60]}...' → "
+                    f"{len(audio_data)} bytes WAV via Python file ({proc_s:.2f}s, "
+                    f"header_valid={header_valid})"
+                )
+                return audio_data
+                
+            except Exception as e:
+                logger.warning(f"TTS: Python file-based failed: {type(e).__name__}: {e}")
+        
+        # Strategy 3: Python chunk-based (last resort)
+        if self.voice and hasattr(self.voice, 'synthesize'):
+            try:
+                logger.debug(f"TTS: Using Python chunk-based for '{text[:60]}...'")
+                audio_data = b''
+                chunk_count = 0
+                
                 for chunk in self.voice.synthesize(text):
-                    raw = self._extract_chunk_bytes(chunk, "synthesize")
-                    if raw:
-                        audio_data += raw
+                    if isinstance(chunk, bytes):
+                        audio_data += chunk
                         chunk_count += 1
-            else:
-                logger.error(f"TTS: Unknown API type '{self._api_type}'")
-                return None
-            
-            if not audio_data:
-                logger.error(f"TTS: No audio data extracted for '{text[:60]}...'")
-                return None
-            
-            # Wrap raw PCM in WAV container
-            wav_io = io.BytesIO()
-            with wave.open(wav_io, 'wb') as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(self.sample_rate)
-                wf.writeframes(audio_data)
-            
-            audio = wav_io.getvalue()
-            proc_s = time.perf_counter() - t0
-            logger.info(
-                f"TTS: '{text[:60]}...' → "
-                f"{len(audio)} bytes WAV via chunks ({proc_s:.2f}s, "
-                f"chunks={chunk_count}, raw_audio={len(audio_data)} bytes)"
-            )
-            return audio
-            
-        except Exception as e:
-            logger.error(
-                f"TTS: All synthesis strategies failed for '{text[:60]}...': "
-                f"{type(e).__name__}: {e}",
-                exc_info=True
-            )
-            return None
+                    elif hasattr(chunk, 'bytes'):
+                        audio_data += chunk.bytes
+                        chunk_count += 1
+                    elif hasattr(chunk, 'data'):
+                        audio_data += chunk.data
+                        chunk_count += 1
+                
+                if audio_data:
+                    wav_io = io.BytesIO()
+                    with wave.open(wav_io, 'wb') as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(self.sample_rate)
+                        wf.writeframes(audio_data)
+                    
+                    audio = wav_io.getvalue()
+                    proc_s = time.perf_counter() - t0
+                    logger.info(
+                        f"TTS: '{text[:60]}...' → "
+                        f"{len(audio)} bytes WAV via chunks ({proc_s:.2f}s, "
+                        f"chunks={chunk_count})"
+                    )
+                    return audio
+                    
+            except Exception as e:
+                logger.error(f"TTS: All strategies failed for '{text[:60]}...': {type(e).__name__}: {e}")
+        
+        return None
 
 
 # ── Sentence splitting ──────────────────────────────────────
@@ -686,6 +660,13 @@ class VoiceOrchestrator:
             )
             if combined_audio:
                 yield {"type": "audio_complete", "data": combined_audio}
+        elif fail_count > 0:
+            # All TTS attempts failed — notify client
+            logger.error(f"Pipeline: ALL {fail_count} TTS sentences failed")
+            yield {
+                "type": "error",
+                "message": f"TTS failed for all {fail_count} sentences. Check server logs."
+            }
         
         total_s = time.perf_counter() - pipeline_t0
         
