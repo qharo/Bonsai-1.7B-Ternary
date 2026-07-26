@@ -306,9 +306,9 @@ textarea::placeholder { color: var(--muted); }
 </div>
 
 <div class="input-area">
-  <button class="send-btn" id="send-btn" title="Send">↑</button>
   <textarea id="inp" placeholder="Type a message or hold Space to speak..." rows="1" autofocus></textarea>
   <button class="mic-btn" id="mic-btn" title="Hold to speak">🎙</button>
+  <button class="send-btn" id="send-btn" title="Send">↑</button>
 </div>
 
 <div class="error-toast" id="error-toast"></div>
@@ -411,10 +411,20 @@ function handleMessage(data) {
       break;
 
     case 'dictation':
-      // Insert transcription into textarea
-      inpEl.value = data.text;
+      // Insert transcription into textarea at cursor position
+      if (document.activeElement === inpEl) {
+        const start = inpEl.selectionStart;
+        const end = inpEl.selectionEnd;
+        const before = inpEl.value.substring(0, start);
+        const after = inpEl.value.substring(end);
+        inpEl.value = before + data.text + after;
+        inpEl.selectionStart = inpEl.selectionEnd = start + data.text.length;
+      } else {
+        // If textarea not focused, append at the end
+        inpEl.value += data.text;
+        inpEl.focus();
+      }
       autoResizeTextarea();
-      inpEl.focus();
       break;
 
     case 'llm_text':
@@ -739,14 +749,15 @@ inpEl.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
 });
 
-// Spacebar dictation: hold for >800ms to trigger voice recording
-// Always preventDefault on keydown, then either insert space (quick tap) or start dictation (hold)
-inpEl.addEventListener('keydown', (e) => {
-  if (e.code === 'Space' && !e.repeat && !isRecording && !isProcessing) {
-    e.preventDefault();  // Prevent space insertion immediately
+// Global Spacebar dictation: hold for >800ms to trigger voice recording
+// Works anywhere on the page, not just when textarea is focused
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' && !e.repeat && !isRecording && !isProcessing && !e.ctrlKey && !e.altKey && !e.metaKey) {
+    // Don't capture space when typing in input/textarea (unless holding)
+    // We still preventDefault immediately to avoid inserting spaces before dictation starts
+    e.preventDefault();
     spacebarTriggered = false;
     spacebarTimer = setTimeout(() => {
-      // Threshold reached — trigger dictation
       spacebarTriggered = true;
       log('DICT', 'Spacebar hold threshold reached, starting dictation');
       startDictation();
@@ -754,7 +765,7 @@ inpEl.addEventListener('keydown', (e) => {
   }
 });
 
-inpEl.addEventListener('keyup', (e) => {
+document.addEventListener('keyup', (e) => {
   if (e.code === 'Space') {
     if (spacebarTimer) {
       clearTimeout(spacebarTimer);
@@ -764,14 +775,16 @@ inpEl.addEventListener('keyup', (e) => {
       // Was triggered by timer — stop dictation
       stopDictation();
     } else if (!spacebarTriggered) {
-      // Quick tap — insert space manually
-      const start = inpEl.selectionStart;
-      const end = inpEl.selectionEnd;
-      const value = inpEl.value;
-      inpEl.value = value.substring(0, start) + ' ' + value.substring(end);
-      inpEl.selectionStart = inpEl.selectionEnd = start + 1;
-      inpEl.dispatchEvent(new Event('input'));
-      log('DICT', 'Spacebar quick tap — inserted space');
+      // Quick tap — if typing in textarea, insert a single space
+      if (document.activeElement === inpEl) {
+        const start = inpEl.selectionStart;
+        const end = inpEl.selectionEnd;
+        const value = inpEl.value;
+        inpEl.value = value.substring(0, start) + ' ' + value.substring(end);
+        inpEl.selectionStart = inpEl.selectionEnd = start + 1;
+        inpEl.dispatchEvent(new Event('input'));
+        log('DICT', 'Spacebar quick tap — inserted space');
+      }
     }
   }
 });
