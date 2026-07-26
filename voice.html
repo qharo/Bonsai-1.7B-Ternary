@@ -345,13 +345,10 @@ const SPACEBAR_THRESHOLD_MS = 800;
 let spacebarTimer = null;
 let spacebarTriggered = false;
 
-// Streaming dictation state
+// Dictation state
 let dictationChunks = [];
-let dictationInterval = null;
 let dictationInsertPos = 0;
 let dictationOldSelectionEnd = 0;
-let dictationAccumulatedText = '';
-let lastSentChunkCount = 0;
 
 // First sentence sync (buffer sentence 0 until audio ready)
 let pendingFirstSentence = null;
@@ -423,28 +420,12 @@ function handleMessage(data) {
       }
       break;
 
-    case 'dictation_partial':
-      {
-        if (data.is_delta) {
-          dictationAccumulatedText += data.text;
-        } else {
-          dictationAccumulatedText = data.text;
-        }
-        const before = inpEl.value.substring(0, dictationInsertPos);
-        const after = inpEl.value.substring(dictationOldSelectionEnd);
-        inpEl.value = before + dictationAccumulatedText + after;
-        inpEl.selectionStart = inpEl.selectionEnd = dictationInsertPos + dictationAccumulatedText.length;
-        autoResizeTextarea();
-      }
-      break;
-
     case 'dictation':
       {
-        dictationAccumulatedText = data.text;
         const before = inpEl.value.substring(0, dictationInsertPos);
         const after = inpEl.value.substring(dictationOldSelectionEnd);
-        inpEl.value = before + dictationAccumulatedText + after;
-        inpEl.selectionStart = inpEl.selectionEnd = dictationInsertPos + dictationAccumulatedText.length;
+        inpEl.value = before + data.text + after;
+        inpEl.selectionStart = inpEl.selectionEnd = dictationInsertPos + data.text.length;
         autoResizeTextarea();
         inpEl.focus();
       }
@@ -679,10 +660,8 @@ async function startDictation() {
 
     mediaRecorder = new MediaRecorder(stream, { mimeType });
 
-    // Reset streaming dictation state
+    // Reset dictation state
     dictationChunks = [];
-    lastSentChunkCount = 0;
-    dictationAccumulatedText = '';
 
     // Save cursor position for dictation insertion
     dictationInsertPos = inpEl.selectionStart;
@@ -699,14 +678,12 @@ async function startDictation() {
       log('MIC', 'Dictation stopped, chunks:', dictationChunks.length);
       stream.getTracks().forEach(t => t.stop());
 
-      // Send any remaining chunks not yet sent by the interval
-      if (dictationChunks.length > lastSentChunkCount) {
-        const audioBlob = new Blob(dictationChunks, { type: mimeType });
-        const arrayBuffer = await audioBlob.arrayBuffer();
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(arrayBuffer);
-          log('MIC', 'Final streaming blob sent:', arrayBuffer.byteLength);
-        }
+      // Send complete audio blob once at the end
+      const audioBlob = new Blob(dictationChunks, { type: mimeType });
+      const arrayBuffer = await audioBlob.arrayBuffer();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(arrayBuffer);
+        log('MIC', 'Final blob sent:', arrayBuffer.byteLength);
       }
 
       // Signal server that streaming dictation has stopped
@@ -717,22 +694,10 @@ async function startDictation() {
       micBtn.classList.remove('recording');
     };
 
-    // Start interval to send accumulated chunks every 1.5 seconds
-    dictationInterval = setInterval(() => {
-      if (dictationChunks.length > lastSentChunkCount && ws && ws.readyState === WebSocket.OPEN) {
-        const audioBlob = new Blob(dictationChunks, { type: mimeType });
-        audioBlob.arrayBuffer().then(arrayBuffer => {
-          ws.send(arrayBuffer);
-          lastSentChunkCount = dictationChunks.length;
-          log('MIC', 'Streaming blob sent:', arrayBuffer.byteLength, 'bytes');
-        });
-      }
-    }, 1500);
-
     mediaRecorder.start(100);
     isRecording = true;
     micBtn.classList.add('recording');
-    log('MIC', 'Dictation recording (streaming mode)');
+    log('MIC', 'Dictation recording (end-only mode)');
 
   } catch (err) {
     log('MIC', 'Error:', err.name, err.message);
@@ -744,12 +709,6 @@ async function startDictation() {
 
 function stopDictation() {
   if (!isRecording || !mediaRecorder) return;
-
-  // Clear interval first so no more blobs are sent
-  if (dictationInterval) {
-    clearInterval(dictationInterval);
-    dictationInterval = null;
-  }
 
   isRecording = false;
   micBtn.classList.remove('recording');

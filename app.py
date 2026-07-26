@@ -586,30 +586,6 @@ def _remove_repeated_phrases(text: str) -> str:
     return text
 
 
-def _compute_stt_delta(prev_text: str, new_text: str) -> tuple[str, bool]:
-    """Compute delta from prev_text to new_text.
-    Returns (text_to_send, is_delta).
-    is_delta=True  → text_to_send should be appended to previous text.
-    is_delta=False → text_to_send is the full replacement text.
-    """
-    cleaned = _remove_repeated_phrases(new_text)
-    if not prev_text:
-        return cleaned, False
-    # Find longest suffix of prev_text that is a prefix of cleaned
-    max_overlap = min(len(prev_text), len(cleaned))
-    overlap = 0
-    for i in range(max_overlap, 0, -1):
-        if prev_text.endswith(cleaned[:i]):
-            overlap = i
-            break
-    # If overlap covers >50 % of previous text, it's normal growth
-    if overlap >= len(prev_text) * 0.5:
-        delta = cleaned[overlap:].strip()
-        return delta, True if delta else False
-    # Significant change (correction) → replace
-    return cleaned, False
-
-
 @app.websocket("/ws/voice")
 async def voice_websocket(websocket: WebSocket):
     """WebSocket endpoint for voice chat.
@@ -637,10 +613,9 @@ async def voice_websocket(websocket: WebSocket):
 
     print(f"[VOICE] Client {client_id}: Ready", flush=True)
 
-    # Per-connection streaming dictation state
+    # Per-connection dictation state (end-only transcription)
     streaming_dictation = False
     dictation_buffer = bytearray()
-    last_partial_text = ""
 
     try:
         while True:
@@ -677,8 +652,7 @@ async def voice_websocket(websocket: WebSocket):
                     elif msg_type == "start_dictation":
                         streaming_dictation = True
                         dictation_buffer = bytearray()
-                        last_partial_text = ""
-                        print(f"[VOICE] Client {client_id}: Streaming dictation started", flush=True)
+                        print(f"[VOICE] Client {client_id}: Dictation started", flush=True)
                         try:
                             await websocket.send_json({"type": "status", "message": "Listening...", "done": False})
                         except Exception as e:
@@ -687,9 +661,9 @@ async def voice_websocket(websocket: WebSocket):
 
                     elif msg_type == "stop_dictation":
                         streaming_dictation = False
-                        print(f"[VOICE] Client {client_id}: Streaming dictation stopped (buffer={len(dictation_buffer)} bytes)", flush=True)
+                        print(f"[VOICE] Client {client_id}: Dictation stopped (buffer={len(dictation_buffer)} bytes)", flush=True)
 
-                        # Process remaining buffer and send final transcription
+                        # Process complete accumulated audio once
                         if len(dictation_buffer) >= 5120:
                             t0 = time.perf_counter()
                             pcm_bytes = convert_audio_to_pcm(bytes(dictation_buffer), input_format="auto", sample_rate=16000)
@@ -706,27 +680,18 @@ async def voice_websocket(websocket: WebSocket):
                                         })
                                     except Exception as e:
                                         print(f"[VOICE] Client {client_id}: Error sending final dictation: {e}", flush=True)
-                                elif last_partial_text:
-                                    final_text = _remove_repeated_phrases(last_partial_text)
-                                    try:
-                                        await websocket.send_json({"type": "dictation", "text": final_text})
-                                    except Exception:
-                                        pass
-                            elif last_partial_text:
-                                final_text = _remove_repeated_phrases(last_partial_text)
-                                try:
-                                    await websocket.send_json({"type": "dictation", "text": final_text})
-                                except Exception:
-                                    pass
-                        elif last_partial_text:
-                            final_text = _remove_repeated_phrases(last_partial_text)
+                                else:
+                                    print(f"[VOICE] Client {client_id}: STT returned empty", flush=True)
+                            else:
+                                print(f"[VOICE] Client {client_id}: ffmpeg conversion failed", flush=True)
+                        else:
+                            print(f"[VOICE] Client {client_id}: Buffer too small ({len(dictation_buffer)} bytes), ignoring", flush=True)
                             try:
-                                await websocket.send_json({"type": "dictation", "text": final_text})
+                                await websocket.send_json({"type": "status", "message": "Recording too short", "done": True})
                             except Exception:
                                 pass
 
                         dictation_buffer = bytearray()
-                        last_partial_text = ""
                         continue
 
                     elif msg_type == "chat":
@@ -801,38 +766,9 @@ async def voice_websocket(websocket: WebSocket):
                 blob_size = len(audio_bytes)
 
                 if streaming_dictation:
-                    # Streaming mode: client sends full accumulated audio each interval.
-                    # Replace buffer (don't extend) since the blob already contains all prior chunks.
-                    dictation_buffer = bytearray(audio_bytes)
-                    print(f"[VOICE] Client {client_id}: Streaming blob ({blob_size} bytes, total buffer={len(dictation_buffer)})", flush=True)
-
-                    if len(dictation_buffer) >= 5120:
-                        t0 = time.perf_counter()
-                        pcm_bytes = convert_audio_to_pcm(bytes(dictation_buffer), input_format="auto", sample_rate=16000)
-                        conv_s = time.perf_counter() - t0
-
-                        if pcm_bytes and len(pcm_bytes) > 16000:  # > 0.5s of audio
-                            stt_t0 = time.perf_counter()
-                            text = _stt.transcribe(pcm_bytes)
-                            stt_s = time.perf_counter() - stt_t0
-                            if text and text != last_partial_text:
-                                # Clean repeated phrases and compute delta
-                                delta, is_delta = _compute_stt_delta(last_partial_text, text)
-                                last_partial_text = text
-                                log_prefix = "(delta)" if is_delta else "(replace)"
-                                print(f"[VOICE] Client {client_id}: Dictation partial {log_prefix}: '{delta[:60]}...' (STT={stt_s:.2f}s)", flush=True)
-                                if delta:
-                                    try:
-                                        await websocket.send_json({
-                                            "type": "dictation_partial",
-                                            "text": delta,
-                                            "is_delta": is_delta,
-                                        })
-                                    except Exception as e:
-                                        print(f"[VOICE] Client {client_id}: Error sending dictation_partial: {e}", flush=True)
-                                        break
-                        elif not pcm_bytes:
-                            print(f"[VOICE] Client {client_id}: ffmpeg conversion failed for streaming chunk", flush=True)
+                    # End-only mode: accumulate all audio, transcribe once at stop_dictation
+                    dictation_buffer.extend(audio_bytes)
+                    print(f"[VOICE] Client {client_id}: Accumulated blob ({blob_size} bytes, total buffer={len(dictation_buffer)})", flush=True)
                     continue
 
                 # Complete blob mode (original behavior)
