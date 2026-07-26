@@ -568,6 +568,48 @@ async def voice_health():
         }
     }
 
+# ── Streaming dictation text deduplication helpers ────────
+
+def _remove_repeated_phrases(text: str) -> str:
+    """Remove repeated word sequences from STT text (Whisper hallucination fix)."""
+    words = text.split()
+    if len(words) < 4:
+        return text
+    # Check for repeated sequences of 2–4 words
+    for phrase_len in range(min(4, len(words) // 2), 1, -1):
+        for i in range(len(words) - phrase_len * 2 + 1):
+            phrase = words[i:i + phrase_len]
+            for j in range(i + phrase_len, len(words) - phrase_len + 1):
+                if words[j:j + phrase_len] == phrase:
+                    cleaned = words[:i] + words[j:]
+                    return " ".join(cleaned)
+    return text
+
+
+def _compute_stt_delta(prev_text: str, new_text: str) -> tuple[str, bool]:
+    """Compute delta from prev_text to new_text.
+    Returns (text_to_send, is_delta).
+    is_delta=True  → text_to_send should be appended to previous text.
+    is_delta=False → text_to_send is the full replacement text.
+    """
+    cleaned = _remove_repeated_phrases(new_text)
+    if not prev_text:
+        return cleaned, False
+    # Find longest suffix of prev_text that is a prefix of cleaned
+    max_overlap = min(len(prev_text), len(cleaned))
+    overlap = 0
+    for i in range(max_overlap, 0, -1):
+        if prev_text.endswith(cleaned[:i]):
+            overlap = i
+            break
+    # If overlap covers >50 % of previous text, it's normal growth
+    if overlap >= len(prev_text) * 0.5:
+        delta = cleaned[overlap:].strip()
+        return delta, True if delta else False
+    # Significant change (correction) → replace
+    return cleaned, False
+
+
 @app.websocket("/ws/voice")
 async def voice_websocket(websocket: WebSocket):
     """WebSocket endpoint for voice chat.
@@ -655,27 +697,31 @@ async def voice_websocket(websocket: WebSocket):
                                 text = _stt.transcribe(pcm_bytes)
                                 if text:
                                     print(f"[VOICE] Client {client_id}: Final dictation: '{text[:60]}...'", flush=True)
+                                    final_text = _remove_repeated_phrases(text)
                                     try:
                                         await websocket.send_json({
                                             "type": "dictation",
-                                            "text": text,
+                                            "text": final_text,
                                             "stt_time_s": round(time.perf_counter() - t0, 2),
                                         })
                                     except Exception as e:
                                         print(f"[VOICE] Client {client_id}: Error sending final dictation: {e}", flush=True)
                                 elif last_partial_text:
+                                    final_text = _remove_repeated_phrases(last_partial_text)
                                     try:
-                                        await websocket.send_json({"type": "dictation", "text": last_partial_text})
+                                        await websocket.send_json({"type": "dictation", "text": final_text})
                                     except Exception:
                                         pass
                             elif last_partial_text:
+                                final_text = _remove_repeated_phrases(last_partial_text)
                                 try:
-                                    await websocket.send_json({"type": "dictation", "text": last_partial_text})
+                                    await websocket.send_json({"type": "dictation", "text": final_text})
                                 except Exception:
                                     pass
                         elif last_partial_text:
+                            final_text = _remove_repeated_phrases(last_partial_text)
                             try:
-                                await websocket.send_json({"type": "dictation", "text": last_partial_text})
+                                await websocket.send_json({"type": "dictation", "text": final_text})
                             except Exception:
                                 pass
 
@@ -770,16 +816,21 @@ async def voice_websocket(websocket: WebSocket):
                             text = _stt.transcribe(pcm_bytes)
                             stt_s = time.perf_counter() - stt_t0
                             if text and text != last_partial_text:
+                                # Clean repeated phrases and compute delta
+                                delta, is_delta = _compute_stt_delta(last_partial_text, text)
                                 last_partial_text = text
-                                print(f"[VOICE] Client {client_id}: Dictation partial: '{text[:60]}...' (STT={stt_s:.2f}s)", flush=True)
-                                try:
-                                    await websocket.send_json({
-                                        "type": "dictation_partial",
-                                        "text": text,
-                                    })
-                                except Exception as e:
-                                    print(f"[VOICE] Client {client_id}: Error sending dictation_partial: {e}", flush=True)
-                                    break
+                                log_prefix = "(delta)" if is_delta else "(replace)"
+                                print(f"[VOICE] Client {client_id}: Dictation partial {log_prefix}: '{delta[:60]}...' (STT={stt_s:.2f}s)", flush=True)
+                                if delta:
+                                    try:
+                                        await websocket.send_json({
+                                            "type": "dictation_partial",
+                                            "text": delta,
+                                            "is_delta": is_delta,
+                                        })
+                                    except Exception as e:
+                                        print(f"[VOICE] Client {client_id}: Error sending dictation_partial: {e}", flush=True)
+                                        break
                         elif not pcm_bytes:
                             print(f"[VOICE] Client {client_id}: ffmpeg conversion failed for streaming chunk", flush=True)
                     continue

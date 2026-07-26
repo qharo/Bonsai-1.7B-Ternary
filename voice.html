@@ -350,6 +350,7 @@ let dictationChunks = [];
 let dictationInterval = null;
 let dictationInsertPos = 0;
 let dictationOldSelectionEnd = 0;
+let dictationAccumulatedText = '';
 let lastSentChunkCount = 0;
 
 // First sentence sync (buffer sentence 0 until audio ready)
@@ -423,23 +424,27 @@ function handleMessage(data) {
       break;
 
     case 'dictation_partial':
-      // Streaming dictation partial result — update textarea directly
       {
+        if (data.is_delta) {
+          dictationAccumulatedText += data.text;
+        } else {
+          dictationAccumulatedText = data.text;
+        }
         const before = inpEl.value.substring(0, dictationInsertPos);
         const after = inpEl.value.substring(dictationOldSelectionEnd);
-        inpEl.value = before + data.text + after;
-        inpEl.selectionStart = inpEl.selectionEnd = dictationInsertPos + data.text.length;
+        inpEl.value = before + dictationAccumulatedText + after;
+        inpEl.selectionStart = inpEl.selectionEnd = dictationInsertPos + dictationAccumulatedText.length;
         autoResizeTextarea();
       }
       break;
 
     case 'dictation':
-      // Final dictation result — same as partial but also ensure focus
       {
+        dictationAccumulatedText = data.text;
         const before = inpEl.value.substring(0, dictationInsertPos);
         const after = inpEl.value.substring(dictationOldSelectionEnd);
-        inpEl.value = before + data.text + after;
-        inpEl.selectionStart = inpEl.selectionEnd = dictationInsertPos + data.text.length;
+        inpEl.value = before + dictationAccumulatedText + after;
+        inpEl.selectionStart = inpEl.selectionEnd = dictationInsertPos + dictationAccumulatedText.length;
         autoResizeTextarea();
         inpEl.focus();
       }
@@ -677,6 +682,7 @@ async function startDictation() {
     // Reset streaming dictation state
     dictationChunks = [];
     lastSentChunkCount = 0;
+    dictationAccumulatedText = '';
 
     // Save cursor position for dictation insertion
     dictationInsertPos = inpEl.selectionStart;

@@ -240,11 +240,13 @@ class STT:
             logger.info(f"STT: Starting transcription of {len(audio_np)/16000:.1f}s audio ({len(pcm_bytes)} bytes)")
             
             segments, info = self.model.transcribe(
-                audio_np, 
-                beam_size=5, 
+                audio_np,
+                beam_size=1,
+                best_of=1,
                 language="en",
                 condition_on_previous_text=False,
-                vad_filter=True,  # Use whisper's built-in VAD for better accuracy
+                without_timestamps=True,
+                vad_filter=True,
                 vad_parameters=dict(min_silence_duration_ms=500)
             )
             texts = []
