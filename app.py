@@ -570,12 +570,16 @@ async def voice_health():
 
 @app.websocket("/ws/voice")
 async def voice_websocket(websocket: WebSocket):
-    """WebSocket endpoint for voice chat (turn-based: client sends complete audio blob)."""
+    """WebSocket endpoint for voice chat.
+    Two modes:
+      1. Dictation: binary audio blob -> STT -> returns transcription text
+      2. Chat: JSON {type:"chat", text:"...", voice_output:true} -> LLM + optional TTS
+    """
     await websocket.accept()
     _voice_connections.add(websocket)
     client_id = id(websocket)
     print(f"[VOICE] Client {client_id} connected (total: {len(_voice_connections)})", flush=True)
-    
+
     if not VOICE_AVAILABLE or _voice_orchestrator is None:
         print(f"[VOICE] Client {client_id}: Pipeline unavailable, closing", flush=True)
         try:
@@ -588,12 +592,11 @@ async def voice_websocket(websocket: WebSocket):
             print(f"[VOICE] Client {client_id}: Error during close: {e}", flush=True)
         _voice_connections.discard(websocket)
         return
-    
-    print(f"[VOICE] Client {client_id}: Ready for audio blobs", flush=True)
-    
+
+    print(f"[VOICE] Client {client_id}: Ready", flush=True)
+
     try:
         while True:
-            # Receive message (binary audio blob or JSON control)
             try:
                 message = await websocket.receive()
             except WebSocketDisconnect:
@@ -605,18 +608,17 @@ async def voice_websocket(websocket: WebSocket):
             except Exception as e:
                 print(f"[VOICE] Client {client_id}: Error in receive: {type(e).__name__}: {e}", flush=True)
                 break
-            
-            # Check for disconnect message type
+
             if isinstance(message, dict) and message.get("type") == "websocket.disconnect":
                 print(f"[VOICE] Client {client_id}: Received disconnect message", flush=True)
                 break
-            
+
             if "text" in message:
-                # JSON control message (legacy - client now sends binary blobs directly)
+                # JSON control / chat message
                 try:
                     data = json.loads(message["text"])
                     msg_type = data.get("type", "")
-                    
+
                     if msg_type == "ping":
                         try:
                             await websocket.send_json({"type": "pong"})
@@ -624,127 +626,132 @@ async def voice_websocket(websocket: WebSocket):
                             print(f"[VOICE] Client {client_id}: Error sending pong: {e}", flush=True)
                             break
                         continue
-                        
+
+                    elif msg_type == "chat":
+                        text = data.get("text", "").strip()
+                        voice_output = data.get("voice_output", True)
+                        print(f"[VOICE] Client {client_id}: Chat message ({len(text)} chars, voice={voice_output})", flush=True)
+                        if not text:
+                            try:
+                                await websocket.send_json({"type": "error", "message": "Empty message"})
+                            except Exception:
+                                pass
+                            continue
+
+                        try:
+                            async for result in _voice_orchestrator.chat(text, voice_output=voice_output):
+                                if result["type"] == "audio":
+                                    audio_b64 = base64.b64encode(result["data"]).decode('utf-8')
+                                    try:
+                                        await websocket.send_json({
+                                            "type": "audio",
+                                            "data": audio_b64,
+                                            "index": result.get("index", 0),
+                                            "audio_bytes": len(result["data"]),
+                                        })
+                                    except Exception as e:
+                                        print(f"[VOICE] Client {client_id}: Error sending audio: {e}", flush=True)
+                                        break
+                                elif result["type"] == "llm_text":
+                                    try:
+                                        await websocket.send_json({
+                                            "type": "llm_text",
+                                            "text": result["text"],
+                                            "index": result.get("index", 0),
+                                        })
+                                    except Exception as e:
+                                        print(f"[VOICE] Client {client_id}: Error sending llm_text: {e}", flush=True)
+                                        break
+                                elif result["type"] == "status":
+                                    try:
+                                        await websocket.send_json({
+                                            "type": "status",
+                                            "message": result["message"],
+                                            "done": result.get("done", False),
+                                            "total_time_s": result.get("total_time_s"),
+                                            "tokens_per_second": result.get("tokens_per_second"),
+                                        })
+                                    except Exception as e:
+                                        print(f"[VOICE] Client {client_id}: Error sending status: {e}", flush=True)
+                                        break
+                                elif result["type"] == "error":
+                                    try:
+                                        await websocket.send_json({
+                                            "type": "error",
+                                            "message": result["message"],
+                                        })
+                                    except Exception as e:
+                                        print(f"[VOICE] Client {client_id}: Error sending error: {e}", flush=True)
+                                        break
+                        except Exception as e:
+                            print(f"[VOICE] Client {client_id}: Chat exception: {type(e).__name__}: {e}", flush=True)
+                            try:
+                                await websocket.send_json({"type": "error", "message": str(e)})
+                            except Exception:
+                                pass
+                        continue
+
                 except json.JSONDecodeError:
                     pass
-            
+
             elif "bytes" in message:
-                # Complete audio blob from MediaRecorder
+                # Dictation: audio blob -> STT only
                 audio_bytes = message["bytes"]
                 blob_size = len(audio_bytes)
                 print(f"[VOICE] Client {client_id}: Received audio blob ({blob_size} bytes)", flush=True)
-                
-                # Filter tiny blobs (incomplete recordings, accidental clicks)
-                if blob_size < 5120:  # 5KB minimum
-                    print(f"[VOICE] Client {client_id}: Blob too small ({blob_size} bytes < 5KB), ignoring", flush=True)
+
+                if blob_size < 5120:
+                    print(f"[VOICE] Client {client_id}: Blob too small, ignoring", flush=True)
                     try:
-                        await websocket.send_json({
-                            "type": "status",
-                            "message": "Recording too short, please try again",
-                            "done": True,
-                        })
+                        await websocket.send_json({"type": "status", "message": "Recording too short", "done": True})
                     except Exception:
                         pass
                     continue
-                
-                # Convert WebM/Opus blob to 16kHz PCM using ffmpeg
-                print(f"[VOICE] Client {client_id}: Converting to PCM with ffmpeg...", flush=True)
+
                 t0 = time.perf_counter()
                 pcm_bytes = convert_audio_to_pcm(audio_bytes, input_format="auto", sample_rate=16000)
                 conv_s = time.perf_counter() - t0
-                
+
                 if not pcm_bytes:
-                    print(f"[VOICE] Client {client_id}: ffmpeg conversion failed or empty result", flush=True)
+                    print(f"[VOICE] Client {client_id}: ffmpeg conversion failed", flush=True)
                     try:
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": "Audio conversion failed. Please try again."
-                        })
+                        await websocket.send_json({"type": "error", "message": "Audio conversion failed"})
                     except Exception:
                         pass
                     continue
-                
-                print(f"[VOICE] Client {client_id}: ffmpeg: {blob_size} bytes → {len(pcm_bytes)} bytes PCM in {conv_s:.2f}s", flush=True)
-                
-                # Process the complete utterance through the pipeline
-                print(f"[VOICE] Client {client_id}: Starting pipeline with {len(pcm_bytes)} bytes PCM", flush=True)
-                
+
+                print(f"[VOICE] Client {client_id}: ffmpeg: {blob_size} -> {len(pcm_bytes)} bytes PCM in {conv_s:.2f}s", flush=True)
+
                 try:
-                    async for result in _voice_orchestrator.process_utterance(pcm_bytes):
-                        result_type = result.get("type", "unknown")
-                        
-                        if result["type"] == "audio":
-                            audio_b64 = base64.b64encode(result["data"]).decode('utf-8')
-                            print(f"[VOICE] Client {client_id}: Sending audio sentence {result.get('index', 0)} ({len(audio_b64)} chars base64, {len(result['data'])} bytes)", flush=True)
+                    async for result in _voice_orchestrator.transcribe(pcm_bytes):
+                        if result["type"] == "dictation":
+                            print(f"[VOICE] Client {client_id}: Dictation: '{result['text'][:60]}...'", flush=True)
                             try:
                                 await websocket.send_json({
-                                    "type": "audio",
-                                    "data": audio_b64,
-                                    "index": result.get("index", 0),
-                                    "audio_bytes": len(result["data"]),
-                                })
-                            except Exception as e:
-                                print(f"[VOICE] Client {client_id}: Error sending audio: {e}", flush=True)
-                                break
-                                
-                        elif result["type"] == "transcription":
-                            print(f"[VOICE] Client {client_id}: Sending transcription: '{result['text'][:60]}...'", flush=True)
-                            try:
-                                await websocket.send_json({
-                                    "type": "transcription",
+                                    "type": "dictation",
                                     "text": result["text"],
                                     "stt_time_s": result.get("stt_time_s", 0),
                                 })
                             except Exception as e:
-                                print(f"[VOICE] Client {client_id}: Error sending transcription: {e}", flush=True)
+                                print(f"[VOICE] Client {client_id}: Error sending dictation: {e}", flush=True)
                                 break
-                                
-                        elif result["type"] == "llm_text":
-                            try:
-                                await websocket.send_json({
-                                    "type": "llm_text",
-                                    "text": result["text"],
-                                    "index": result.get("index", 0),
-                                })
-                            except Exception as e:
-                                print(f"[VOICE] Client {client_id}: Error sending llm_text: {e}", flush=True)
-                                break
-                                
                         elif result["type"] == "status":
-                            print(f"[VOICE] Client {client_id}: Status: {result['message']} (done={result.get('done', False)})", flush=True)
                             try:
                                 await websocket.send_json({
                                     "type": "status",
                                     "message": result["message"],
                                     "done": result.get("done", False),
-                                    "total_time_s": result.get("total_time_s"),
-                                    "tokens_per_second": result.get("tokens_per_second"),
                                 })
                             except Exception as e:
                                 print(f"[VOICE] Client {client_id}: Error sending status: {e}", flush=True)
                                 break
-                                
-                        elif result["type"] == "error":
-                            print(f"[VOICE] Client {client_id}: Pipeline error: {result['message']}", flush=True)
-                            try:
-                                await websocket.send_json({
-                                    "type": "error",
-                                    "message": result["message"],
-                                })
-                            except Exception as e:
-                                print(f"[VOICE] Client {client_id}: Error sending error: {e}", flush=True)
-                                break
-                
                 except Exception as e:
-                    print(f"[VOICE] Client {client_id}: Pipeline exception: {type(e).__name__}: {e}", flush=True)
+                    print(f"[VOICE] Client {client_id}: Dictation exception: {type(e).__name__}: {e}", flush=True)
                     try:
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": f"Pipeline error: {str(e)}"
-                        })
+                        await websocket.send_json({"type": "error", "message": str(e)})
                     except Exception:
                         pass
-    
+
     except WebSocketDisconnect:
         print(f"[VOICE] Client {client_id}: WebSocketDisconnect", flush=True)
     except RuntimeError as e:

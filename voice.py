@@ -713,13 +713,140 @@ class VoiceOrchestrator:
         )
         
         yield {
-            "type": "status", 
-            "message": "Done", 
+            "type": "status",
+            "message": "Done",
             "done": True,
             "total_time_s": round(total_s, 2),
             "stt_time_s": round(stt_s, 2),
             "llm_time_s": round(llm_s, 2),
             "tts_time_s": round(tts_s, 2),
+            "tokens_generated": llm_token_count,
+            "tokens_per_second": round(tps, 1),
+            "sentences": sentence_index,
+            "audio_sentences": audio_count,
+            "tts_fails": fail_count,
+        }
+
+    async def transcribe(self, pcm_bytes: bytes) -> AsyncIterator[dict]:
+        """Dictation mode: STT only, returns transcription text."""
+        yield {"type": "status", "message": "Transcribing speech..."}
+
+        stt_t0 = time.perf_counter()
+        text = self.stt.transcribe(pcm_bytes)
+        stt_s = time.perf_counter() - stt_t0
+
+        logger.info(f"Dictation: '{text[:120]}' in {stt_s:.2f}s")
+        yield {"type": "dictation", "text": text, "stt_time_s": round(stt_s, 2)}
+
+    async def chat(self, text: str, voice_output: bool = True) -> AsyncIterator[dict]:
+        """Chat mode: LLM + optional TTS. Same interleaved logic as process_utterance but skips STT."""
+        pipeline_t0 = time.perf_counter()
+        logger.info(f"Chat: '{text[:120]}' (voice_output={voice_output})")
+
+        # 1. LLM (streaming generation in background)
+        yield {"type": "status", "message": "Generating response..."}
+
+        loop = asyncio.get_event_loop()
+        token_queue = asyncio.Queue()
+        llm_done = threading.Event()
+
+        def _generate_tokens():
+            try:
+                for token in self.llm_generate(text):
+                    token_queue.put_nowait(token)
+            except Exception as e:
+                logger.error(f"Chat: LLM generation error: {e}")
+            finally:
+                llm_done.set()
+
+        llm_thread = threading.Thread(target=_generate_tokens, daemon=True)
+        llm_thread.start()
+
+        accumulated_text = ""
+        sentence_index = 0
+        audio_count = 0
+        fail_count = 0
+        llm_token_count = 0
+        llm_t0 = time.perf_counter()
+
+        def _extract_sentences(text):
+            parts = _SENTENCE_RE.split(text)
+            if len(parts) <= 1:
+                return [], text
+            sentences = []
+            remaining = ""
+            for i, part in enumerate(parts):
+                part = part.strip()
+                if not part:
+                    continue
+                if i < len(parts) - 1:
+                    sentences.append(part)
+                else:
+                    remaining = part
+            return sentences, remaining
+
+        while not (llm_done.is_set() and token_queue.empty()):
+            try:
+                token = await asyncio.wait_for(token_queue.get(), timeout=0.1)
+                accumulated_text += token
+                llm_token_count += 1
+
+                sentences, remaining = _extract_sentences(accumulated_text)
+                if sentences:
+                    accumulated_text = remaining
+                    for sentence in sentences:
+                        if not sentence.strip():
+                            continue
+                        yield {"type": "llm_text", "text": sentence + " ", "index": sentence_index}
+                        if voice_output and self.tts.available:
+                            def _synthesize(sent):
+                                return self.tts.synthesize(sent)
+                            try:
+                                audio = await loop.run_in_executor(None, _synthesize, sentence)
+                                if audio and len(audio) > 100:
+                                    audio_count += 1
+                                    yield {"type": "audio", "data": audio, "index": sentence_index}
+                                else:
+                                    fail_count += 1
+                            except Exception as e:
+                                fail_count += 1
+                                logger.error(f"Chat: TTS error sentence {sentence_index}: {e}")
+                        sentence_index += 1
+            except asyncio.TimeoutError:
+                if llm_done.is_set() and token_queue.empty():
+                    break
+                continue
+
+        llm_thread.join(timeout=1.0)
+        llm_s = time.perf_counter() - llm_t0
+        tps = llm_token_count / llm_s if llm_s > 0 else 0
+
+        if accumulated_text.strip():
+            yield {"type": "llm_text", "text": accumulated_text.strip() + " ", "index": sentence_index}
+            if voice_output and self.tts.available:
+                try:
+                    audio = await loop.run_in_executor(None, self.tts.synthesize, accumulated_text.strip())
+                    if audio and len(audio) > 100:
+                        audio_count += 1
+                        yield {"type": "audio", "data": audio, "index": sentence_index}
+                    else:
+                        fail_count += 1
+                except Exception as e:
+                    fail_count += 1
+            sentence_index += 1
+
+        total_s = time.perf_counter() - pipeline_t0
+        logger.info(
+            f"Chat: COMPLETE. Total={total_s:.1f}s "
+            f"(LLM={llm_s:.1f}s [{tps:.1f} t/s], sentences={sentence_index}, audio={audio_count})"
+        )
+
+        yield {
+            "type": "status",
+            "message": "Done",
+            "done": True,
+            "total_time_s": round(total_s, 2),
+            "llm_time_s": round(llm_s, 2),
             "tokens_generated": llm_token_count,
             "tokens_per_second": round(tps, 1),
             "sentences": sentence_index,
