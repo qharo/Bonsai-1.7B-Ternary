@@ -135,6 +135,14 @@ header {
 
 .row.bot .bubble.error { color: var(--error); }
 
+/* Dictation temp message */
+.row.user.dictation-temp {
+  opacity: 0.75;
+}
+.row.user.dictation-temp .bubble {
+  font-style: italic;
+}
+
 /* Sentence highlighting */
 .sentence {
   display: inline;
@@ -345,6 +353,17 @@ const SPACEBAR_THRESHOLD_MS = 800;
 let spacebarTimer = null;
 let spacebarTriggered = false;
 
+// Streaming dictation state
+let dictationChunks = [];
+let dictationInterval = null;
+let dictationTempMessage = null;
+let lastSentChunkCount = 0;
+
+// First sentence sync (buffer sentence 0 until audio ready)
+let pendingFirstSentence = null;
+let pendingFirstAudio = null;
+let firstSentenceTimeout = null;
+
 function log(label, ...args) {
   console.log(`[${label}]`, ...args);
 }
@@ -410,7 +429,19 @@ function handleMessage(data) {
       }
       break;
 
+    case 'dictation_partial':
+      // Streaming dictation partial result — update temp message
+      if (dictationTempMessage) {
+        updateDictationMessage(dictationTempMessage, data.text);
+      }
+      break;
+
     case 'dictation':
+      // Final dictation result — remove temp message, put text in textarea
+      if (dictationTempMessage) {
+        removeDictationMessage(dictationTempMessage);
+        dictationTempMessage = null;
+      }
       // Insert transcription into textarea at cursor position
       if (document.activeElement === inpEl) {
         const start = inpEl.selectionStart;
@@ -428,12 +459,26 @@ function handleMessage(data) {
       break;
 
     case 'llm_text':
-      appendBotSentence(data.text, data.index);
+      if (data.index === 0 && voiceOutputEnabled) {
+        // Buffer first sentence until audio is ready
+        pendingFirstSentence = {text: data.text, index: 0};
+        setFirstSentenceTimeout();
+        checkFirstSentenceReady();
+      } else {
+        appendBotSentence(data.text, data.index);
+      }
       break;
 
     case 'audio':
-      if (voiceOutputEnabled) {
-        queueAudio(data.data, data.index);
+      if (data.index === 0) {
+        if (voiceOutputEnabled) {
+          pendingFirstAudio = {data: data.data, index: 0};
+          checkFirstSentenceReady();
+        }
+      } else {
+        if (voiceOutputEnabled) {
+          queueAudio(data.data, data.index);
+        }
       }
       break;
 
@@ -594,6 +639,62 @@ function base64ToArrayBuffer(base64) {
   return bytes.buffer;
 }
 
+// ── Dictation temp message UI ─────────────────────────────
+
+function createDictationMessage() {
+  welcomeEl.style.display = 'none';
+  const row = document.createElement('div');
+  row.className = 'row user dictation-temp';
+  const b = document.createElement('div');
+  b.className = 'bubble';
+  b.innerHTML = '🎙️ <span class="dictation-text"></span><span class="cursor"></span>';
+  row.appendChild(b);
+  msgsEl.appendChild(row);
+  scrollBottom();
+  return { row, textSpan: b.querySelector('.dictation-text') };
+}
+
+function updateDictationMessage(msg, text) {
+  if (msg && msg.textSpan) {
+    msg.textSpan.textContent = text;
+    scrollBottom();
+  }
+}
+
+function removeDictationMessage(msg) {
+  if (msg && msg.row) {
+    msg.row.remove();
+  }
+}
+
+// ── First sentence sync helpers ───────────────────────────
+
+function checkFirstSentenceReady() {
+  if (pendingFirstSentence && pendingFirstAudio) {
+    appendBotSentence(pendingFirstSentence.text, pendingFirstSentence.index);
+    queueAudio(pendingFirstAudio.data, pendingFirstAudio.index);
+    pendingFirstSentence = null;
+    pendingFirstAudio = null;
+    if (firstSentenceTimeout) {
+      clearTimeout(firstSentenceTimeout);
+      firstSentenceTimeout = null;
+    }
+  }
+}
+
+function setFirstSentenceTimeout() {
+  if (firstSentenceTimeout) clearTimeout(firstSentenceTimeout);
+  firstSentenceTimeout = setTimeout(() => {
+    if (pendingFirstSentence) {
+      // Audio never arrived — show text anyway
+      appendBotSentence(pendingFirstSentence.text, pendingFirstSentence.index);
+      pendingFirstSentence = null;
+      pendingFirstAudio = null;
+      firstSentenceTimeout = null;
+    }
+  }, 5000);
+}
+
 // ── Dictation (hold mic) ──────────────────────────────────
 
 async function startDictation() {
@@ -613,47 +714,83 @@ async function startDictation() {
     log('MIC', 'MIME type:', mimeType);
 
     mediaRecorder = new MediaRecorder(stream, { mimeType });
-    const audioChunks = [];
+
+    // Reset streaming dictation state
+    dictationChunks = [];
+    lastSentChunkCount = 0;
+
+    // Signal server that streaming dictation is starting
+    ws.send(JSON.stringify({type: 'start_dictation'}));
+
+    // Create temporary dictation message in chat area
+    dictationTempMessage = createDictationMessage();
 
     mediaRecorder.ondataavailable = (event) => {
-      if (event.data.size > 0) audioChunks.push(event.data);
+      if (event.data.size > 0) dictationChunks.push(event.data);
     };
 
     mediaRecorder.onstop = async () => {
-      log('MIC', 'Dictation stopped, chunks:', audioChunks.length);
+      log('MIC', 'Dictation stopped, chunks:', dictationChunks.length);
       stream.getTracks().forEach(t => t.stop());
 
-      if (audioChunks.length === 0) {
-        micBtn.classList.remove('recording');
-        return;
+      // Send any remaining chunks not yet sent by the interval
+      if (dictationChunks.length > lastSentChunkCount) {
+        const audioBlob = new Blob(dictationChunks, { type: mimeType });
+        const arrayBuffer = await audioBlob.arrayBuffer();
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(arrayBuffer);
+          log('MIC', 'Final streaming blob sent:', arrayBuffer.byteLength);
+        }
       }
 
-      const audioBlob = new Blob(audioChunks, { type: mimeType });
-      const arrayBuffer = await audioBlob.arrayBuffer();
-
+      // Signal server that streaming dictation has stopped
       if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(arrayBuffer);
-        log('MIC', 'Dictation blob sent:', arrayBuffer.byteLength);
+        ws.send(JSON.stringify({type: 'stop_dictation'}));
       }
 
       micBtn.classList.remove('recording');
     };
 
+    // Start interval to send accumulated chunks every 1.5 seconds
+    dictationInterval = setInterval(() => {
+      if (dictationChunks.length > lastSentChunkCount && ws && ws.readyState === WebSocket.OPEN) {
+        const audioBlob = new Blob(dictationChunks, { type: mimeType });
+        audioBlob.arrayBuffer().then(arrayBuffer => {
+          ws.send(arrayBuffer);
+          lastSentChunkCount = dictationChunks.length;
+          log('MIC', 'Streaming blob sent:', arrayBuffer.byteLength, 'bytes');
+        });
+      }
+    }, 1500);
+
     mediaRecorder.start(100);
     isRecording = true;
     micBtn.classList.add('recording');
-    log('MIC', 'Dictation recording');
+    log('MIC', 'Dictation recording (streaming mode)');
 
   } catch (err) {
     log('MIC', 'Error:', err.name, err.message);
     if (err.name === 'NotAllowedError') showError('Microphone permission denied');
     else if (err.name === 'NotFoundError') showError('No microphone found');
     else showError('Error: ' + err.message);
+
+    // Clean up temp message on error
+    if (dictationTempMessage) {
+      removeDictationMessage(dictationTempMessage);
+      dictationTempMessage = null;
+    }
   }
 }
 
 function stopDictation() {
   if (!isRecording || !mediaRecorder) return;
+
+  // Clear interval first so no more blobs are sent
+  if (dictationInterval) {
+    clearInterval(dictationInterval);
+    dictationInterval = null;
+  }
+
   isRecording = false;
   micBtn.classList.remove('recording');
   if (mediaRecorder.state !== 'inactive') mediaRecorder.stop();
@@ -684,6 +821,14 @@ function sendChat() {
 
   // Clear previous bot state
   finishBotMessage();
+
+  // Clear first sentence sync state for new chat
+  pendingFirstSentence = null;
+  pendingFirstAudio = null;
+  if (firstSentenceTimeout) {
+    clearTimeout(firstSentenceTimeout);
+    firstSentenceTimeout = null;
+  }
 
   // Send chat message
   isProcessing = true;

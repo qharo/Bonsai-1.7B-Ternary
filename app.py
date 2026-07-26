@@ -595,6 +595,11 @@ async def voice_websocket(websocket: WebSocket):
 
     print(f"[VOICE] Client {client_id}: Ready", flush=True)
 
+    # Per-connection streaming dictation state
+    streaming_dictation = False
+    dictation_buffer = bytearray()
+    last_partial_text = ""
+
     try:
         while True:
             try:
@@ -625,6 +630,57 @@ async def voice_websocket(websocket: WebSocket):
                         except Exception as e:
                             print(f"[VOICE] Client {client_id}: Error sending pong: {e}", flush=True)
                             break
+                        continue
+
+                    elif msg_type == "start_dictation":
+                        streaming_dictation = True
+                        dictation_buffer = bytearray()
+                        last_partial_text = ""
+                        print(f"[VOICE] Client {client_id}: Streaming dictation started", flush=True)
+                        try:
+                            await websocket.send_json({"type": "status", "message": "Listening...", "done": False})
+                        except Exception as e:
+                            print(f"[VOICE] Client {client_id}: Error sending status: {e}", flush=True)
+                        continue
+
+                    elif msg_type == "stop_dictation":
+                        streaming_dictation = False
+                        print(f"[VOICE] Client {client_id}: Streaming dictation stopped (buffer={len(dictation_buffer)} bytes)", flush=True)
+
+                        # Process remaining buffer and send final transcription
+                        if len(dictation_buffer) >= 5120:
+                            t0 = time.perf_counter()
+                            pcm_bytes = convert_audio_to_pcm(bytes(dictation_buffer), input_format="auto", sample_rate=16000)
+                            if pcm_bytes:
+                                text = _stt.transcribe(pcm_bytes)
+                                if text:
+                                    print(f"[VOICE] Client {client_id}: Final dictation: '{text[:60]}...'", flush=True)
+                                    try:
+                                        await websocket.send_json({
+                                            "type": "dictation",
+                                            "text": text,
+                                            "stt_time_s": round(time.perf_counter() - t0, 2),
+                                        })
+                                    except Exception as e:
+                                        print(f"[VOICE] Client {client_id}: Error sending final dictation: {e}", flush=True)
+                                elif last_partial_text:
+                                    try:
+                                        await websocket.send_json({"type": "dictation", "text": last_partial_text})
+                                    except Exception:
+                                        pass
+                            elif last_partial_text:
+                                try:
+                                    await websocket.send_json({"type": "dictation", "text": last_partial_text})
+                                except Exception:
+                                    pass
+                        elif last_partial_text:
+                            try:
+                                await websocket.send_json({"type": "dictation", "text": last_partial_text})
+                            except Exception:
+                                pass
+
+                        dictation_buffer = bytearray()
+                        last_partial_text = ""
                         continue
 
                     elif msg_type == "chat":
@@ -695,9 +751,39 @@ async def voice_websocket(websocket: WebSocket):
                     pass
 
             elif "bytes" in message:
-                # Dictation: audio blob -> STT only
                 audio_bytes = message["bytes"]
                 blob_size = len(audio_bytes)
+
+                if streaming_dictation:
+                    # Streaming mode: accumulate chunks and process periodically
+                    dictation_buffer.extend(audio_bytes)
+                    print(f"[VOICE] Client {client_id}: Streaming blob ({blob_size} bytes, total buffer={len(dictation_buffer)})", flush=True)
+
+                    if len(dictation_buffer) >= 5120:
+                        t0 = time.perf_counter()
+                        pcm_bytes = convert_audio_to_pcm(bytes(dictation_buffer), input_format="auto", sample_rate=16000)
+                        conv_s = time.perf_counter() - t0
+
+                        if pcm_bytes and len(pcm_bytes) > 16000:  # > 0.5s of audio
+                            stt_t0 = time.perf_counter()
+                            text = _stt.transcribe(pcm_bytes)
+                            stt_s = time.perf_counter() - stt_t0
+                            if text and text != last_partial_text:
+                                last_partial_text = text
+                                print(f"[VOICE] Client {client_id}: Dictation partial: '{text[:60]}...' (STT={stt_s:.2f}s)", flush=True)
+                                try:
+                                    await websocket.send_json({
+                                        "type": "dictation_partial",
+                                        "text": text,
+                                    })
+                                except Exception as e:
+                                    print(f"[VOICE] Client {client_id}: Error sending dictation_partial: {e}", flush=True)
+                                    break
+                        elif not pcm_bytes:
+                            print(f"[VOICE] Client {client_id}: ffmpeg conversion failed for streaming chunk", flush=True)
+                    continue
+
+                # Complete blob mode (original behavior)
                 print(f"[VOICE] Client {client_id}: Received audio blob ({blob_size} bytes)", flush=True)
 
                 if blob_size < 5120:
