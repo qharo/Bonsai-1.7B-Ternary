@@ -755,8 +755,9 @@ async def voice_websocket(websocket: WebSocket):
                 blob_size = len(audio_bytes)
 
                 if streaming_dictation:
-                    # Streaming mode: accumulate chunks and process periodically
-                    dictation_buffer.extend(audio_bytes)
+                    # Streaming mode: client sends full accumulated audio each interval.
+                    # Replace buffer (don't extend) since the blob already contains all prior chunks.
+                    dictation_buffer = bytearray(audio_bytes)
                     print(f"[VOICE] Client {client_id}: Streaming blob ({blob_size} bytes, total buffer={len(dictation_buffer)})", flush=True)
 
                     if len(dictation_buffer) >= 5120:

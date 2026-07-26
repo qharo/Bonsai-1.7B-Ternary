@@ -135,14 +135,6 @@ header {
 
 .row.bot .bubble.error { color: var(--error); }
 
-/* Dictation temp message */
-.row.user.dictation-temp {
-  opacity: 0.75;
-}
-.row.user.dictation-temp .bubble {
-  font-style: italic;
-}
-
 /* Sentence highlighting */
 .sentence {
   display: inline;
@@ -356,7 +348,8 @@ let spacebarTriggered = false;
 // Streaming dictation state
 let dictationChunks = [];
 let dictationInterval = null;
-let dictationTempMessage = null;
+let dictationInsertPos = 0;
+let dictationOldSelectionEnd = 0;
 let lastSentChunkCount = 0;
 
 // First sentence sync (buffer sentence 0 until audio ready)
@@ -430,32 +423,26 @@ function handleMessage(data) {
       break;
 
     case 'dictation_partial':
-      // Streaming dictation partial result — update temp message
-      if (dictationTempMessage) {
-        updateDictationMessage(dictationTempMessage, data.text);
+      // Streaming dictation partial result — update textarea directly
+      {
+        const before = inpEl.value.substring(0, dictationInsertPos);
+        const after = inpEl.value.substring(dictationOldSelectionEnd);
+        inpEl.value = before + data.text + after;
+        inpEl.selectionStart = inpEl.selectionEnd = dictationInsertPos + data.text.length;
+        autoResizeTextarea();
       }
       break;
 
     case 'dictation':
-      // Final dictation result — remove temp message, put text in textarea
-      if (dictationTempMessage) {
-        removeDictationMessage(dictationTempMessage);
-        dictationTempMessage = null;
-      }
-      // Insert transcription into textarea at cursor position
-      if (document.activeElement === inpEl) {
-        const start = inpEl.selectionStart;
-        const end = inpEl.selectionEnd;
-        const before = inpEl.value.substring(0, start);
-        const after = inpEl.value.substring(end);
+      // Final dictation result — same as partial but also ensure focus
+      {
+        const before = inpEl.value.substring(0, dictationInsertPos);
+        const after = inpEl.value.substring(dictationOldSelectionEnd);
         inpEl.value = before + data.text + after;
-        inpEl.selectionStart = inpEl.selectionEnd = start + data.text.length;
-      } else {
-        // If textarea not focused, append at the end
-        inpEl.value += data.text;
+        inpEl.selectionStart = inpEl.selectionEnd = dictationInsertPos + data.text.length;
+        autoResizeTextarea();
         inpEl.focus();
       }
-      autoResizeTextarea();
       break;
 
     case 'llm_text':
@@ -639,34 +626,6 @@ function base64ToArrayBuffer(base64) {
   return bytes.buffer;
 }
 
-// ── Dictation temp message UI ─────────────────────────────
-
-function createDictationMessage() {
-  welcomeEl.style.display = 'none';
-  const row = document.createElement('div');
-  row.className = 'row user dictation-temp';
-  const b = document.createElement('div');
-  b.className = 'bubble';
-  b.innerHTML = '🎙️ <span class="dictation-text"></span><span class="cursor"></span>';
-  row.appendChild(b);
-  msgsEl.appendChild(row);
-  scrollBottom();
-  return { row, textSpan: b.querySelector('.dictation-text') };
-}
-
-function updateDictationMessage(msg, text) {
-  if (msg && msg.textSpan) {
-    msg.textSpan.textContent = text;
-    scrollBottom();
-  }
-}
-
-function removeDictationMessage(msg) {
-  if (msg && msg.row) {
-    msg.row.remove();
-  }
-}
-
 // ── First sentence sync helpers ───────────────────────────
 
 function checkFirstSentenceReady() {
@@ -719,11 +678,12 @@ async function startDictation() {
     dictationChunks = [];
     lastSentChunkCount = 0;
 
+    // Save cursor position for dictation insertion
+    dictationInsertPos = inpEl.selectionStart;
+    dictationOldSelectionEnd = inpEl.selectionEnd;
+
     // Signal server that streaming dictation is starting
     ws.send(JSON.stringify({type: 'start_dictation'}));
-
-    // Create temporary dictation message in chat area
-    dictationTempMessage = createDictationMessage();
 
     mediaRecorder.ondataavailable = (event) => {
       if (event.data.size > 0) dictationChunks.push(event.data);
@@ -773,12 +733,6 @@ async function startDictation() {
     if (err.name === 'NotAllowedError') showError('Microphone permission denied');
     else if (err.name === 'NotFoundError') showError('No microphone found');
     else showError('Error: ' + err.message);
-
-    // Clean up temp message on error
-    if (dictationTempMessage) {
-      removeDictationMessage(dictationTempMessage);
-      dictationTempMessage = null;
-    }
   }
 }
 
