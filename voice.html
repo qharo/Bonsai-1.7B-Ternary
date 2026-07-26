@@ -271,15 +271,27 @@ textarea::placeholder { color: var(--muted); }
 }
 .error-toast.show { opacity: 1; }
 
-.back-link {
-  position: fixed;
-  bottom: 16px;
-  left: 16px;
-  font-size: 12px;
-  color: var(--muted);
-  text-decoration: none;
+/* ── Thinking indicator ─────────────────────────────────── */
+.thinking-dots {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+  padding: 2px 4px;
 }
-.back-link:hover { color: var(--text); }
+.thinking-dots span {
+  width: 6px;
+  height: 6px;
+  background: var(--muted);
+  border-radius: 50%;
+  animation: thinkPulse 1.4s ease-in-out infinite;
+}
+.thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
+.thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes thinkPulse {
+  0%, 100% { opacity: 0.3; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1); }
+}
 </style>
 </head>
 <body>
@@ -313,8 +325,6 @@ textarea::placeholder { color: var(--muted); }
 
 <div class="error-toast" id="error-toast"></div>
 
-<a href="/" class="back-link">← Text chat</a>
-
 <script>
 const msgsEl      = document.getElementById('msgs');
 const welcomeEl   = document.getElementById('welcome');
@@ -337,6 +347,7 @@ let processingTimeout = null;
 // Audio playback
 let audioContext = null;
 const audioQueue = [];
+let thinkingRow = null;
 let isPlaying = false;
 let currentSentenceIndex = -1;
 
@@ -432,6 +443,7 @@ function handleMessage(data) {
       break;
 
     case 'llm_text':
+      hideThinkingIndicator();
       if (data.index === 0 && voiceOutputEnabled) {
         // Buffer first sentence until audio is ready
         pendingFirstSentence = {text: data.text, index: 0};
@@ -443,6 +455,7 @@ function handleMessage(data) {
       break;
 
     case 'audio':
+      hideThinkingIndicator();
       if (data.index === 0) {
         if (voiceOutputEnabled) {
           pendingFirstAudio = {data: data.data, index: 0};
@@ -456,6 +469,7 @@ function handleMessage(data) {
       break;
 
     case 'error':
+      hideThinkingIndicator();
       clearProcessingTimeout();
       showError(data.message);
       isProcessing = false;
@@ -481,6 +495,27 @@ function appendUser(text) {
 
 let currentBotRow = null;
 let sentenceElements = {};
+
+function showThinkingIndicator() {
+  hideThinkingIndicator();
+  welcomeEl.style.display = 'none';
+  thinkingRow = document.createElement('div');
+  thinkingRow.className = 'row bot';
+  thinkingRow.id = 'thinking-row';
+  const b = document.createElement('div');
+  b.className = 'bubble';
+  b.innerHTML = '<div class="thinking-dots"><span></span><span></span><span></span></div>';
+  thinkingRow.appendChild(b);
+  msgsEl.appendChild(thinkingRow);
+  scrollBottom();
+}
+
+function hideThinkingIndicator() {
+  if (thinkingRow) {
+    thinkingRow.remove();
+    thinkingRow = null;
+  }
+}
 
 function startBotMessage() {
   welcomeEl.style.display = 'none';
@@ -738,8 +773,9 @@ function sendChat() {
   inpEl.value = '';
   autoResizeTextarea();
 
-  // Clear previous bot state
+  // Clear previous bot state and show thinking indicator
   finishBotMessage();
+  showThinkingIndicator();
 
   // Clear first sentence sync state for new chat
   pendingFirstSentence = null;
@@ -784,6 +820,7 @@ function showError(msg) {
 function setProcessingTimeout() {
   clearProcessingTimeout();
   processingTimeout = setTimeout(() => {
+    hideThinkingIndicator();
     showError('Server response timeout');
     isProcessing = false;
     sendBtn.disabled = false;

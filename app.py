@@ -345,7 +345,7 @@ app = FastAPI(title="Bonsai 1.7B Inference", lifespan=lifespan)
 
 @app.get("/")
 async def index():
-    return FileResponse("index.html")
+    return FileResponse("voice.html")
 
 @app.get("/voice")
 async def voice_page():
