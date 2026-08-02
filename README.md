@@ -1,14 +1,4 @@
----
-title: Bonsai 1.7B
-emoji: 🌿
-colorFrom: green
-colorTo: blue
-sdk: docker
-app_file: app.py
-pinned: false
----
-
-# Bonsai 1.7B — A 1.58-bit LLM with Voice Chat
+# Bonsai 1.7B // A 1.58-bit LLM with Voice Chat
 
 <div align="center">
 
@@ -22,7 +12,7 @@ An optimized C inference engine for **Ternary-Bonsai-1.7B**, served via a FastAP
 
 ---
 
-## Optimizations
+## 🚀 Optimizations
 
 LLM inference is almost entirely memory-bandwidth bound. To get the most out of the CPU, I focused on moving as little data as possible:
 
@@ -32,21 +22,20 @@ LLM inference is almost entirely memory-bandwidth bound. To get the most out of 
 *   **Two-Phase `lm_head` Prefilter** 
 ---
 
-## 🎙️ Voice Chat Pipeline
+## 🎤 Voice Pipeline
 
 The interface is a single voice-first chat UI. You can type or dictate, and the model responds with both text and optional spoken audio.
 
 **Speech-to-Text**
 - **Voice Activity Detection (VAD):** WebRTC VAD detects speech boundaries client-side.
-- **Transcription:** faster-whisper tiny (int8) transcribes the complete audio once the user releases the mic button (or spacebar). We use **end-only dictation** rather than streaming partials, which avoids the repetition and hallucination artifacts common when tiny Whisper models process progressively longer audio clips.
+- **Transcription:** [faster-whisper tiny](https://huggingface.co/Systran/faster-whisper-tiny) (int8) transcribes the complete audio once the user releases the mic button (or spacebar).
 
 **LLM Inference**
-- The full Bonsai 1.7B runs on the optimized C engine using 2 OMP threads. It generates ~7–10 tokens per second on AMD EPYC 7R13.
+- The full Bonsai 1.7B runs on the optimized C engine using 2 OMP threads. It generates ~7-10 tokens per second on AMD EPYC 7R13.
 
 **Text-to-Speech**
 - **Synthesis:** piper-tts (local ONNX) renders each complete sentence.
-- **Interleaved Streaming:** The LLM generates sentences in a background thread while TTS synthesizes the previous sentence. Audio playback begins as soon as the first sentence is ready — the model does not need to finish generating before you start hearing it.
-- **Sentence Sync & Highlighting:** The first sentence text is buffered until its audio chunk arrives, then both appear simultaneously. During playback, the currently spoken sentence is highlighted inside the chat bubble.
+- **Interleaved Streaming:** The LLM generates sentences in a background thread while TTS synthesizes the previous sentence.
 
 ---
 
