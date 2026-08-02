@@ -35,8 +35,7 @@ The interface is a single voice-first chat UI. You can type or dictate, and the 
 
 **Text-to-Speech**
 - **Synthesis:** piper-tts (local ONNX) renders each complete sentence.
-- **Interleaved Streaming:** The LLM generates sentences in a background thread while TTS synthesizes the previous sentence. Audio playback begins as soon as the first sentence is ready — the model does not need to finish generating before you start hearing it.
-- **Sentence Sync & Highlighting:** The first sentence text is buffered until its audio chunk arrives, then both appear simultaneously. During playback, the currently spoken sentence is highlighted inside the chat bubble.
+- **Interleaved Streaming:** The LLM generates sentences in a background thread while TTS synthesizes the previous sentence.
 
 ---
 
