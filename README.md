@@ -8,7 +8,7 @@ app_file: app.py
 pinned: false
 ---
 
-# Bonsai 1.7B — A 1.58-bit LLM
+# Bonsai 1.7B — A 1.58-bit LLM with Voice Chat
 
 <div align="center">
 
@@ -30,6 +30,24 @@ LLM inference is almost entirely memory-bandwidth bound. To get the most out of 
 *   **Load-Time Precomputation:** Precompute FP32 scales and pre-separate positive/negative bitmaps at startup
 *   **SIMD Kernels:** I used lookup tables (LUTs) and masked fused-multiply-adds (FMA) to process up to 512 elements per clock cycle.
 *   **Two-Phase `lm_head` Prefilter** 
+---
+
+## 🎙️ Voice Chat Pipeline
+
+The interface is a single voice-first chat UI. You can type or dictate, and the model responds with both text and optional spoken audio.
+
+**Speech-to-Text**
+- **Voice Activity Detection (VAD):** WebRTC VAD detects speech boundaries client-side.
+- **Transcription:** faster-whisper tiny (int8) transcribes the complete audio once the user releases the mic button (or spacebar). We use **end-only dictation** rather than streaming partials, which avoids the repetition and hallucination artifacts common when tiny Whisper models process progressively longer audio clips.
+
+**LLM Inference**
+- The full Bonsai 1.7B runs on the optimized C engine using 2 OMP threads. It generates ~7–10 tokens per second on AMD EPYC 7R13.
+
+**Text-to-Speech**
+- **Synthesis:** piper-tts (local ONNX) renders each complete sentence.
+- **Interleaved Streaming:** The LLM generates sentences in a background thread while TTS synthesizes the previous sentence. Audio playback begins as soon as the first sentence is ready — the model does not need to finish generating before you start hearing it.
+- **Sentence Sync & Highlighting:** The first sentence text is buffered until its audio chunk arrives, then both appear simultaneously. During playback, the currently spoken sentence is highlighted inside the chat bubble.
+
 ---
 
 ## 📦 Model Weights
@@ -68,10 +86,12 @@ docker run -p 7860:7860 -v $(pwd)/model_weights_repacked:/app/model_weights_repa
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `GET /` | — | Chat UI |
-| `POST /generate` | SSE stream | Streaming token generation |
+| `GET /` | — | Voice chat UI (dictation + TTS) |
+| `WS /ws/voice` | WebSocket | Dictation, chat, and audio streaming |
+| `POST /generate` | SSE stream | Text-only streaming (legacy) |
 | `POST /generate/completion` | JSON | Full response with timing stats |
 | `GET /health` | — | Status & SIMD check |
+| `GET /health/voice` | — | Voice pipeline diagnostics |
 | `GET /model/info` | — | Architecture metadata |
 | `GET /profile` | — | Deep-dive C engine profiling stats |
 
