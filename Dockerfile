@@ -15,7 +15,7 @@ COPY Makefile .
 RUN make inference.so
 
 # Copy Python app, UI, and dependencies
-COPY app.py voice.py voice.html index.html requirements.txt download_models.py ./
+COPY app.py voice.py voice.html requirements.txt download_models.py ./
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
