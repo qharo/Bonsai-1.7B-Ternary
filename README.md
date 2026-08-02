@@ -31,7 +31,7 @@ The interface is a single voice-first chat UI. You can type or dictate, and the 
 - **Transcription:** [faster-whisper tiny](https://huggingface.co/Systran/faster-whisper-tiny) (int8) transcribes the complete audio once the user releases the mic button (or spacebar).
 
 **LLM Inference**
-- The full Bonsai 1.7B runs on the optimized C engine using 2 OMP threads. It generates ~7–10 tokens per second on AMD EPYC 7R13.
+- The full Bonsai 1.7B runs on the optimized C engine using 2 OMP threads. It generates ~7-10 tokens per second on AMD EPYC 7R13.
 
 **Text-to-Speech**
 - **Synthesis:** piper-tts (local ONNX) renders each complete sentence.
