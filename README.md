@@ -12,7 +12,7 @@ An optimized C inference engine for **Ternary-Bonsai-1.7B**, served via a FastAP
 
 ---
 
-## Optimizations
+## 🚀 Optimizations
 
 LLM inference is almost entirely memory-bandwidth bound. To get the most out of the CPU, I focused on moving as little data as possible:
 
@@ -22,7 +22,7 @@ LLM inference is almost entirely memory-bandwidth bound. To get the most out of 
 *   **Two-Phase `lm_head` Prefilter** 
 ---
 
-## Voice Pipeline
+## 🎤 Voice Pipeline
 
 The interface is a single voice-first chat UI. You can type or dictate, and the model responds with both text and optional spoken audio.
 
