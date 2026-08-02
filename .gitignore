@@ -13,6 +13,9 @@ tokenizer/
 # Compiled binaries
 inference.so
 
+# Generated artifacts
+repomix-output.md
+
 # Original safetensors — not used by inference
 model_weights_repacked/**/*.safetensors
 
