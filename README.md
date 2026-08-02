@@ -1,4 +1,4 @@
-# Bonsai 1.7B — A 1.58-bit LLM with Voice Chat
+# Bonsai 1.7B // A 1.58-bit LLM with Voice Chat
 
 <div align="center">
 
